@@ -1,3 +1,109 @@
-# React とは
+---
+title: React とは何か
+description: React の歴史と現在地、Vue との違いを整理する
+---
 
-PoC 用のスタブページです。実際の章はここに書かれます。
+# React とは何か
+
+React は、Meta（旧 Facebook）が 2013 年に公開した **UI を構築するための JavaScript ライブラリ**です。今では Web、モバイル、TV、VR まで横断する巨大エコシステムの中核となっていますが、本質は意外とシンプルです。
+
+> **React は「状態を入力すると UI を出力する関数」を書くためのライブラリ**
+
+これだけです。本書ではこの「シンプルな本質」をどう実装で支えているかを、最小実装の写経を通じて紐解いていきます。
+
+## 短い歴史
+
+| 年 | 出来事 |
+|---|---|
+| 2011 | Facebook 内部で `FaxJS` として誕生（Jordan Walke 作） |
+| 2013 | OSS 公開、JSX 同時発表 |
+| 2015 | React Native 発表、Web 以外への展開 |
+| 2017 | **Fiber アーキテクチャ**（v16）に内部書き換え |
+| 2019 | **Hooks**（v16.8）導入、関数コンポーネント時代の幕開け |
+| 2022 | **Concurrent Rendering**（v18）安定版、Suspense / Transition |
+| 2024+ | **React Server Components**（v19）、`use()` フック |
+
+本書では **v18 を主軸に v19 の差分を補足**する構成を取ります。
+
+## React の核となる 3 つの哲学
+
+### 1. **宣言的 UI** (Declarative)
+
+「どう描くか」（命令的）ではなく「**何を描くか**」（宣言的）を書きます。
+
+```jsx
+// 命令的: ボタンを作って、テキストを入れて、クリックハンドラを登録して...
+const button = document.createElement('button')
+button.textContent = 'Click'
+button.addEventListener('click', handleClick)
+container.appendChild(button)
+
+// 宣言的（React）: こういう UI が欲しい、と書くだけ
+function Button() {
+  return <button onClick={handleClick}>Click</button>
+}
+```
+
+React は「現在の状態から UI を組み立てる」関数として書かれ、状態が変わると React が**自動的に差分を計算して**実 DOM を更新します。この差分計算が **Reconciliation**（再調整）であり、本書 Part 2 の主役です。
+
+### 2. **コンポーネントベース**
+
+UI を**再利用可能な部品**に分解して構築します。React のコンポーネントは関数（または class）で、props を受け取り、JSX を返します。
+
+```jsx
+function Greeting({ name }) {
+  return <h1>こんにちは、{name} さん</h1>
+}
+```
+
+部品の組み合わせで複雑な UI を構築できる、というアイデア自体は React 以前からあった（Web Components など）ですが、React は **JS の関数として表現する**ことで、合成・抽象化のしやすさを劇的に高めました。
+
+### 3. **学習一度、どこでも書ける**
+
+React 本体は「UI を関数で書く」という核だけを提供し、レンダリング先（Web の DOM、ネイティブ UI、ターミナル、PDF...）は別のレンダラーが担当します。あなたが「状態 → UI の関数」を書ければ、レンダラーを差し替えるだけで対応プラットフォームが広がります。
+
+これが React Native や、3D 描画向けの React Three Fiber、CLI 向けの Ink などが成立する仕組みです。
+
+## Vue との比較で位置づける
+
+chibivue 経験者向けに、Vue と React の構造的な違いを整理します。これは本書の構成にも直結します。
+
+| 観点 | Vue | React |
+|---|---|---|
+| **テンプレート** | HTML 風テンプレート + ディレクティブ (`v-if`, `v-for`) | **JSX = JavaScript 式そのもの** |
+| **コンポーネント定義** | SFC (`.vue`、template/script/style の 3 ブロック) | **関数（または class）コンポーネントのみ** |
+| **リアクティビティ** | Proxy ベース (`ref` / `reactive`) で値の変更を追跡 | **不変 state + 再レンダリング**、変更は `setState` で明示 |
+| **描画戦略** | Stack ベースの再帰的 diff | **Fiber**（中断可能な作業単位） |
+| **ロジック再利用** | Composition API (`setup` 内のフック関数) | **Hooks**（React 固有の主役機能） |
+| **並行描画** | Vapor Mode（実験的） | **Concurrent Rendering / Suspense / Transition** |
+
+例えるなら:
+
+> **Vue は「監視カメラ」**: データを見張っていて、変わったら自動で画面を書き換えます
+> **React は「定期スナップショット」**: 状態が変わったと言われたら、UI 全体を関数として再計算して差分だけ反映します
+
+両者の哲学の違いは、API の違い（`ref(0).value++` vs `setCount(c => c + 1)`）にも、内部実装の違い（Proxy vs Fiber）にも、すべて影響します。
+
+## 「ライブラリ」であることの意味
+
+React は **フレームワークではなくライブラリ**です。これは公式が繰り返し強調してきたポイントで、以下のような帰結を持ちます:
+
+- ルーティング・データフェッチ・状態管理は React 本体には**含まれていません**
+  - → Next.js / Remix / TanStack Router / Redux 等が必要に応じて補完します
+- 「どう書くか」の規約が緩いです
+  - → 自由度が高い反面、プロジェクトごとに流儀が違いやすくなります
+- 本体は「UI を関数で書く」という最小の核に集中しています
+  - → だからこそ Native や 3D など多様なプラットフォームに展開できました
+
+本書は **React 本体の内部実装**にフォーカスします。Next.js などのフレームワークレイヤーは扱いません（必要に応じて SSR と RSC の概観のみ触れる程度）。
+
+## まとめ
+
+- React は「状態 → UI の関数」を書くためのライブラリ
+- 宣言的 UI / コンポーネントベース / プラットフォーム非依存 の 3 哲学
+- Vue とは**根本から設計思想が違う**（Proxy vs 不変 state、テンプレート vs JSX、Stack vs Fiber）
+- React 本体は「UI を関数で書く」最小の核に集中
+
+次の章では、この本質を支えている**主要な要素**（仮想 DOM、Reconciler、JSX、Hooks）を概観し、本書の各 Part がどこを担うかをマッピングします。
+
+→ [React を構成する主要な要素](./030-react-core-components)

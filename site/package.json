@@ -9,8 +9,8 @@
   },
   "dependencies": {
     "next": "^16.2.4",
-    "nextra": "^4.5.1",
-    "nextra-theme-docs": "^4.5.1",
+    "nextra": "4.5.1",
+    "nextra-theme-docs": "4.5.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

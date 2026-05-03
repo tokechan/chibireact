@@ -1,0 +1,190 @@
+---
+title: 初めてのレンダリングと createRoot API
+description: React 18 から導入された createRoot の API 骨格を最小実装で作ります
+---
+
+# 初めてのレンダリングと createRoot API
+
+いよいよ Part 1 がスタートします。この章から、**実際に動く最小の React** を 1 行ずつ書いていきます。
+
+## この章のゴール
+
+- `createRoot(container).render(element)` の **API 骨格** を作る
+- TDD（Red → Green）のサイクルを 1 回まわす
+- `@chibireact/core` パッケージを動かせる状態にする
+
+> 章末に動くもの: `createRoot` を呼び出すと `render` メソッドを持つ root オブジェクトが返り、テストが緑になっている状態。
+
+前章: [本書の進め方と環境構築](../00-introduction/040-setup-project)
+
+## 前提知識
+
+- Vitest の基本的な書き方（`describe`, `it`, `expect`）
+- TypeScript の関数型と型注釈
+- `document.createElement` などの DOM API
+
+## React 18 の `createRoot` とは
+
+React 17 まで、エントリポイントは `ReactDOM.render(<App />, container)` でした。
+React 18 から **新しい API として `createRoot`** が導入されています。
+
+```js
+// React 17 まで（旧 API）
+ReactDOM.render(<App />, document.getElementById('app'))
+
+// React 18 以降（新 API）
+const root = ReactDOM.createRoot(document.getElementById('app'))
+root.render(<App />)
+```
+
+なぜ変わったかというと、**Concurrent Rendering を有効にするため**です。`render` を毎回呼ぶ古い API では、root に紐づく状態（中断中の更新、優先度など）を引き継げませんでした。新 API では `root` という概念が一級市民になり、Concurrent 機能の前提条件になっています。
+
+本書では新 API である `createRoot` をそのまま採用します。
+
+## テストを書く（Red）
+
+TDD の流儀に従い、**まずテストから書きます**。
+
+`packages/@chibireact/core/tests/create-root.test.ts`:
+
+```ts
+import { describe, it, expect } from 'vitest'
+import { createRoot } from '../src/create-root'
+
+describe('createRoot', () => {
+  it('container を渡すと render メソッドを持つ root オブジェクトを返します', () => {
+    const container = document.createElement('div')
+    const root = createRoot(container)
+
+    expect(root).toHaveProperty('render')
+    expect(typeof root.render).toBe('function')
+  })
+
+  it('render() を呼び出してもエラーにならない（最小骨格）', () => {
+    const container = document.createElement('div')
+    const root = createRoot(container)
+
+    expect(() => {
+      root.render({ type: 'h1', props: {}, children: ['Hello'] })
+    }).not.toThrow()
+  })
+
+  it('container が異なれば独立した root を返します', () => {
+    const containerA = document.createElement('div')
+    const containerB = document.createElement('div')
+
+    const rootA = createRoot(containerA)
+    const rootB = createRoot(containerB)
+
+    expect(rootA).not.toBe(rootB)
+  })
+})
+```
+
+この時点で実行します:
+
+```bash
+pnpm --filter @chibireact/core test
+```
+
+当然、失敗します（実装がないため）:
+
+```
+✗ tests/create-root.test.ts
+  Cannot find module '../src/create-root'
+```
+
+これが **Red** の状態です。期待を表明したけれど、まだ通せていない。次にこれを通す最小実装を書きます。
+
+## 実装する（Green）
+
+**最小の実装**を書きます。「最小」とは、テストを通すために**絶対に必要なことだけ**書く、ということです。きれいな設計や将来の拡張は今は考えません。
+
+`packages/@chibireact/core/src/create-root.ts`:
+
+```ts
+export type ChibireactNode =
+  | {
+      type: string | Function
+      props: Record<string, unknown>
+      children: ChibireactNode[]
+    }
+  | string
+  | number
+
+export type Root = {
+  render(element: ChibireactNode): void
+}
+
+export function createRoot(container: HTMLElement): Root {
+  void container
+  return {
+    render(_element: ChibireactNode): void {
+      // この章では何もしない。実際の描画は 1.4 で実装します。
+    },
+  }
+}
+```
+
+そして `index.ts` でエクスポート:
+
+```ts
+// packages/@chibireact/core/src/index.ts
+export { createRoot } from './create-root'
+```
+
+再度テスト実行:
+
+```bash
+pnpm --filter @chibireact/core test
+```
+
+```
+ ✓ tests/create-root.test.ts (3 tests) 3ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+```
+
+これが **Green**。期待通りに動きました。
+
+## ここで思うこと
+
+「え、これだけ？ 描画してないじゃん」と感じたかもしれません。それで正解です。
+
+TDD では **「動く最小限」を先に作って、徐々に育てていく**のが基本です。`render` が「何も描かない」状態でも、API の形は確定し、テストで保護された状態になりました。次の章以降で機能を足していくときも、**この 3 つのテストが壊れていないか**を毎回確認できます。
+
+これが Pombo の "Build your own React" にはない、本書の差別化軸です。Pombo は完成形のコードを一気に提示しますが、**本書は 1 章 1 サイクル**で進みます。
+
+## ちょっと深掘り
+
+### 本家 React の `createRoot` を覗いてみる
+
+[React の本家ソース](https://github.com/facebook/react/blob/main/packages/react-dom/src/client/ReactDOMRoot.js) では `createRoot` は数百行に渡る複雑な処理ですが、本質的には:
+
+1. `container` から **FiberRoot** を作る
+2. **HostRoot Fiber** を初期化
+3. `ReactDOMRoot` クラスのインスタンスを返す（`render` / `unmount` メソッドを持つ）
+
+本書では Fiber や FiberRoot をまだ知りません。それらは Part 2 で扱います。**今は形だけ真似る** ので OK です。
+
+### `void container` ってなに？
+
+TypeScript の strict モードで「未使用の引数」エラーを抑えるイディオムです。`container` を「使う気はあるけど今は使わない」と明示します。次の章で実際に使うようになると、`void` は外して通常の参照に置き換えます。
+
+## まとめ
+
+- `createRoot(container).render(element)` の API 骨格を作りました
+- TDD の Red → Green サイクルを 1 回まわしました
+- まだ何も描画していませんが、**API の形は固定**しました
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum
+git commit -m "feat(part1): 1.1 createRoot API の骨格を実装"
+```
+
+次の章では、**この最小実装をきれいに整理する**ためにモノレポ構成を確認します。
+
+→ 次の章: パッケージ設計（執筆中）

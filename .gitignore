@@ -2,6 +2,22 @@
 *.log
 .idea/
 
+# Node / pnpm
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+.next/
+.open-next/
+out/
+coverage/
+
+# Local env
+.env
+.env.*.local
+
 # Editor
 .vscode/*
 !.vscode/extensions.json
