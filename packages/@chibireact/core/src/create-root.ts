@@ -1,15 +1,4 @@
-/**
- * 仮想 DOM ノード（最小定義）。
- * Part 1.3 で createElement を実装する際に拡張します。
- */
-export type ChibireactNode =
-  | {
-      type: string | Function
-      props: Record<string, unknown>
-      children: ChibireactNode[]
-    }
-  | string
-  | number
+import type { ChibireactNode } from './types'
 
 /**
  * createRoot が返す root オブジェクトの API。
