@@ -3,12 +3,12 @@ import type { ChibireactNode } from './types'
 /**
  * 仮想 DOM 要素を再帰的に DOM ツリーへ変換し、container に追加します。
  *
- * Part 1.4 で骨格、Part 1.5 で props 反映を追加しました。
- * - 関数コンポーネント: Part 1.8 で対応
- * - イベントハンドラ: Part 1.6 で対応
- *
- * 既存の container 内容はクリアしません（複数回呼び出すと append されます）。
- * 再レンダリング時の差分適用は Part 1.10 で実装します。
+ * 段階的に機能を追加してきました:
+ * - Part 1.4: 骨格（type と children）
+ * - Part 1.5: props を DOM 属性として反映
+ * - Part 1.6: on... イベントを addEventListener で登録
+ * - Part 1.8: 関数コンポーネント対応（予定）
+ * - Part 1.10: 再レンダリング差分計算（予定）
  */
 export function render(element: ChibireactNode, container: HTMLElement | Node): void {
   // テキストノード（文字列・数値）
@@ -27,7 +27,7 @@ export function render(element: ChibireactNode, container: HTMLElement | Node): 
   // HTML 要素を生成
   const dom = document.createElement(element.type)
 
-  // props を DOM 属性として反映（Part 1.5）
+  // props を反映
   applyProps(dom, element.props)
 
   // 子要素を再帰的に処理
@@ -40,19 +40,35 @@ export function render(element: ChibireactNode, container: HTMLElement | Node): 
 }
 
 /**
- * 仮想 DOM の props を実 DOM の属性として反映します。
+ * key が `on` で始まり、続く文字が大文字なら on... 系のイベントハンドラ。
+ * 例: onClick, onMouseDown, onChange
+ */
+function isEventProp(key: string): boolean {
+  return key.startsWith('on') && key.length > 2 && key[2] === key[2]?.toUpperCase()
+}
+
+/**
+ * onClick → 'click', onMouseDown → 'mousedown' のように
+ * DOM の addEventListener が期待する形式（小文字）に変換します。
+ */
+function getEventName(key: string): string {
+  return key.slice(2).toLowerCase()
+}
+
+/**
+ * 仮想 DOM の props を実 DOM の属性 / イベントとして反映します。
  *
- * Part 1.5 の最小実装:
- * - className → dom.className（HTML の予約語回避）
- * - style (object) → dom.style への代入
- * - その他の文字列・数値・真偽値 → setAttribute
- *
- * Part 1.6 で `on...` (関数) のイベント対応を追加します。
+ * Part 1.5 で属性反映、Part 1.6 でイベント反映を追加しました。
  */
 function applyProps(dom: HTMLElement, props: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(props)) {
-    // children プロパティは render 側で別管理しているので念のため除外
     if (key === 'children') continue
+
+    // イベントハンドラ (Part 1.6)
+    if (isEventProp(key) && typeof value === 'function') {
+      dom.addEventListener(getEventName(key), value as EventListener)
+      continue
+    }
 
     if (key === 'className') {
       dom.className = String(value)
@@ -76,7 +92,5 @@ function applyProps(dom: HTMLElement, props: Record<string, unknown>): void {
       dom.setAttribute(key, String(value))
       continue
     }
-
-    // 関数 (events) は Part 1.6 で対応する
   }
 }

@@ -1,0 +1,216 @@
+---
+title: イベントハンドラに対応する
+description: onClick / onChange のような on... props を addEventListener で登録します
+---
+
+# イベントハンドラに対応する
+
+[前章](./050-props)で props を DOM 属性として反映できるようになりました。でも `onClick` のような **関数値の props** はまだスキップされています。
+
+```ts
+createElement('button', { onClick: () => alert('hi') }, 'Click me')
+// → <button>Click me</button>  （クリックしても何も起きない）
+```
+
+この章で `onXxx` 系の props を **イベントハンドラ** として登録できるようにします。
+
+## この章のゴール
+
+- `onClick` / `onChange` などの **`on...` で始まる関数 props** を `addEventListener` で登録
+- イベント名は **小文字化** する (`onClick` → `'click'`)
+- 通常の attribute（`open`, `disabled` 等）は前章のまま属性として処理
+- `onclick` のような全部小文字は React 同様 **attribute 扱い**（イベントとして登録しない）
+
+> 章末に動くもの: 9 個のイベント関連テストが緑になり、`<button onClick={...}>` のクリックが実際にハンドラを呼ぶ状態。
+
+前章: [props を扱う](./050-props)
+
+## 前提知識
+
+- DOM API: `addEventListener`, `dispatchEvent`
+- `MouseEvent`, `Event` などのイベントオブジェクト
+- Vitest の `vi.fn()`（モック関数）
+
+## React のイベント命名規則
+
+React は **camelCase** で `onClick`, `onMouseDown`, `onChange` などの prop を提供します。
+これらはコンパイル時には何も変換されず、ランタイムで識別する必要があります:
+
+```jsx
+<button onClick={handleClick}>Click</button>
+// → React.createElement('button', { onClick: handleClick }, 'Click')
+```
+
+ランタイムが `onClick` を見つけたら、`'click'` イベントとして `addEventListener` する、という変換ルールです。
+
+> **注**: HTML には `<button onclick="...">` という属性記法もありますが、これは「DOM の onclick プロパティに文字列を代入」する旧式の方法で、本書では使いません。React と同じく `addEventListener` 一択です。
+
+## 「on で始まる関数 props」の判定ルール
+
+`on` で始まれば全部イベントとして扱うと、以下のような attribute と混同します:
+
+| キー | 種類 | 扱い |
+|---|---|---|
+| `onClick` | event | addEventListener('click') |
+| `onMouseDown` | event | addEventListener('mousedown') |
+| `open` | attribute | setAttribute('open') |
+| `online` | （存在しないが）attribute | setAttribute('online') |
+| `onclick` | （旧式 HTML）attribute 扱い | setAttribute('onclick') |
+
+ルールは **「`on` で始まり、3 文字目が大文字、かつ値が関数」**。これで React の慣習と整合します。
+
+## テストを書く（Red）
+
+`packages/@chibireact/core/tests/events.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { render } from '../src/render'
+import { createElement } from '../src/create-element'
+
+describe('render events', () => {
+  let container: HTMLElement
+  beforeEach(() => { container = document.createElement('div') })
+
+  it('onClick の関数を addEventListener として登録します', () => {
+    const handler = vi.fn()
+    render(createElement('button', { onClick: handler }, 'Click'), container)
+    const button = container.firstChild as HTMLButtonElement
+    button.click()
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  it('onMouseDown など、複数語のイベントも小文字化して登録します', () => {
+    const handler = vi.fn()
+    render(createElement('div', { onMouseDown: handler }), container)
+    container.firstChild!.dispatchEvent(new MouseEvent('mousedown'))
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  it('イベントハンドラは attribute として反映されません', () => {
+    render(createElement('button', { onClick: vi.fn() }), container)
+    const button = container.firstChild as HTMLButtonElement
+    expect(button.hasAttribute('onClick')).toBe(false)
+    expect(button.hasAttribute('onclick')).toBe(false)
+  })
+})
+```
+
+（実際の test file には他にも 6 ケース）
+
+実行すると `onClick` が「関数なので何も処理されない」状態のまま、ハンドラが呼ばれず失敗します。
+
+## 実装する（Green）
+
+`render.ts` の `applyProps` にイベント分岐を追加します。
+
+```ts
+function isEventProp(key: string): boolean {
+  return key.startsWith('on')
+    && key.length > 2
+    && key[2] === key[2]?.toUpperCase()
+}
+
+function getEventName(key: string): string {
+  return key.slice(2).toLowerCase()  // onClick → 'click'
+}
+
+function applyProps(dom: HTMLElement, props: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(props)) {
+    if (key === 'children') continue
+
+    // ✅ イベントハンドラ
+    if (isEventProp(key) && typeof value === 'function') {
+      dom.addEventListener(getEventName(key), value as EventListener)
+      continue
+    }
+
+    if (key === 'className') {
+      dom.className = String(value)
+      continue
+    }
+
+    if (key === 'style' && typeof value === 'object' && value !== null) {
+      Object.assign(dom.style, value as CSSStyleDeclaration)
+      continue
+    }
+
+    if (value == null) continue
+
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      dom.setAttribute(key, String(value))
+      continue
+    }
+  }
+}
+```
+
+テスト再実行:
+
+```
+ ✓ tests/events.test.ts (9 tests)
+
+ Test Files  5 passed (5)
+      Tests  38 passed (38)
+```
+
+これで **Green**。9 個のイベントテストが通り、累計 38/38。
+
+## ちょっと深掘り
+
+### 本家 React のイベントシステム（合成イベント）との違い
+
+本家 React は **SyntheticEvent (合成イベント)** という独自のイベントオブジェクトを使い、ブラウザ間の差異を吸収します。さらに React 16 までは **イベント委譲 (Event Delegation)**:
+
+> 個々の DOM 要素には listener を登録せず、root 要素 (= `document`) に **すべてのイベントを 1 箇所で受けて**、対象要素まで配送する仕組み
+
+を採っていました。これにより memory 使用量が削減されます。
+
+React 17 以降はこの委譲先が `document` から **root container** に変わり、複数の React アプリを同居させても干渉しないようになりました。
+
+本書の最小実装では、各要素に直接 `addEventListener` するシンプルな方式を採ります。**イベント委譲は将来 (Part 2 以降) のオプション** として扱う可能性があります。
+
+### `vi.fn()` ってなに？
+
+Vitest が提供する **モック関数** です。`vi.fn()` で作った関数は、呼び出されるたびに以下を記録します:
+
+- 何回呼ばれたか (`mock.calls.length`)
+- 各回の引数は何だったか (`mock.calls[0]` 等)
+- 戻り値は何を返したか
+
+`expect(handler).toHaveBeenCalledTimes(1)` のような便利なマッチャーで検証できます。
+
+> **TDD 視点**: 本物のロジックの代わりに「呼ばれたか確認できるダミー」を渡せるので、副作用を伴うコード（DOM 操作、API 呼び出し）のテストで頻出します。
+
+### `onclick` (lowercase) を attribute 扱いにする理由
+
+React は厳密に `onClick` (camelCase) のみをイベント prop として認めます。`onclick` (lowercase) を書くと、HTML attribute として `setAttribute('onclick', '...')` のように処理されます。
+
+本書も同じ挙動です。`isEventProp` の判定で 3 文字目が大文字でないと弾く理由はここにあります:
+
+```ts
+isEventProp('onClick')   // true: 'C' は大文字
+isEventProp('onclick')   // false: 'c' は小文字（HTML 旧式属性）
+isEventProp('online')    // false: 'l' は小文字
+```
+
+## まとめ
+
+- `on...` で始まる関数 props を `addEventListener` で登録できるようになりました
+- イベント名は `onClick` → `'click'` のように小文字化
+- 本家 React の合成イベント / イベント委譲は採用せず、シンプルな実装で進めます
+
+これで Part 1.4〜1.6 が完了し、**props ・ children ・ event を持つ動的な UI** が描画できるようになりました 🎉
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/060-event-handlers.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.6 イベントハンドラを実装"
+```
+
+→ 次の章: children と入れ子構造（執筆中）
