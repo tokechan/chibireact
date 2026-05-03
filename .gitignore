@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+.idea/
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
