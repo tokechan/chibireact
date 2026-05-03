@@ -1,17 +1,54 @@
-# chibireact へようこそ
+---
+title: chibireact
+description: React を小さく作りながら学ぶ本
+---
 
-**React を小さく作りながら学ぶ本** の準備中ページです。
+# chibireact
 
-## 本書について
+**React を小さく作りながら学ぶ本** へようこそ。
 
-chibireact は、Vue 学習書 [chibivue](https://book.chibivue.land/) の構成と思想を React 向けに再設計したものです。
-**写経しながら React の内部実装を理解できる、日本語の連載書籍**を目指しています。
+本書は、Vue 学習書 [chibivue](https://book.chibivue.land/) の構成と思想を React 向けに再設計した、日本語の連載書籍です。「React は使えるけれど、内部の仕組みは知らない」中級者を対象に、**React 18+ の主要機能を最小実装で写経しながら理解する**ことを目的としています。
 
-## 想定読者
+## こんな人に向いています
 
-- React は使えるが、内部の仕組みを知らない中級者
-- Fiber / Hooks / Concurrent Rendering の動作原理を実装ベースで理解したい人
+- React で実務はしているが、`useState` や `useEffect` の中身がブラックボックスで気持ち悪い
+- Fiber や Concurrent Rendering について「聞いたことはある」止まり
+- React の公式ドキュメントを読み終えて、もう一段深く潜りたい
+- 写経しながら手を動かして覚えるのが好き
+
+## 本書の特徴
+
+| 軸 | 本書のスタンス |
+|---|---|
+| 対象バージョン | **React 18 主軸 + React 19 差分補足** |
+| 進め方 | **TDD（Vitest）で各章のテストから書く** |
+| 言語 | TypeScript 完全対応 |
+| ビルド | Vite + pnpm |
+| ライセンス | コード MIT 想定（[Plans/04 で議論中](https://github.com/tokechan/chibireact/blob/main/Plans/04-content-plan.md)） |
+
+## 目次の概観
+
+| Part | 内容 | 章数 |
+|---|---|---|
+| 0 | Getting Started | 4 |
+| 1 | Minimum Example: 最小の React を作る | 13 |
+| 2 | Reconciler の改良: Fiber へ | 7 |
+| 3 | Hooks の実装 | 9 |
+| 4 | JSX とビルドツール | 5 |
+| 5 | Concurrent Rendering と Suspense | 6 |
+| 6 | Web Application Essentials | 5 |
+| 付録 | 30 分で React を作る ほか | 4 |
+
+詳細は [Plans/02-toc-draft.md](https://github.com/tokechan/chibireact/blob/main/Plans/02-toc-draft.md) を参照してください。
+
+## 既存教材との違い
+
+「Build your own React」系の教材は英語圏に複数ありますが、**日本語 × 写経 × 連載書籍 × React 18+** の 4 条件を満たすものは現状ありません（[Plans/03-prior-art.md](https://github.com/tokechan/chibireact/blob/main/Plans/03-prior-art.md) で詳細）。本書はその空白地帯を埋めることを狙います。
 
 ## 進捗
 
-このサイトは現在 **PoC 段階**です。詳細な企画資料は別途リポジトリ内の `Plans/` を参照してください。
+このサイトは現在 **PoC 段階**です。Part 0 のドラフトから順次公開していきます。最新状況は [GitHub リポジトリ](https://github.com/tokechan/chibireact) を参照してください。
+
+## 謝辞
+
+[chibivue](https://book.chibivue.land/) の作者 [@ubugeeei](https://github.com/Ubugeeei) 氏に深い敬意を込めて。本書の構成・トーン・章立ては chibivue を直接的に参考にしています。

@@ -1,0 +1,19 @@
+{
+  "name": "@chibireact/core",
+  "version": "0.0.1",
+  "private": true,
+  "description": "chibireact の最小実装の React 本体（写経対象）",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

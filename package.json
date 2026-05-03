@@ -1,0 +1,13 @@
+{
+  "name": "chibireact",
+  "version": "0.0.1",
+  "private": true,
+  "description": "React を小さく作りながら学ぶ本（モノレポルート）",
+  "scripts": {
+    "dev": "pnpm --filter chibireact-site dev",
+    "build:site": "pnpm --filter chibireact-site build",
+    "test": "pnpm --filter '@chibireact/*' test",
+    "test:watch": "pnpm --filter '@chibireact/*' test --watch"
+  },
+  "license": "UNLICENSED"
+}

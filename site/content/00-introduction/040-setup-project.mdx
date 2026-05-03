@@ -1,0 +1,166 @@
+---
+title: 本書の進め方と環境構築
+description: chibireact を写経しながら進めるための環境準備
+---
+
+# 本書の進め方と環境構築
+
+本書は「写経しながら最小実装の React を作る」教材です。読むだけでなく、実際に手を動かして進めてください。この章では、その準備を整えます。
+
+## 必要なもの
+
+| ツール | バージョン | 用途 |
+|---|---|---|
+| **Node.js** | 22 以上 | JavaScript ランタイム |
+| **pnpm** | 10 以上 | パッケージマネージャ |
+| **Git** | 任意 | バージョン管理 |
+| **GitHub アカウント** | — | リポジトリ管理（任意） |
+| **エディタ** | お好きなもの | VS Code / Cursor / IntelliJ など |
+
+### Node.js のインストール
+
+[公式サイト](https://nodejs.org/) から最新 LTS をインストールするか、バージョン管理ツール（`nvm`, `volta`, `mise` など）を使うのを推奨します。
+
+```bash
+node --version
+# v22.x.x 以上であれば OK
+```
+
+### pnpm のインストール
+
+```bash
+# Corepack 経由（Node.js 22 にバンドル）
+corepack enable
+corepack prepare pnpm@latest --activate
+
+# または npm 経由
+npm install -g pnpm
+```
+
+```bash
+pnpm --version
+# 10.x.x 以上であれば OK
+```
+
+> **なぜ pnpm？**
+> npm より速く、ディスク効率が良く、セキュリティ既定が強い（postinstall がデフォルト OFF など）。本書では新規パッケージの追加時に「これは安全？」を都度判断する手間を最小化したいので、pnpm を採用しています。
+
+## リポジトリのセットアップ
+
+### 既存リポジトリを clone する場合
+
+```bash
+git clone https://github.com/tokechan/chibireact.git
+cd chibireact
+```
+
+### 自分の手で書き始める場合（推奨）
+
+写経の効果を最大化するため、**ゼロから自分のリポジトリを切る**のを推奨します。本書の各章のコードを自分のエディタで実際にタイプすることで、覚えが格段に良くなります。
+
+```bash
+mkdir my-chibireact
+cd my-chibireact
+git init -b main
+```
+
+## 章ごとの作業環境
+
+本書の Part 1 以降では、`@chibireact/core`（自作 React 本体）と `examples/`（章ごとの動作確認用サンプル）の **モノレポ構成** で進めます。詳細は Part 1 の最初の章で扱いますが、構造はこんな感じです:
+
+```
+my-chibireact/
+├── packages/
+│   └── @chibireact/
+│       ├── core/              # 自作 React 本体
+│       ├── reconciler/        # Fiber 実装（Part 2 から）
+│       └── jsx-runtime/       # JSX 変換ランタイム（Part 4 から）
+├── examples/
+│   ├── 01-minimum-renderer/   # 各章末の動作確認サンプル
+│   ├── 02-fiber-loop/
+│   └── ...
+└── pnpm-workspace.yaml
+```
+
+## TDD の流儀
+
+各章では、**テストから書く**スタイル（TDD: Test-Driven Development）で進めます。
+
+```bash
+# テストを実行
+pnpm test
+
+# テストを watch モードで（ファイル変更を検知して自動再実行）
+pnpm test --watch
+```
+
+各章で:
+
+1. **Red**: 期待する振る舞いをテストとして書きます（実装がまだないので失敗します）
+2. **Green**: テストを通す最小の実装を書きます
+3. **Refactor**: テストが緑のまま、構造を整えます
+
+このサイクルを 1 章ごとに回していきます。詳しい TDD の作法は Kent Beck "Test-Driven Development: By Example" や、和田卓人（t-wada）さんの発表を参照してください。
+
+## エディタの推奨設定
+
+### VS Code / Cursor
+
+以下の拡張機能をインストールすると快適です:
+
+- **TypeScript Importer**（型補完）
+- **Vitest**（テストの inline 実行）
+- **MDX**（章本文の編集用）
+- **GitLens**（コミット履歴の可視化）
+
+### TypeScript の strict 設定
+
+本書ではすべて TypeScript で書きます。`tsconfig.json` の `strict: true` を必ず有効化してください。これにより:
+
+- `null` / `undefined` の扱いが厳密になります
+- 型推論が効きやすくなります
+- 「動くけど壊れやすい」コードが書きにくくなります
+
+## 動作確認
+
+最初のセットアップが終わったら、`Hello, chibireact` が動くことを確認します。
+
+```bash
+mkdir -p packages/@chibireact/core
+cd packages/@chibireact/core
+pnpm init
+```
+
+詳細な手順は Part 1 の最初の章 [createRoot API](../10-minimum/010-create-root-api) で扱います（執筆中）。
+
+## トラブルシューティング
+
+### `pnpm install` で `Ignored build scripts` という警告が出る
+
+**問題なし**。pnpm 10 はセキュリティ対策として、新しくインストールするパッケージの `postinstall` スクリプトをデフォルトでブロックします。本書では信頼できるパッケージのみを使うので、必要に応じて `pnpm approve-builds` で個別承認してください。
+
+### Node.js のバージョンが古いと言われる
+
+Node.js 22 未満では本書のコードは動作しません。`nvm install 22` などで最新 LTS にアップグレードしてください。
+
+### TypeScript の型エラーが大量に出る
+
+ブラウザの DOM 型を読み込む設定が抜けている可能性があります。`tsconfig.json` の `compilerOptions.lib` に `"DOM"` を追加してください。
+
+## 次の章へ
+
+これで準備完了です。Part 1 から、いよいよ **最小の React を作り始めます**。
+
+→ Part 1 の最初の章（執筆中）
+
+---
+
+**この章を書き終えた時点でのチェックリスト:**
+
+- [ ] Node.js 22+ がインストールされている
+- [ ] pnpm 10+ がインストールされている
+- [ ] お好きなエディタが起動している
+- [ ] 写経用のリポジトリ（or 本書の clone）が手元にある
+- [ ] TDD の流れがざっくり理解できている
+
+すべてにチェックが付いたら、Part 1 へ進みましょう。

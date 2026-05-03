@@ -1,0 +1,177 @@
+---
+title: React を構成する主要な要素
+description: 仮想 DOM / Reconciler / JSX / Hooks の概観と、本書での扱い方
+---
+
+# React を構成する主要な要素
+
+[前章](./020-what-is-react)で「React は状態 → UI の関数を書くためのライブラリ」と整理しました。この章では、その核を支えている**5 つの主要な要素**を概観し、本書のどの Part で深く掘るかを示します。
+
+## 全体像
+
+<svg viewBox="0 0 640 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="React の主要 5 要素のデータフロー図" style={{ maxWidth: '100%', height: 'auto', margin: '1.5em auto', display: 'block' }}>
+  <defs>
+    <marker id="arrow-flow" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="currentColor" />
+    </marker>
+  </defs>
+
+  {/* Box 1: User code */}
+  <rect x="60" y="20" width="320" height="80" rx="8" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.85" />
+  <text x="220" y="50" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="bold">あなたが書くコード</text>
+  <text x="220" y="75" textAnchor="middle" fontSize="12" fill="currentColor" fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace" opacity="0.75">function App() ... return JSX</text>
+
+  {/* Arrow 1 -> 2 */}
+  <line x1="220" y1="100" x2="220" y2="155" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#arrow-flow)" />
+  <text x="230" y="130" fontSize="11" fill="currentColor" opacity="0.7" fontStyle="italic">JSX → React.createElement</text>
+
+  {/* Box 2: Virtual DOM */}
+  <rect x="60" y="160" width="320" height="70" rx="8" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.85" />
+  <text x="220" y="188" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="bold">仮想 DOM (Virtual DOM)</text>
+  <text x="220" y="210" textAnchor="middle" fontSize="12" fill="currentColor" opacity="0.75">軽量な JS オブジェクトで UI を表現</text>
+
+  {/* Arrow 2 -> 3 */}
+  <line x1="220" y1="230" x2="220" y2="285" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#arrow-flow)" />
+
+  {/* Box 3: Reconciler */}
+  <rect x="60" y="290" width="320" height="70" rx="8" fill="none" stroke="currentColor" strokeWidth="2" />
+  <text x="220" y="318" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="bold">Reconciler (Fiber)</text>
+  <text x="220" y="340" textAnchor="middle" fontSize="12" fill="currentColor" opacity="0.75">差分計算 + 中断可能な作業ループ</text>
+
+  {/* Arrow 3 -> 4 */}
+  <line x1="220" y1="360" x2="220" y2="415" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#arrow-flow)" />
+
+  {/* Box 4: Renderer */}
+  <rect x="60" y="420" width="320" height="80" rx="8" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.85" />
+  <text x="220" y="448" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="bold">Renderer</text>
+  <text x="220" y="470" textAnchor="middle" fontSize="12" fill="currentColor" opacity="0.75">react-dom / react-native / ...</text>
+  <text x="220" y="488" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.6">実際の描画先に反映</text>
+
+  {/* Side: Hooks */}
+  <rect x="430" y="290" width="180" height="100" rx="8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 3" opacity="0.85" />
+  <text x="520" y="318" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="bold">Hooks</text>
+  <text x="520" y="340" textAnchor="middle" fontSize="12" fill="currentColor" opacity="0.75">useState / useEffect</text>
+  <text x="520" y="358" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.6">関数コンポーネントで</text>
+  <text x="520" y="375" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.6">状態と副作用を扱う</text>
+
+  {/* Lateral connector: Reconciler ↔ Hooks */}
+  <line x1="380" y1="325" x2="430" y2="325" stroke="currentColor" strokeWidth="1.2" strokeDasharray="3 3" opacity="0.7" />
+</svg>
+
+## 1. JSX
+
+JSX は **JavaScript 構文の拡張**で、HTML 風のタグを JS 式として書ける記法です。
+
+```jsx
+const element = <h1 className="title">Hello</h1>
+```
+
+これは Babel や SWC のようなコンパイラによって、以下のような `React.createElement` 呼び出しに**変換されます**:
+
+```js
+const element = React.createElement('h1', { className: 'title' }, 'Hello')
+```
+
+つまり JSX は構文上の砂糖（シンタックスシュガー）であり、**ランタイムには JSX という概念は存在しません**。本書 Part 4 でこの変換の仕組みを最小実装します。
+
+## 2. 仮想 DOM (Virtual DOM)
+
+仮想 DOM は、UI を表現する**軽量な JavaScript オブジェクト**です。実 DOM (HTML 要素) ではありません。
+
+```js
+// 実 DOM:  <h1 class="title">Hello</h1>
+// 仮想 DOM: { type: 'h1', props: { className: 'title' }, children: ['Hello'] }
+```
+
+なぜ仮想 DOM が必要か:
+
+- **実 DOM の操作は遅い**（リフロー・リペイントが発生します）
+- **小さな変更を毎回反映するとパフォーマンスが落ちます**
+- **JS オブジェクト同士の差分計算は速いです**
+
+React は「次に作りたい UI」と「現在の UI」をどちらも仮想 DOM で持ち、**差分だけを実 DOM に反映**します。本書 Part 1 でこの仕組みを最小実装します。
+
+## 3. Reconciler (Fiber)
+
+Reconciler は仮想 DOM の差分計算を担うエンジンです。React 16 (2017) から **Fiber アーキテクチャ**として書き換えられました。
+
+Fiber は次の特徴を持ちます:
+
+- 描画作業を**小さな単位（Fiber Node）に分割します**
+- 各単位の処理ごとに「ブラウザの応答性に余裕があるか」を確認します
+- 重い更新を**中断・再開**できます
+- ユーザー入力など緊急の更新を**割り込ませられます**
+
+これが React 18 の **Concurrent Rendering** の基礎になっています。
+
+| 旧 (Stack Reconciler, ~v15) | 新 (Fiber, v16+) |
+|---|---|
+| 同期的な再帰でツリーを辿る | 非同期で中断可能 |
+| 一度始めると最後まで止まらない | 緊急の更新を優先できる |
+| 巨大なツリーで UI が固まる | スムーズに保てる |
+
+Fiber は本書 **Part 2 の主役**です。なぜ生まれたか、どう動くかを最小実装で追います。
+
+## 4. Renderer (描画先)
+
+Reconciler が「次にこう描くべき」と決めた変更を、**実際の出力先に反映する**部分です。React 本体は描画先を持たず、Renderer が分離されています。
+
+| Renderer | 出力先 |
+|---|---|
+| `react-dom` | Web の DOM |
+| `react-native` | iOS / Android のネイティブ UI |
+| `react-three-fiber` | WebGL (3D) |
+| `ink` | ターミナル |
+| `react-pdf` | PDF |
+
+この分離があるからこそ、React は多様なプラットフォームに展開できました。本書では `react-dom` 相当（Web の DOM）のみを扱います。
+
+## 5. Hooks
+
+Hooks は、**関数コンポーネントで状態や副作用を扱うための仕組み**です。React 16.8 (2019) で導入されました。
+
+```jsx
+function Counter() {
+  const [count, setCount] = useState(0)
+  useEffect(() => { document.title = `Count: ${count}` }, [count])
+  return <button onClick={() => setCount(count + 1)}>{count}</button>
+}
+```
+
+主な Hooks:
+
+| Hook | 用途 |
+|---|---|
+| `useState` | コンポーネントローカルな状態 |
+| `useEffect` | コミット後の副作用（DOM 操作、購読） |
+| `useContext` | Context API 経由の値取得 |
+| `useReducer` | 複雑な状態遷移 |
+| `useMemo` / `useCallback` | メモ化 |
+| `useRef` | ミュータブルな参照 |
+| `useTransition` / `useDeferredValue` | Concurrent 系 |
+| `use` (v19) | Promise / Context の統合的な解決 |
+
+Hooks は React の主役機能であり、**本書 Part 3 全体**を費やして実装します。
+
+## 本書の Part 構成と対応関係
+
+| Part | 主題 | 対応する要素 |
+|---|---|---|
+| 0 | Getting Started | 全体の概観（この Part） |
+| 1 | Minimum Example | 仮想 DOM、最小レンダラー、最小 useState |
+| 2 | Reconciler の改良: Fiber へ | Reconciler (Fiber) |
+| 3 | Hooks の実装 | Hooks 全体 |
+| 4 | JSX とビルドツール | JSX 変換 |
+| 5 | Concurrent Rendering と Suspense | Fiber + Hooks の応用 |
+| 6 | Web Application Essentials | Renderer、SSR、RSC |
+| 付録 | 30 分で React を作る ほか | 全要素を圧縮した 1 ファイル版 |
+
+## まとめ
+
+- React の核は **JSX → 仮想 DOM → Reconciler (Fiber) → Renderer** の 4 段階
+- これに **Hooks** が状態と副作用を加える
+- 本書では各要素を Part ごとに分けて最小実装する
+
+次の章では、本書を進めるための**環境構築**を行います。
+
+→ [本書の進め方と環境構築](./040-setup-project)
