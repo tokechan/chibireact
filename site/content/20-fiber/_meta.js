@@ -3,4 +3,5 @@ export default {
   '020-stack-reconciler-limits': 'Stack Reconciler の限界',
   '030-fiber-node': 'Fiber Node とは何か',
   '040-work-loop': 'work loop と作業の単位化',
+  '050-scheduler': 'requestIdleCallback と最小スケジューラ',
 }

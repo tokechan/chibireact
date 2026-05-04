@@ -1,22 +1,20 @@
 import type { ChibireactNode } from './types'
 import { TEXT_ELEMENT, createFiber, type Fiber, type FiberType } from './fiber'
+import { requestIdleWork, type IdleDeadline } from './scheduler'
 
 /**
  * Part 2.4: work loop と作業の単位化。
+ * Part 2.5: requestIdleCallback で while を中断・再開可能に。
  *
  * 2.3 では `buildFiberTree` で **同期的に** 全 Fiber を一気に作っていた。
- * ここでは同じ仕事を **「1 ノードずつ進める」** 形に書き換える。
+ * 2.4 でこれを **「1 ノードずつ進める」** while ループに書き換えた。
+ * 2.5 では同じ while を **deadline で抜けて、次のアイドル時間に再開** する形に進化させる。
  *
- * 中核アイデア:
- *   - 「次にやる仕事」を `nextUnitOfWork: Fiber | null` という変数で持つ
- *   - while ループで `performUnitOfWork(fiber)` を呼び続ける
- *   - 各 fiber の処理ごとに「DOM 作成 → 親に append → 子 fiber 化 → 次のユニットを返す」を行う
- *
- * 副産物として、Part 1 の `render` と同じ DOM 出力が得られる
- * （関数コンポーネント・イベント・属性すべて対応）。
+ * 提供する 2 つのエントリポイント:
+ *   - `runFiberRoot`     : 同期版 (2.4)。中断しないので一気に描画。
+ *   - `scheduleFiberRoot`: スケジューラ版 (2.5)。RIC でアイドル時間に少しずつ進める。
  *
  * まだやっていないこと（次以降の章で実装）:
- *   - Part 2.5: ブラウザのアイドル時間に合わせて while ループを **中断・再開**
  *   - Part 2.6: 前回ツリーとの diff（reconciliation・二重バッファ）
  *   - Part 2.7: render と commit の分離（今は work loop 内で eager に DOM を触っている）
  */
@@ -26,6 +24,9 @@ const HOST_ROOT = '__HOST_ROOT__' as const
 
 /** モジュール内の "次にやる仕事" ポインタ。1 root 前提の最小実装。 */
 let nextUnitOfWork: Fiber | null = null
+
+/** スケジューラ版が今アイドル callback を待機中かどうか。二重スケジュールを防ぐフラグ。 */
+let isScheduled = false
 
 /**
  * 仮想 DOM ツリーを container に描画します（Fiber 経由・同期版）。
@@ -51,6 +52,66 @@ export function runFiberRoot(
   while (nextUnitOfWork !== null) {
     nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
   }
+}
+
+/**
+ * 仮想 DOM ツリーを container に描画します（スケジューラ版・中断可能）。Part 2.5 で追加。
+ *
+ * `runFiberRoot` との違い:
+ *   - `runFiberRoot`     : while ループを最後まで回す → 大きな tree でメインスレッドが固まる
+ *   - `scheduleFiberRoot`: deadline.timeRemaining() を見て **1 ms を切ったら yield** し、
+ *                          次のアイドル時間に `requestIdleCallback` で再開する
+ *
+ * 結果として、たとえ 1 万要素のツリーでもブラウザ操作 (クリック・スクロール) が
+ * 中断できる。Part 2.2「Stack Reconciler の限界」で触れた "16ms 予算" 問題への
+ * 最初の手当て。
+ *
+ * 制限:
+ *   - 同時に複数の root をスケジュールしても 1 root しか保持できない (2.6 以降で改善)
+ *   - 描画完了は非同期。テストでは microtask / setTimeout を flush する必要がある
+ */
+export function scheduleFiberRoot(
+  element: ChibireactNode,
+  container: HTMLElement,
+): void {
+  const root = createFiber(HOST_ROOT as unknown as FiberType, {}, null)
+  root.dom = container
+  root.pendingChildren = [element]
+
+  nextUnitOfWork = root
+  if (!isScheduled) {
+    isScheduled = true
+    requestIdleWork(workLoopStep)
+  }
+}
+
+/**
+ * RIC から呼ばれる 1 ステップ。deadline の余裕がある間ユニットを処理し、
+ * 余裕が切れたら yield。残作業があれば次のアイドル時間に再スケジュール。
+ */
+function workLoopStep(deadline: IdleDeadline): void {
+  let shouldYield = false
+  while (nextUnitOfWork !== null && !shouldYield) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+    // 残り時間が 1ms を切ったらブラウザに制御を返す
+    shouldYield = deadline.timeRemaining() < 1
+  }
+  if (nextUnitOfWork !== null) {
+    // まだ残ってる → 次のアイドル時間で再開
+    requestIdleWork(workLoopStep)
+  } else {
+    // 全部終わった
+    isScheduled = false
+  }
+}
+
+/**
+ * @internal
+ * テスト用: スケジューラ状態をリセットする。通常コードからは呼ばない。
+ */
+export function _resetSchedulerForTesting(): void {
+  nextUnitOfWork = null
+  isScheduled = false
 }
 
 /**
