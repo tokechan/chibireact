@@ -1,19 +1,21 @@
 /**
- * useState の最小実装。
+ * useState の最小実装（Part 1.9）+ バッチング（Part 1.10）。
  *
- * 設計（Part 1.9 暫定版）:
+ * 設計（暫定）:
  * - **ルートごとに 1 配列の hooks**（_rootHooks）をモジュール状態で持つ
  * - 各 render 開始前に index を 0 にリセット
  * - useState 呼び出しごとに index++ し、対応する箱から状態を読む
- * - setState は新値を保存して _rerender() を呼ぶ
+ * - setState は新値を保存して、**queueMicrotask で再レンダをバッチング**
  *
- * この実装の制限:
- * - **複数の関数コンポーネントが useState を使うと配列を共有してしまう**
- *   → Part 1.10 で再レンダ機構を整理し、Part 2 (Fiber) で per-fiber に修正
- * - 1 ルート前提（複数 createRoot しても同じ配列を使う）
- * - 「Hooks のルール」（条件分岐内で呼ばない）に依存
+ * バッチング (Part 1.10):
+ * - 同じ tick 内で複数 setState を呼んでも、再レンダは 1 回だけ
+ * - React 18 の automatic batching 相当の最小実装
  *
- * 制限はあるものの、`<Counter />` が動くという「最小の useState」を体験するには十分。
+ * 制限:
+ * - 複数の関数コンポーネントが配列を共有
+ *   → Part 2 (Fiber) で per-fiber に修正
+ * - 1 ルート前提
+ * - Hooks のルールに依存
  */
 
 type Hook<T = unknown> = { state: T }
@@ -21,6 +23,7 @@ type Hook<T = unknown> = { state: T }
 let _rootHooks: Hook[] = []
 let _index = 0
 let _rerender: (() => void) | null = null
+let _scheduled = false
 
 export type SetStateAction<T> = T | ((prev: T) => T)
 export type Dispatch<T> = (action: SetStateAction<T>) => void
@@ -56,10 +59,23 @@ export function useState<T>(initial: T): [T, Dispatch<T>] {
         : action
     if (Object.is(hook.state, next)) return // 同じ値ならスキップ
     hook.state = next
-    _rerender?.()
+    _scheduleRerender()
   }
 
   return [hook.state, setState]
+}
+
+/**
+ * 同じ tick の複数 setState を 1 回の再レンダにまとめます (Part 1.10)。
+ * React 18 の automatic batching 相当の最小実装。
+ */
+function _scheduleRerender(): void {
+  if (_scheduled) return
+  _scheduled = true
+  queueMicrotask(() => {
+    _scheduled = false
+    _rerender?.()
+  })
 }
 
 /**
@@ -81,4 +97,5 @@ export function _clearHooksForTesting(): void {
   _rootHooks = []
   _index = 0
   _rerender = null
+  _scheduled = false
 }

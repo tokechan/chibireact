@@ -3,6 +3,9 @@ import { createRoot } from '../src/create-root'
 import { createElement } from '../src/create-element'
 import { useState, _clearHooksForTesting } from '../src/hooks-state'
 
+/** 次のマイクロタスクまで待つヘルパー */
+const flushMicrotasks = () => new Promise<void>((resolve) => queueMicrotask(resolve))
+
 describe('useState', () => {
   let container: HTMLElement
 
@@ -11,7 +14,7 @@ describe('useState', () => {
     _clearHooksForTesting()
   })
 
-  it('初期値で状態を持ち、ボタンクリックで更新できます (Counter)', () => {
+  it('初期値で状態を持ち、ボタンクリックで更新できます (Counter)', async () => {
     const Counter = () => {
       const [count, setCount] = useState(0)
       return createElement(
@@ -28,13 +31,15 @@ describe('useState', () => {
     expect(button.textContent).toBe('0')
 
     button.click()
+    await flushMicrotasks()
     expect((container.firstChild as HTMLButtonElement).textContent).toBe('1')
 
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
     expect((container.firstChild as HTMLButtonElement).textContent).toBe('2')
   })
 
-  it('関数型の setState (prev => next) で安全に更新できます', () => {
+  it('関数型の setState (prev => next) で安全に更新できます', async () => {
     const Counter = () => {
       const [count, setCount] = useState(0)
       return createElement(
@@ -47,13 +52,16 @@ describe('useState', () => {
     const root = createRoot(container)
     root.render(createElement(Counter, null))
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
 
     expect((container.firstChild as HTMLButtonElement).textContent).toBe('3')
   })
 
-  it('複数の useState 呼び出しを同じ順序で扱えます', () => {
+  it('複数の useState 呼び出しを同じ順序で扱えます', async () => {
     const Form = () => {
       const [name, setName] = useState('')
       const [age, setAge] = useState(0)
@@ -81,13 +89,14 @@ describe('useState', () => {
 
     const btn = container.querySelector('#btn') as HTMLButtonElement
     btn.click()
+    await flushMicrotasks()
 
     // クリック後の DOM
     expect(container.querySelector('#name')?.textContent).toBe('tokechan')
     expect(container.querySelector('#age')?.textContent).toBe('99')
   })
 
-  it('同じ値を setState しても再レンダはスキップします (Object.is)', () => {
+  it('同じ値を setState しても再レンダはスキップします (Object.is)', async () => {
     let renderCount = 0
     const App = () => {
       renderCount++
@@ -104,11 +113,12 @@ describe('useState', () => {
 
     const initialRenderCount = renderCount
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
 
     expect(renderCount).toBe(initialRenderCount) // 増えない
   })
 
-  it('オブジェクトを state として持てます', () => {
+  it('オブジェクトを state として持てます', async () => {
     type User = { name: string; count: number }
     const App = () => {
       const [user, setUser] = useState<User>({ name: 'a', count: 0 })
@@ -122,7 +132,9 @@ describe('useState', () => {
     const root = createRoot(container)
     root.render(createElement(App, null))
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
     ;(container.firstChild as HTMLButtonElement).click()
+    await flushMicrotasks()
 
     expect((container.firstChild as HTMLButtonElement).textContent).toBe('a:2')
   })
