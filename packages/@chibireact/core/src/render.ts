@@ -40,11 +40,12 @@ export function render(element: ChibireactNode, container: HTMLElement | Node): 
 }
 
 /**
- * key が `on` で始まり、続く文字が大文字なら on... 系のイベントハンドラ。
- * 例: onClick, onMouseDown, onChange
+ * `on` で始まり、次が大文字（onClick, onMouseDown など）の prop を
+ * イベントハンドラとして識別します。
+ * `onclick`（小文字）や `open`（on 始まりではない）は弾きます。
  */
 function isEventProp(key: string): boolean {
-  return key.startsWith('on') && key.length > 2 && key[2] === key[2]?.toUpperCase()
+  return /^on[A-Z]/.test(key)
 }
 
 /**

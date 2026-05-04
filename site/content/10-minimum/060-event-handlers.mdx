@@ -61,7 +61,7 @@ React は **camelCase** で `onClick`, `onMouseDown`, `onChange` などの prop 
 
 ## テストを書く（Red）
 
-`packages/@chibireact/core/tests/events.test.ts`:
+`packages/@chibireact/core/tests/render-events.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, vi } from 'vitest'
@@ -105,10 +105,9 @@ describe('render events', () => {
 `render.ts` の `applyProps` にイベント分岐を追加します。
 
 ```ts
+// `on` で始まり、次が大文字（onClick など）の prop を event として識別
 function isEventProp(key: string): boolean {
-  return key.startsWith('on')
-    && key.length > 2
-    && key[2] === key[2]?.toUpperCase()
+  return /^on[A-Z]/.test(key)
 }
 
 function getEventName(key: string): string {
@@ -152,7 +151,7 @@ function applyProps(dom: HTMLElement, props: Record<string, unknown>): void {
 テスト再実行:
 
 ```
- ✓ tests/events.test.ts (9 tests)
+ ✓ tests/render-events.test.ts (9 tests)
 
  Test Files  5 passed (5)
       Tests  38 passed (38)
