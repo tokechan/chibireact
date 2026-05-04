@@ -1,0 +1,386 @@
+---
+title: work loop と作業の単位化
+description: 再帰でツリーを処理する代わりに、明示的な while ループと「次の仕事ポインタ」で 1 ノードずつ進めます
+---
+
+# work loop と作業の単位化
+
+[Fiber Node とは何か](./030-fiber-node) でデータ構造を定義しました。
+ですが 2.3 の `buildFiberTree` はまだ **同期再帰** で「全部一気に作る」関数でした。
+本章ではこれを **「1 ノードずつ進む while ループ」** に書き換えます。これが Fiber アーキテクチャの心臓部 = **work loop** です。
+
+## この章のゴール
+
+- 「次にやる仕事」を **`nextUnitOfWork: Fiber | null`** という変数で表現できる
+- `performUnitOfWork(fiber)` が 1 ノード分の処理を行い、**次の Fiber を返す** という関数を書ける
+- 関数コンポーネントの呼び出しが **eager → 遅延** に変わったことを理解する
+- `runFiberRoot(element, container)` で Part 1 の `render` と同じ DOM 出力が出る
+- 「中断したくなったらどこで止まれるか」が見える状態にする（実際の中断は次章）
+
+> 章末に動くもの: Fiber 経由で DOM が描画できる。テスト 19 個が緑、累計 **103/103**。
+>
+> Part 1 の `render` も従来通り動く。`runFiberRoot` は **同等機能の代替実装**。
+> `createRoot`（useState 含む）の差し替えは Part 2.6/2.7 で行う。
+
+前章: [Fiber Node とは何か](./030-fiber-node)
+
+## なぜ「再帰」を「while ループ」に書き直すのか
+
+Part 1 の `render` を見直してください:
+
+```ts
+function render(node, container) {
+  // ...
+  for (const child of node.children) {
+    render(child, dom)  // 再帰
+  }
+  container.appendChild(dom)
+}
+```
+
+**コールスタックに状態を乗せている**ので、外から「いま何をしていて、次は何をする予定か」を覗けません。
+途中で抜けるには `throw` するしかなく、再開する手段はありません。
+
+work loop はここを **明示的な変数** に置き換えます:
+
+```ts
+let nextUnitOfWork: Fiber | null = root
+while (nextUnitOfWork !== null) {
+  nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+}
+```
+
+「いま処理する fiber」がモジュール変数。`performUnitOfWork` は処理 1 単位を終えて **次の fiber を返す** だけ。
+**この while を抜ければ中断できます。** 次章 (2.5) でその抜け方をスケジューラに任せます。
+
+## 「次の仕事」をどう決めるか
+
+> Fiber は parent / child / sibling のリンクを持つ linked-list。
+> 「次の作業」はこの構造の上を 3 ステップで決められます。
+
+```ts
+function findNextUnit(fiber: Fiber): Fiber | null {
+  // 1. 子があれば降りる（深さ優先）
+  if (fiber.child !== null) return fiber.child
+  // 2. 自分または上方向の sibling を探す
+  let next: Fiber | null = fiber
+  while (next !== null) {
+    if (next.sibling !== null) return next.sibling
+    next = next.parent
+  }
+  return null
+}
+```
+
+例 `<div><h1>A</h1><p>B</p></div>` の訪問順:
+
+```
+div → h1 → "A" → (sibling=p) → "B" → 終了
+       │    │       │           │
+       child child sibling      parent.parent.sibling=null → null
+```
+
+`<App>` 1 個渡したときの完全な訪問順は次のようになります:
+
+```
+[ROOT]
+  └─ App                    (関数コンポーネント Fiber)
+        └─ div              (App の戻り値)
+              ├─ h1
+              │   └─ "A"
+              └─ p
+                  └─ "B"
+
+訪問順: ROOT → App → div → h1 → "A" → p → "B" → 終了
+```
+
+## `performUnitOfWork` の中身
+
+1 つの Fiber を処理するときにやることは 5 つ:
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  // 1. 関数コンポーネントなら関数を呼ぶ → 戻り値を pendingChildren に
+  if (typeof fiber.type === 'function') {
+    const componentProps = { ...fiber.props, children: fiber.pendingChildren }
+    const result = (fiber.type as Function)(componentProps)
+    fiber.pendingChildren = [result]
+  }
+
+  // 2. DOM ノードを作る (host, text のみ)
+  if (fiber.dom === null) {
+    fiber.dom = createDomFromFiber(fiber)
+  }
+
+  // 3. DOM を親に append する（DOM を持つ最寄りの祖先）
+  if (fiber.parent !== null && fiber.dom !== null) {
+    findClosestDomAncestor(fiber)?.appendChild(fiber.dom)
+  }
+
+  // 4. children を Fiber 化して child / sibling 鎖を張る
+  reconcileChildren(fiber, fiber.pendingChildren)
+
+  // 5. 次の作業単位を返す
+  return findNextUnit(fiber)
+}
+```
+
+ステップ 1 の **「関数コンポーネントを `performUnitOfWork` の中で呼ぶ」** が前章 (2.3) との大きな差です。
+
+| | Part 2.3 (`buildFiberTree`) | Part 2.4 (`performUnitOfWork`) |
+|---|---|---|
+| 関数コンポーネントの呼び出し | tree 構築時に **eager** | **work loop が来たタイミング** で呼ぶ |
+| ループ構造 | 再帰呼び出し | 明示的 while + `nextUnitOfWork` |
+| DOM 作成 | しない | する |
+| 中断可能 | 不可 | 可（次章で実装） |
+
+## Fiber 型を拡張する
+
+2.3 で定義した Fiber に **2 フィールド** を追加します:
+
+```ts
+export type Fiber = {
+  type: FiberType
+  props: Record<string, unknown>
+  key: string | number | null
+  parent: Fiber | null
+  child: Fiber | null
+  sibling: Fiber | null
+  // NEW
+  dom: Node | null               // 関連付けられた実 DOM (function fiber は null)
+  pendingChildren: readonly ChibireactNode[]  // 次に Fiber 化する子の vDOM 配列
+}
+```
+
+- `dom`: その Fiber に対応する実 DOM。host element と text fiber は持つ。関数コンポーネントは null（透過）。
+- `pendingChildren`: 「Fiber 化を遅延させた」未処理の子。host fiber では生成時に `element.children` を入れる。関数 fiber は処理時に関数を呼んだ戻り値で上書き。
+
+`createFiber` のデフォルトは `dom: null`, `pendingChildren: []`。
+
+> Part 2.3 の `buildFiberTree` はこれらのフィールドを使わないので、追加しても 2.3 のテストは緑のままです。
+
+## ルート Fiber と「`HOST_ROOT` sentinel」
+
+work loop は **「次にやる Fiber」が常に手元にある** ことを前提にしています。
+そのため container を 1 つの Fiber としてラップします:
+
+```ts
+const HOST_ROOT = '__HOST_ROOT__' as const
+
+export function runFiberRoot(element: ChibireactNode, container: HTMLElement): void {
+  const root = createFiber(HOST_ROOT, {}, null)
+  root.dom = container               // ルートの DOM = container 自身
+  root.pendingChildren = [element]   // 最初に展開するのは渡された 1 個
+
+  nextUnitOfWork = root
+  while (nextUnitOfWork !== null) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+  }
+}
+```
+
+`HOST_ROOT` は host element でも関数でもない特別な type で、`createDomFromFiber` で除外されます（DOM は既に container を持っているため）。
+
+> 本家 React も同じ概念で `HostRoot` というタグを使っています。
+
+## テストを書く（TDD）
+
+「Part 1 の render と同じ DOM が出る」ことが期待される振る舞いです。
+
+```ts
+// packages/@chibireact/core/tests/work-loop.test.ts
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { runFiberRoot } from '../src/work-loop'
+import { createElement } from '../src/create-element'
+
+describe('work loop: 基本的な DOM 生成', () => {
+  let container: HTMLElement
+  beforeEach(() => {
+    container = document.createElement('div')
+  })
+
+  it('単純な要素を container に描画できる', () => {
+    runFiberRoot(createElement('h1', null, 'Hello'), container)
+    expect(container.firstChild?.nodeName).toBe('H1')
+    expect(container.firstChild?.textContent).toBe('Hello')
+  })
+
+  it('深い入れ子が正しく描画される', () => {
+    runFiberRoot(
+      createElement(
+        'section',
+        null,
+        createElement('article', null,
+          createElement('h1', null, 'Title'),
+          createElement('p', null, 'Body'),
+        ),
+      ),
+      container,
+    )
+
+    const article = container.firstChild!.firstChild as HTMLElement
+    expect(article.children[0].nodeName).toBe('H1')
+    expect(article.children[1].textContent).toBe('Body')
+  })
+})
+
+describe('work loop: 関数コンポーネント (遅延評価)', () => {
+  it('関数コンポーネントは「処理されるタイミング」で呼ばれる', () => {
+    const spy = vi.fn(() => createElement('span', null, 'rendered'))
+    expect(spy).not.toHaveBeenCalled()
+
+    const container = document.createElement('div')
+    runFiberRoot(createElement(spy, null), container)
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+})
+```
+
+## 実装する
+
+`packages/@chibireact/core/src/work-loop.ts`:
+
+```ts
+import type { ChibireactNode } from './types'
+import { TEXT_ELEMENT, createFiber, type Fiber, type FiberType } from './fiber'
+
+const HOST_ROOT = '__HOST_ROOT__' as const
+let nextUnitOfWork: Fiber | null = null
+
+export function runFiberRoot(
+  element: ChibireactNode,
+  container: HTMLElement,
+): void {
+  const root = createFiber(HOST_ROOT as unknown as FiberType, {}, null)
+  root.dom = container
+  root.pendingChildren = [element]
+
+  nextUnitOfWork = root
+  while (nextUnitOfWork !== null) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+  }
+}
+
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  if (typeof fiber.type === 'function') {
+    const componentProps = {
+      ...fiber.props,
+      children: fiber.pendingChildren,
+    }
+    const result = (fiber.type as Function)(componentProps)
+    fiber.pendingChildren = [result]
+  }
+
+  if (fiber.dom === null) {
+    fiber.dom = createDomFromFiber(fiber)
+  }
+
+  if (fiber.parent !== null && fiber.dom !== null) {
+    const parentDom = findClosestDomAncestor(fiber)
+    if (parentDom !== null) {
+      parentDom.appendChild(fiber.dom)
+    }
+  }
+
+  reconcileChildren(fiber, fiber.pendingChildren)
+  return findNextUnit(fiber)
+}
+```
+
+補助関数（`reconcileChildren`, `nodeToFiber`, `findNextUnit`, `findClosestDomAncestor`, `createDomFromFiber`, `applyProps` など）は実コードを参照してください。`applyProps` は Part 1.5 / 1.6 のロジックそのままです。
+
+## 関数コンポーネントが「透過」になる仕組み
+
+関数コンポーネント Fiber は `dom: null` です。その子要素 (関数の戻り値) は **DOM を持つ最寄りの祖先** に append されます:
+
+```ts
+function findClosestDomAncestor(fiber: Fiber): Node | null {
+  let p = fiber.parent
+  while (p !== null && p.dom === null) {
+    p = p.parent
+  }
+  return p?.dom ?? null
+}
+```
+
+例:
+
+```
+Fiber 構造:
+  ROOT (dom=container)
+    └─ Counter (関数 Fiber, dom=null)
+          └─ div  (dom=<div>)
+
+div を append するとき:
+  findClosestDomAncestor(div)
+    → div.parent = Counter (dom=null)
+    → Counter.parent = ROOT (dom=container)
+    → return container
+```
+
+Counter が「DOM 上は存在しないが論理的には存在する」のは、この `dom: null` + 祖先探索によるものです。
+
+## テストを通す
+
+```
+ ✓ tests/work-loop.test.ts (19 tests)
+ Test Files  12 passed (12)
+      Tests  103 passed (103)
+```
+
+19 テスト追加して全部緑。Part 1 の 84 テストもそのまま通過。
+
+## まだやっていないこと
+
+| 機能 | 状態 |
+|---|---|
+| 中断・再開（while ループの抜け方） | ❌（次章 2.5: requestIdleCallback） |
+| 前回ツリーとの diff (reconciliation) | ❌（2.6: 二重バッファ） |
+| 副作用フラグと commit phase 分離 | ❌（2.7） |
+| `createRoot` を Fiber 版に差し替え | ❌（2.6/2.7 で） |
+
+今の `runFiberRoot` は **「再描画」が無く、初回描画のみ** です。再描画では二重バッファ (`alternate`) で前回 Fiber と比較する必要があります。これは 2.6 で。
+
+## ちょっと深掘り
+
+### なぜ children を `props` ではなく `pendingChildren` という別フィールドに?
+
+本家 React では children は `props.children` に入っています。本書 chibireact は `ChibireactElement.children` をトップレベルに置く設計を採っているため、Fiber でも別フィールドにしました。
+
+`pendingChildren` という名前は「**まだ Fiber 化されていない、これから処理する予定の子**」を強調するため。Fiber 化が終わった後はこの配列を読まなくなり、子は `parent.child` 経由で辿れるようになります。
+
+### 関数コンポーネントを処理時に呼ぶ意義（次章への布石）
+
+Part 2.3 では `elementChildren()` 内で関数コンポーネントを **eager に** 呼んでいました。
+2.4 では `performUnitOfWork` の **ステップ 1** で呼びます。これによって:
+
+- 関数コンポーネントを呼ぶ前に **deadline チェック** ができる（2.5）
+- 関数の中で `useState` などの hook を呼ぶ前に **どの fiber を処理しているか** をモジュール状態に書き込める（2.7 以降）
+- Suspense などで「途中で止めて後で再開」が成立する（Part 5）
+
+### Pombo "Build your own React" との対応
+
+本書 2.4 は Pombo の Step IV "Fibers" + Step VII "Function and Hooks (前半)" 相当です。
+ただし Pombo は最初から `props.children` を使うため、children の格納場所が違います。
+また Pombo は最初から `requestIdleCallback` で書くため、本書のように
+「同期 work loop → 次章でスケジューラに切り替え」という段階を踏みません。
+
+本書の段階分けは「**先に同期で動かして納得してから、中断機構を入れる**」という、より教育的な構成です。
+
+## まとめ
+
+- `nextUnitOfWork` ポインタと `while` ループで Fiber tree を 1 ノードずつ処理した
+- `performUnitOfWork` は 5 ステップ（関数評価 / DOM 作成 / append / 子 fiber 化 / 次のユニット）
+- 関数コンポーネントの呼び出しが **eager → 遅延** に進化
+- 関数 Fiber は `dom: null` で透過、子は祖先の DOM に付く
+- `runFiberRoot` で Part 1 の `render` と同じ DOM 出力が得られる
+- 次章で while を **ブラウザのアイドル時間に合わせて抜ける** 形に進化させる
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/20-fiber/040-work-loop.mdx site/content/20-fiber/_meta.js
+git commit -m "feat(part2): 2.4 work loop と作業の単位化"
+```
+
+→ 次の章: [requestIdleCallback と最小スケジューラ](./050-scheduler)（執筆中）

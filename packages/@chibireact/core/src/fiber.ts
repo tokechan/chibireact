@@ -67,6 +67,22 @@ export type Fiber = {
   parent: Fiber | null
   child: Fiber | null
   sibling: Fiber | null
+  /**
+   * この Fiber に関連付けられた実 DOM ノード。
+   * - host fiber (string type) や text fiber → 対応する DOM
+   * - 関数コンポーネント Fiber → null（DOM を持たない）
+   * - 2.3 の `buildFiberTree` では未使用。2.4 の work loop で利用開始。
+   */
+  dom: Node | null
+  /**
+   * この Fiber を処理するときに「次に Fiber 化すべき子の vDOM 配列」。
+   * - 2.3 の `buildFiberTree` ではトラバース時に都度 `elementChildren()` で再導出するので未使用 (`[]`)。
+   * - 2.4 の work loop では遅延 fiber 化の入力として使う:
+   *   - host fiber: element.children
+   *   - function fiber: 関数を呼び出した戻り値 1 個
+   *   - root fiber: [rootElement]
+   */
+  pendingChildren: readonly ChibireactNode[]
 }
 
 /**
@@ -84,6 +100,8 @@ export function createFiber(
     parent: null,
     child: null,
     sibling: null,
+    dom: null,
+    pendingChildren: [],
   }
 }
 
