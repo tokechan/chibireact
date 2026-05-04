@@ -2,9 +2,11 @@ export { createRoot } from './create-root'
 export { createElement } from './create-element'
 export { render } from './render'
 export { useState } from './hooks-state'
+export { buildFiberTree, createFiber, TEXT_ELEMENT } from './fiber'
 export type { ChibireactElement, ChibireactNode } from './types'
 export type { Root } from './create-root'
 export type { Dispatch, SetStateAction } from './hooks-state'
+export type { Fiber, FiberType } from './fiber'
 export type {
   FunctionComponent,
   FC,

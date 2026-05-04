@@ -1,0 +1,338 @@
+---
+title: Fiber Node とは何か
+description: Fiber アーキテクチャの中核データ構造を、parent / child / sibling の linked-list として実装します
+---
+
+# Fiber Node とは何か
+
+前章 [Stack Reconciler の限界](./020-stack-reconciler-limits) で、同期再帰の描画では「途中で止まれない」問題を見ました。
+
+> **中断・再開ができるためには、作業の状態を「明示的なオブジェクト」として持たないといけない**
+
+この章では、その「明示的なオブジェクト」 = **Fiber Node** を作ります。Fiber アーキテクチャの **データ構造の章** です。
+
+## この章のゴール
+
+- Fiber Node の最小フィールド (`type` / `props` / `parent` / `child` / `sibling`) を言える
+- vDOM ツリーから Fiber linked-list を構築できる（同期版）
+- なぜコールスタックの再帰ではなく **明示的なポインタ** が必要なのかを説明できる
+- テキストノード用の `TEXT_ELEMENT` 擬似タイプの意図が分かる
+
+> 章末に動くもの: `buildFiberTree` で element を Fiber に変換、テスト 15 個が緑、累計 **84/84**。
+> まだ DOM への描画は Part 1 の `render` を使う。Fiber を実際の描画に繋げるのは次章 2.4。
+
+前章: [Stack Reconciler の限界](./020-stack-reconciler-limits)
+
+## Fiber が解こうとしている問題（おさらい）
+
+Part 1 の `render`:
+
+```ts
+function render(node, container) {
+  // ...
+  for (const child of node.children) {
+    render(child, dom)  // ← 再帰呼び出し: 状態はコールスタックに乗っている
+  }
+}
+```
+
+「いま自分はどのノードを処理していて、次はどこに行くのか」 が **コールスタックのフレーム** に暗黙的に乗っています。これは速いし簡単ですが、**外から覗けません**。
+
+ブラウザに「ちょっと待って、今フレーム描画したいから止めてくれない？」と言われても、コールスタックの途中で停めて、再開時に同じ場所から続けるのは不可能です。
+
+Fiber は **「次にやることをオブジェクトのフィールドに書き出す」** ことでこれを解決します。
+
+## Fiber Node のリンク構造
+
+> ポイント: Fiber は「ツリー」ですが、子の表現が **配列ではなく「最初の子 + 兄弟」のリスト** になっています。
+
+```
+       div
+       /
+   parent
+       \
+        h1 ─sibling─→ p ─sibling─→ ul
+                                   /
+                               child
+                                   \
+                                    li ─sibling─→ li ─sibling─→ li
+```
+
+3 つのフィールドだけで木全体を表せます:
+
+| フィールド | 役割 |
+|---|---|
+| `parent` | 親 Fiber |
+| `child` | **最初の** 子 Fiber（残りはここから sibling で辿る）|
+| `sibling` | 同じ親を持つ次の Fiber |
+
+「次にやる仕事」の探索は次の規則で完全に決まります（次章 work loop で使います）:
+
+1. `child` があるなら降りる
+2. なければ `sibling` を見る
+3. それも無ければ `parent.sibling` を辿って上に戻りながら探す
+
+## 型を定義する
+
+`packages/@chibireact/core/src/fiber.ts` を新設します。
+
+```ts
+export const TEXT_ELEMENT = '__TEXT_ELEMENT__' as const
+
+export type FiberType = string | Function | typeof TEXT_ELEMENT
+
+export type Fiber = {
+  type: FiberType
+  props: Record<string, unknown>
+  key: string | number | null
+  parent: Fiber | null
+  child: Fiber | null
+  sibling: Fiber | null
+}
+```
+
+ポイント:
+
+- **`TEXT_ELEMENT`**: 文字列・数値の child は **テキスト用 Fiber** に揃えます。本家 React も内部に `HostText` という似た仕組みを持ちます。全 Fiber の `type` フィールドが必ず存在することで、後の work loop が一貫した処理を書きやすくなります。
+- **`key`**: Part 1.11 で element に追加した識別子をそのまま引き継ぎます。Part 2.7 の reconciliation でリスト並び替えに使います。
+- **`alternate` などはまだ無い**: 二重バッファや effect tag は Part 2.6 / 2.7 で追加します。今は最小構成で。
+
+## テストを書く（TDD）
+
+「Fiber がどう繋がっているべきか」をまず期待として書きます。
+
+```ts
+// packages/@chibireact/core/tests/fiber.test.ts
+import { describe, it, expect } from 'vitest'
+import { buildFiberTree, TEXT_ELEMENT } from '../src/fiber'
+import { createElement } from '../src/create-element'
+
+describe('Fiber: 単一ノード', () => {
+  it('HTML element から Fiber を作ると type / props / key が保存される', () => {
+    const element = createElement('h1', { className: 'title' }, 'Hello')
+    const fiber = buildFiberTree(element)!
+
+    expect(fiber.type).toBe('h1')
+    expect(fiber.props.className).toBe('title')
+    expect(fiber.key).toBeNull()
+  })
+
+  it('文字列の child は TEXT_ELEMENT 型の Fiber になる', () => {
+    const root = buildFiberTree(createElement('p', null, 'こんにちは'))!
+    expect(root.child!.type).toBe(TEXT_ELEMENT)
+    expect(root.child!.props.nodeValue).toBe('こんにちは')
+  })
+})
+
+describe('Fiber: parent / child リンク', () => {
+  it('1 つの子を持つ要素は parent.child / child.parent が双方向に繋がる', () => {
+    const element = createElement('div', null, createElement('h1', null))
+    const parent = buildFiberTree(element)!
+    const child = parent.child!
+
+    expect(child.parent).toBe(parent)
+    expect(child.sibling).toBeNull()
+  })
+})
+
+describe('Fiber: sibling リンク', () => {
+  it('複数の子は parent.child から sibling で繋がる', () => {
+    const tree = createElement(
+      'ul',
+      null,
+      createElement('li', null, 'A'),
+      createElement('li', null, 'B'),
+      createElement('li', null, 'C'),
+    )
+    const ul = buildFiberTree(tree)!
+    const liA = ul.child!
+    const liB = liA.sibling!
+    const liC = liB.sibling!
+
+    expect(liC.sibling).toBeNull()
+  })
+})
+```
+
+実行すれば当然失敗します（まだ実装が無い）。
+
+## 実装する: `buildFiberTree`
+
+vDOM ノードを受け取り、Fiber linked-list のルートを返します。
+**今回は同期で一気に作る**。次章 2.4 でこれを「1 ノードずつ」に書き換えます。
+
+```ts
+import type { ChibireactElement, ChibireactNode } from './types'
+
+export function createFiber(
+  type: FiberType,
+  props: Record<string, unknown>,
+  key: string | number | null = null,
+): Fiber {
+  return {
+    type,
+    props,
+    key,
+    parent: null,
+    child: null,
+    sibling: null,
+  }
+}
+
+export function buildFiberTree(node: ChibireactNode): Fiber | null {
+  const fiber = nodeToFiber(node)
+  if (fiber === null) return null
+
+  const children = elementChildren(node)
+  let prev: Fiber | null = null
+  for (const childNode of flattenIter(children)) {
+    const childFiber = buildFiberTree(childNode)
+    if (childFiber === null) continue
+    childFiber.parent = fiber
+    if (fiber.child === null) {
+      fiber.child = childFiber
+    } else if (prev !== null) {
+      prev.sibling = childFiber
+    }
+    prev = childFiber
+  }
+
+  return fiber
+}
+```
+
+「最初の子は `parent.child` に、2 つめ以降は `prev.sibling` に繋ぐ」のがコア。`prev` を 1 つ前の子で更新していくループです。
+
+補助関数も並べます:
+
+```ts
+function nodeToFiber(node: ChibireactNode): Fiber | null {
+  if (node === null || node === undefined || typeof node === 'boolean') return null
+  if (isNodeArray(node)) return null
+  if (typeof node === 'string' || typeof node === 'number') {
+    return createFiber(TEXT_ELEMENT, { nodeValue: String(node) })
+  }
+  return createFiber(node.type, node.props, node.key ?? null)
+}
+
+function elementChildren(node: ChibireactNode): readonly ChibireactNode[] {
+  if (!isElement(node)) return []
+  if (typeof node.type === 'function') {
+    const componentProps = { ...node.props, children: node.children }
+    const result = (node.type as (p: Record<string, unknown>) => ChibireactNode)(
+      componentProps,
+    )
+    return [result]
+  }
+  return node.children
+}
+
+function* flattenIter(
+  nodes: readonly ChibireactNode[],
+): IterableIterator<ChibireactNode> {
+  for (const n of nodes) {
+    if (isNodeArray(n)) yield* flattenIter(n)
+    else yield n
+  }
+}
+```
+
+`flattenIter` は Part 1.7 の「配列を再帰展開する」と同じ仕事です。children に混じった `[a, [b, [c]]]` を `a, b, c` の sibling 鎖に直します。
+
+### 関数コンポーネントはどう扱うか
+
+Part 1 の render と同じく、**関数を呼んでその戻り値を 1 個の child** として扱います。
+すると `<App />` の Fiber は次のような構造に:
+
+```
+<App />
+↓
+Fiber(type=App)
+  └─ child → Fiber(type='div')      ← App() の戻り値
+        └─ child → Fiber(type='h1') ← div の最初の子
+              └─ ...
+```
+
+> 重要: この **「関数を呼ぶタイミング」** は、Part 2.4 の work loop で再定義します。今は eager（即時呼び出し）です。
+
+## テストを通す
+
+実装を保存して `pnpm test`:
+
+```
+ ✓ tests/fiber.test.ts (15 tests)
+ Test Files  11 passed (11)
+      Tests  84 passed (84)
+```
+
+これで **Green**。Part 1 の 69 テストは引き続き全緑のまま、Fiber の 15 テストが追加されました。
+
+## まだやっていないこと（重要）
+
+ここまでで作ったのは **データ構造とその構築だけ** です。次が **「無い」** ことに注意してください:
+
+| 機能 | 状態 |
+|---|---|
+| Fiber を使った DOM 描画 | ❌（次章 2.4） |
+| 中断・再開 | ❌（次章 2.4 で work loop） |
+| ブラウザのアイドル時間に合わせて進める | ❌（2.5 でスケジューラ） |
+| 前回ツリーとの diff（reconciliation） | ❌（2.6 で二重バッファ） |
+| 副作用フラグと commit | ❌（2.7） |
+
+つまり今の `buildFiberTree` は **「再帰で全部作る」** という意味で Part 1 の `render` と本質的に同じです。
+**「自分で順序を制御できる構造に書き直した」** ところがゴール。次章でこの構造を活かして「1 ノードずつ進める」work loop を入れます。
+
+## ちょっと深掘り
+
+### なぜ「最初の子 + sibling」なのか（配列ではなく）
+
+Fiber が children を配列ではなく linked-list で持つのは:
+
+1. **メモリ効率**: 子の数を事前に知らなくていい。動的に追加・削除しやすい
+2. **work loop の単純化**: 「次の仕事」を `child → sibling → parent.sibling → ...` の **3 つのポインタ追跡だけ** で表せる
+3. **二重バッファとの相性**: 後の章で `alternate` を加えて新旧 Fiber を行き来する際、各ノードが独立したオブジェクトだと差し替えが楽
+
+本家 React 16+ もまったく同じ理由でこの形を採っています。
+
+### `TEXT_ELEMENT` という擬似タイプ
+
+```ts
+// 文字列の子
+'Hello' → Fiber(type=TEXT_ELEMENT, props={ nodeValue: 'Hello' })
+```
+
+なぜわざわざ Fiber に変換するのか？ 答えは **work loop の一貫性** です。
+
+Fiber を 1 個ずつ処理する関数（次章で書きます）が、毎回「あ、これは要素か？テキストか？」と分岐するのは煩雑。**全 Fiber が `type` と `props` を持つ** という前提に揃えると、一様に書けます。
+
+本家 React も内部で `HostText` というタグを使って同じ抽象化をしています。
+
+### 関数コンポーネントの「呼ぶタイミング」問題
+
+Part 2.4 で work loop を導入すると、関数コンポーネント Fiber は:
+
+- work loop が「この Fiber を処理する番」になったタイミングで関数を呼ぶ
+- その戻り値から子 Fiber を生成する
+
+という **遅延評価** に変わります。
+
+これによって:
+- 関数コンポーネントの呼び出しもブラウザに **割り込まれて中断** できる
+- Suspense などで「途中で止めて後で再開」が成立する
+
+## まとめ
+
+- Fiber は **`type` / `props` / `parent` / `child` / `sibling`** を持つオブジェクト
+- vDOM ツリーは **「最初の子 + sibling 鎖」** の linked-list として表現する
+- 文字列・数値は `TEXT_ELEMENT` 型の Fiber に揃えると後の処理が一様になる
+- 今章では同期に全構築。**まだ DOM には繋がっていない**
+- 次章で「1 ノードずつ進める work loop」を入れる
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/20-fiber
+git commit -m "feat(part2): 2.3 Fiber Node データ構造（parent/child/sibling）"
+```
+
+→ 次の章: [work loop と作業の単位化](./040-work-loop)（執筆中）
