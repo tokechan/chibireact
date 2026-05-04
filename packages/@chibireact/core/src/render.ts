@@ -7,31 +7,44 @@ import type { ChibireactNode } from './types'
  * - Part 1.4: 骨格（type と children）
  * - Part 1.5: props を DOM 属性として反映
  * - Part 1.6: on... イベントを addEventListener で登録
+ * - Part 1.7: null / undefined / boolean / 配列の child を安全に処理
  * - Part 1.8: 関数コンポーネント対応（予定）
  * - Part 1.10: 再レンダリング差分計算（予定）
  */
-export function render(element: ChibireactNode, container: HTMLElement | Node): void {
+export function render(node: ChibireactNode, container: HTMLElement | Node): void {
+  // null / undefined / boolean は React と同様にスキップ
+  // これにより `cond && <Foo />` のような条件付きレンダリングが書ける
+  if (node === null || node === undefined || typeof node === 'boolean') {
+    return
+  }
+
+  // 配列はそれぞれを再帰的に処理（リストレンダリング用）
+  if (Array.isArray(node)) {
+    for (const item of node) render(item, container)
+    return
+  }
+
   // テキストノード（文字列・数値）
-  if (typeof element === 'string' || typeof element === 'number') {
-    container.appendChild(document.createTextNode(String(element)))
+  if (typeof node === 'string' || typeof node === 'number') {
+    container.appendChild(document.createTextNode(String(node)))
     return
   }
 
   // 関数コンポーネントは未対応（Part 1.8 で追加）
-  if (typeof element.type !== 'string') {
+  if (typeof node.type !== 'string') {
     throw new Error(
       'chibireact: function components are not yet supported (will be added in Part 1.8).',
     )
   }
 
   // HTML 要素を生成
-  const dom = document.createElement(element.type)
+  const dom = document.createElement(node.type)
 
   // props を反映
-  applyProps(dom, element.props)
+  applyProps(dom, node.props)
 
   // 子要素を再帰的に処理
-  for (const child of element.children) {
+  for (const child of node.children) {
     render(child, dom)
   }
 
@@ -40,7 +53,7 @@ export function render(element: ChibireactNode, container: HTMLElement | Node): 
 }
 
 /**
- * `on` で始まり、次が大文字（onClick, onMouseDown など）の prop を
+ * `on` で始まり、次が大文字（onClick など）の prop を
  * イベントハンドラとして識別します。
  * `onclick`（小文字）や `open`（on 始まりではない）は弾きます。
  */

@@ -5,4 +5,5 @@ export default {
   '040-recursive-renderer': '単純な再帰的レンダラー',
   '050-props': 'props を扱う',
   '060-event-handlers': 'イベントハンドラに対応する',
+  '070-children': 'children と入れ子構造',
 }
