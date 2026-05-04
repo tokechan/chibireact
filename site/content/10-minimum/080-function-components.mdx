@@ -1,0 +1,299 @@
+---
+title: 関数コンポーネントの最小実装
+description: function App() { return <h1/> } のような関数コンポーネントが動くようにします
+---
+
+# 関数コンポーネントの最小実装
+
+ここまでで HTML 要素は描画できるようになりましたが、まだ **`function App()` のような関数コンポーネント** は動きません:
+
+```tsx
+function App() {
+  return createElement('h1', null, 'Hello')
+}
+
+createRoot(container).render(createElement(App, null))
+// → エラー: function components are not yet supported
+```
+
+この章で関数コンポーネントを動くようにします。本書のここまでで一番「React っぽい」コードが書けるようになります。
+
+## この章のゴール
+
+- `function MyComp() { return ... }` の関数コンポーネントが描画できる
+- `props` を関数コンポーネントが受け取れる
+- `props.children` で子要素を受け取れる
+- 入れ子の関数コンポーネントが動く
+- 関数コンポーネントが `null` / 配列 / 文字列を返してもよい
+
+> 章末に動くもの: 9 個の関数コンポーネントテストが緑になり、累計 56/56 緑。`<App />` から始まる本物の React 風アプリが書ける状態。
+
+前章: [children と入れ子構造](./070-children)
+
+## 前提知識
+
+- JS の関数とクロージャ
+- `typeof fn === 'function'` での関数判定
+- スプレッド構文 `{ ...obj, child }`
+
+## 関数コンポーネントとは何か
+
+React の関数コンポーネントは、**「props を受け取って element を返す関数」**です。
+
+```tsx
+function Greeting(props) {
+  return createElement('h1', null, `Hello, ${props.name}`)
+}
+```
+
+これを使う側は、HTML 要素と同じように `createElement` の `type` に **関数自体** を渡します:
+
+```tsx
+createElement(Greeting, { name: 'tokechan' })
+// → { type: Greeting, props: { name: 'tokechan' }, children: [] }
+```
+
+`type` が **文字列**（`'h1'` 等）なら HTML 要素、**関数** なら関数コンポーネント、というシンプルな分岐です。
+
+## render が関数コンポーネントを処理する手順
+
+```
+render(element):
+  if element.type === string:
+    document.createElement で DOM を作る (前章までと同じ)
+  else if element.type === function:
+    1. element.props と element.children を 1 つに合体
+    2. element.type(合体した props) を呼び出す
+    3. 戻り値（また element）を再帰的に render する
+```
+
+ポイントは「**呼び出して、戻ってきた element をまた render する**」という再帰構造。これだけで、コンポーネントの組み合わせが任意の深さで成立します。
+
+## なぜ props と children を合体するか
+
+React の関数コンポーネントは `props.children` で子要素にアクセスします:
+
+```tsx
+function Card(props) {
+  return createElement('div', { className: 'card' }, props.children)
+}
+```
+
+ところが本書の chibireact では、`createElement(...)` の戻り値で **children を `props.children` ではなくトップレベルに分離** しています（[1.3 章で議論](./030-create-element)）:
+
+```ts
+{
+  type: Card,
+  props: { className: 'card' },
+  children: [<h2/>, <p/>]
+}
+```
+
+そのまま `Card(element.props)` を呼ぶと **`props.children` が undefined** になり、コンポーネントから子要素にアクセスできません。
+そこで render の中で **合体** します:
+
+```ts
+const componentProps = { ...node.props, children: node.children }
+const result = node.type(componentProps)
+```
+
+これで関数コンポーネント側は `props.children` を従来通り使えます。「内部表現は分離しているけど、コンポーネントへ渡すときだけ React 互換に合体させる」という発想です。
+
+## テストを書く（Red）
+
+`packages/@chibireact/core/tests/render-function-components.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { render } from '../src/render'
+import { createElement } from '../src/create-element'
+
+describe('render function components', () => {
+  let container: HTMLElement
+  beforeEach(() => { container = document.createElement('div') })
+
+  it('もっとも単純な関数コンポーネントが描画されます', () => {
+    const Hello = () => createElement('h1', null, 'Hello')
+    render(createElement(Hello, null), container)
+    expect(container.firstChild?.nodeName).toBe('H1')
+  })
+
+  it('props を受け取れます', () => {
+    const Greeting = (props) =>
+      createElement('p', null, `こんにちは、${props.name} さん`)
+    render(createElement(Greeting, { name: 'tokechan' }), container)
+    expect(container.firstChild?.textContent).toBe('こんにちは、tokechan さん')
+  })
+
+  it('props.children を受け取れます', () => {
+    const Card = (props) =>
+      createElement('div', { className: 'card' }, props.children)
+
+    render(
+      createElement(Card, null,
+        createElement('h2', null, 'タイトル'),
+        createElement('p', null, '本文'),
+      ),
+      container,
+    )
+
+    const card = container.firstChild as HTMLElement
+    expect(card.children.length).toBe(2)
+  })
+})
+```
+
+（実際は他にも 6 ケース: 入れ子コンポーネント / 複数呼び出し / null 返却 / 配列返却 / 文字列返却 / リスト中の使用）
+
+実行すると `function components are not yet supported` で全部失敗します。
+
+## 実装する（Green）
+
+render の `typeof node.type !== 'string'` で throw していた箇所を、**関数コンポーネント分岐に置き換え** ます。
+
+`packages/@chibireact/core/src/render.ts`:
+
+```ts
+export function render(node: ChibireactNode, container: HTMLElement | Node): void {
+  if (node === null || node === undefined || typeof node === 'boolean') return
+  if (Array.isArray(node)) {
+    for (const item of node) render(item, container)
+    return
+  }
+  if (typeof node === 'string' || typeof node === 'number') {
+    container.appendChild(document.createTextNode(String(node)))
+    return
+  }
+
+  // 🆕 関数コンポーネント
+  if (typeof node.type === 'function') {
+    const componentProps = { ...node.props, children: node.children }
+    const result = node.type(componentProps) as ChibireactNode
+    render(result, container)
+    return
+  }
+
+  // ここから先は通常の HTML 要素 (前章までと同じ)
+  const dom = document.createElement(node.type)
+  applyProps(dom, node.props)
+  for (const child of node.children) render(child, dom)
+  container.appendChild(dom)
+}
+```
+
+たった 6 行（`if` ブロック）の追加で関数コンポーネントが動きます。
+
+テスト再実行:
+
+```
+ ✓ tests/render-function-components.test.ts (9 tests)
+
+ Test Files  7 passed (7)
+      Tests  56 passed (56)
+```
+
+これで **Green**。
+
+## 実際に書ける React 風コード
+
+ここまでで以下のような **本物の React のような** コードが動きます:
+
+```tsx
+import { createRoot, createElement } from '@chibireact/core'
+
+function Header(props) {
+  return createElement('header', { className: 'main-header' },
+    createElement('h1', null, props.title),
+  )
+}
+
+function Item(props) {
+  return createElement('li', null, props.label)
+}
+
+function App() {
+  const items = ['Apple', 'Banana', 'Cherry']
+  return createElement('div', null,
+    createElement(Header, { title: 'My Fruits' }),
+    createElement('ul', null,
+      items.map(item => createElement(Item, { label: item })),
+    ),
+  )
+}
+
+createRoot(document.getElementById('app')).render(createElement(App, null))
+```
+
+これが描画されます:
+
+```html
+<div>
+  <header class="main-header">
+    <h1>My Fruits</h1>
+  </header>
+  <ul>
+    <li>Apple</li>
+    <li>Banana</li>
+    <li>Cherry</li>
+  </ul>
+</div>
+```
+
+JSX こそまだですが、構造は完全に React です。
+
+## ちょっと深掘り
+
+### 関数コンポーネントは「呼び出される」だけの存在
+
+注目すべきは **コンポーネントには寿命もインスタンスもない** こと。`render` から見ると、ただ「関数を呼んで戻り値を使う」だけです。**毎回呼ぶたびに新しい結果を得る**、ステートレスな存在。
+
+これが React の哲学「コンポーネントは pure function であるべき」の理由です。同じ props なら同じ結果を返すべき。状態が必要なときは外（hooks）に置きます。
+
+### ではなぜ Class Component が React にはあったのか
+
+React 16.8 までは関数コンポーネントは状態を持てず、状態を扱うには Class Component が必須でした:
+
+```jsx
+class Counter extends React.Component {
+  state = { count: 0 }
+  render() { return <button>{this.state.count}</button> }
+}
+```
+
+Hooks (`useState`) の導入で関数コンポーネントが状態を持てるようになり、Class はほぼ使われなくなりました。本書では Class Component は扱いません。Hooks ルートで進めます。
+
+### `React.memo` のようなメモ化は？
+
+現状 chibireact は **毎回コンポーネントを呼び直し** ます。同じ props でも再評価します。これは無駄な計算です。
+
+本家 React では `React.memo` で「props が変わらなければスキップ」を表現できます:
+
+```jsx
+const Memoized = React.memo(MyComponent)
+```
+
+本書ではこれを **Part 1.10 の差分計算** や **Part 3.7 の useMemo** で扱います。最小実装ではメモ化なしで進めます。
+
+### Class Component のサポートは？
+
+本書では扱いません。`typeof node.type === 'function'` の判定では、Class も function として認識される（class は constructor function）ので、たまたま呼べるかもしれません。が、`new MyClass(props)` で呼ぶ必要があるなど扱いが違うので、まじめに対応するならフラグで分岐が必要。
+
+本書 chibireact のスコープでは **関数コンポーネント一本** で進めます。
+
+## まとめ
+
+- `typeof node.type === 'function'` で関数コンポーネントを判別
+- `componentProps = { ...node.props, children: node.children }` で React 互換の `props.children` を提供
+- 戻り値を **再帰的に render** する単純な仕組み
+- これで本物の React 風なツリーが書けるようになりました
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/080-function-components.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.8 関数コンポーネントの最小実装"
+```
+
+次はいよいよ Part 1 の最大の山場、**`useState` の最小実装** です。「状態を持てる関数コンポーネント」が実現します。
+
+→ 次の章: [useState の最小実装](./090-use-state)
