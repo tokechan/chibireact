@@ -1,84 +1,78 @@
 import type { ChibireactNode } from './types'
-import { TEXT_ELEMENT, createFiber, type Fiber, type FiberType } from './fiber'
+import {
+  TEXT_ELEMENT,
+  createFiber,
+  type EffectTag,
+  type Fiber,
+  type FiberType,
+} from './fiber'
 import { requestIdleWork, type IdleDeadline } from './scheduler'
 
 /**
  * Part 2.4: work loop と作業の単位化。
  * Part 2.5: requestIdleCallback で while を中断・再開可能に。
+ * Part 2.6: 二重バッファ (current / wipRoot) と commit phase 分離、reconcile で前回ツリーと比較。
  *
- * 2.3 では `buildFiberTree` で **同期的に** 全 Fiber を一気に作っていた。
- * 2.4 でこれを **「1 ノードずつ進める」** while ループに書き換えた。
- * 2.5 では同じ while を **deadline で抜けて、次のアイドル時間に再開** する形に進化させる。
+ * 章ごとの進化まとめ:
+ *   - 2.4: 同期 while + DOM を work 中に append → 部分描画が見える可能性
+ *   - 2.5: deadline で中断・再開 + DOM は依然 work 中に append
+ *   - 2.6: render phase (Fiber 構築) と commit phase (DOM 反映) を完全分離
+ *           → 描画途中の半端な DOM はユーザーに見えない
+ *           → 再レンダ時は前回ツリー (currentRoot) と比較し、PLACEMENT/UPDATE/DELETION に振り分け
  *
  * 提供する 2 つのエントリポイント:
- *   - `runFiberRoot`     : 同期版 (2.4)。中断しないので一気に描画。
- *   - `scheduleFiberRoot`: スケジューラ版 (2.5)。RIC でアイドル時間に少しずつ進める。
+ *   - `runFiberRoot`     : 同期版。テスト・教育用。
+ *   - `scheduleFiberRoot`: スケジューラ版。RIC でアイドル時間に少しずつ進める。
  *
- * まだやっていないこと（次以降の章で実装）:
- *   - Part 2.6: 前回ツリーとの diff（reconciliation・二重バッファ）
- *   - Part 2.7: render と commit の分離（今は work loop 内で eager に DOM を触っている）
+ * まだやっていないこと:
+ *   - Part 2.7: prop 差分の最小化 (現状は UPDATE で全 prop を再適用)、
+ *               event listener の取り回し最適化、ライフサイクル/effect。
  */
 
-/** ルート Fiber を識別する sentinel。host element でも関数でもない特別な型。 */
+/** ルート Fiber を識別する sentinel。 */
 const HOST_ROOT = '__HOST_ROOT__' as const
 
-/** モジュール内の "次にやる仕事" ポインタ。1 root 前提の最小実装。 */
+/** モジュール状態 (1 root 前提の最小実装)。 */
 let nextUnitOfWork: Fiber | null = null
-
-/** スケジューラ版が今アイドル callback を待機中かどうか。二重スケジュールを防ぐフラグ。 */
+let wipRoot: Fiber | null = null
+let currentRoot: Fiber | null = null
+let deletions: Fiber[] = []
 let isScheduled = false
 
+// --- 公開エントリポイント -----------------------------------------------------
+
 /**
- * 仮想 DOM ツリーを container に描画します（Fiber 経由・同期版）。
+ * 仮想 DOM ツリーを container に描画します（同期版）。
  *
- * Part 1 の `render` と同じ DOM 出力を生成しますが、内部の進め方が違います:
- *   render          → コールスタックの再帰
- *   runFiberRoot    → nextUnitOfWork ポインタの while ループ
+ * Part 2.6 から内部の進め方が変わりました:
+ *   1. wipRoot を作り、現在の currentRoot を alternate にリンク
+ *   2. 同期 while で performUnitOfWork を回し、Fiber tree を完成させる
+ *   3. commitRoot で DOM 反映 (PLACEMENT/UPDATE/DELETION)
  *
- * @example
- *   runFiberRoot(createElement('h1', null, 'Hello'), document.body)
+ * 2 度目の `runFiberRoot` 呼び出しでは、前回ツリーと diff して **同じ DOM を再利用** します。
  */
 export function runFiberRoot(
   element: ChibireactNode,
   container: HTMLElement,
 ): void {
-  // ルート Fiber を作る。`dom` は container で固定、`pendingChildren` に渡された
-  // element を 1 個入れて「最初に展開すべき子」とする。
-  const root = createFiber(HOST_ROOT as unknown as FiberType, {}, null)
-  root.dom = container
-  root.pendingChildren = [element]
-
-  nextUnitOfWork = root
+  prepareWipRoot(element, container)
   while (nextUnitOfWork !== null) {
     nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
   }
+  commitRoot()
 }
 
 /**
- * 仮想 DOM ツリーを container に描画します（スケジューラ版・中断可能）。Part 2.5 で追加。
+ * 仮想 DOM ツリーを container に描画します（スケジューラ版・中断可能）。
  *
- * `runFiberRoot` との違い:
- *   - `runFiberRoot`     : while ループを最後まで回す → 大きな tree でメインスレッドが固まる
- *   - `scheduleFiberRoot`: deadline.timeRemaining() を見て **1 ms を切ったら yield** し、
- *                          次のアイドル時間に `requestIdleCallback` で再開する
- *
- * 結果として、たとえ 1 万要素のツリーでもブラウザ操作 (クリック・スクロール) が
- * 中断できる。Part 2.2「Stack Reconciler の限界」で触れた "16ms 予算" 問題への
- * 最初の手当て。
- *
- * 制限:
- *   - 同時に複数の root をスケジュールしても 1 root しか保持できない (2.6 以降で改善)
- *   - 描画完了は非同期。テストでは microtask / setTimeout を flush する必要がある
+ * `runFiberRoot` との違いは「同期 while」が「RIC ベースの中断可能 while」になっただけ。
+ * 内部のフェーズ分け (render phase → commit phase) は同一。
  */
 export function scheduleFiberRoot(
   element: ChibireactNode,
   container: HTMLElement,
 ): void {
-  const root = createFiber(HOST_ROOT as unknown as FiberType, {}, null)
-  root.dom = container
-  root.pendingChildren = [element]
-
-  nextUnitOfWork = root
+  prepareWipRoot(element, container)
   if (!isScheduled) {
     isScheduled = true
     requestIdleWork(workLoopStep)
@@ -86,44 +80,64 @@ export function scheduleFiberRoot(
 }
 
 /**
+ * @internal
+ * テスト用: モジュール状態を初期化。
+ */
+export function _resetSchedulerForTesting(): void {
+  nextUnitOfWork = null
+  wipRoot = null
+  currentRoot = null
+  deletions = []
+  isScheduled = false
+}
+
+// --- 共通処理 ----------------------------------------------------------------
+
+/**
+ * ルート Fiber を作って render phase の準備をします。同期/非同期の両エントリで共通。
+ */
+function prepareWipRoot(element: ChibireactNode, container: HTMLElement): void {
+  wipRoot = createFiber(HOST_ROOT as unknown as FiberType, {}, null)
+  wipRoot.dom = container
+  wipRoot.pendingChildren = [element]
+  // 同じ container への 2 回目以降のみ alternate を引き継ぐ。
+  // container が変わったら別ツリー扱いで PLACEMENT から始める。
+  wipRoot.alternate = currentRoot?.dom === container ? currentRoot : null
+  deletions = []
+  nextUnitOfWork = wipRoot
+}
+
+/**
  * RIC から呼ばれる 1 ステップ。deadline の余裕がある間ユニットを処理し、
  * 余裕が切れたら yield。残作業があれば次のアイドル時間に再スケジュール。
+ * 全作業が終わったら commitRoot を呼ぶ。
  */
 function workLoopStep(deadline: IdleDeadline): void {
   let shouldYield = false
   while (nextUnitOfWork !== null && !shouldYield) {
     nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
-    // 残り時間が 1ms を切ったらブラウザに制御を返す
     shouldYield = deadline.timeRemaining() < 1
   }
   if (nextUnitOfWork !== null) {
-    // まだ残ってる → 次のアイドル時間で再開
     requestIdleWork(workLoopStep)
   } else {
-    // 全部終わった
+    // render phase 完了 → commit
+    if (wipRoot !== null) {
+      commitRoot()
+    }
     isScheduled = false
   }
 }
 
 /**
- * @internal
- * テスト用: スケジューラ状態をリセットする。通常コードからは呼ばない。
- */
-export function _resetSchedulerForTesting(): void {
-  nextUnitOfWork = null
-  isScheduled = false
-}
-
-/**
- * 1 つの Fiber を処理し、**次にやるべき Fiber** を返します。
- *
- * このメソッドが「中断・再開」可能な単位。Part 2.5 で while を
- * `requestIdleCallback` の deadline で抜ける形に書き換えれば、
- * ここで一旦 return することでブラウザに制御を返せます。
+ * 1 つの Fiber に対する render phase の処理。**DOM への append はここで行わない**。
+ * 担当:
+ *   - 関数コンポーネントの実行
+ *   - 必要なら DOM ノードを生成（append はしない）
+ *   - 子要素を Fiber 化 + alternate と比較して effectTag を付ける
+ *   - 次のユニットを返す
  */
 function performUnitOfWork(fiber: Fiber): Fiber | null {
-  // 1. 関数コンポーネント: 関数を呼んで戻り値を pendingChildren にする
-  //    （2.3 では nodeToFiber 内で eager に呼んでいた → ここで遅延化された）
   if (typeof fiber.type === 'function') {
     const componentProps = {
       ...fiber.props,
@@ -135,36 +149,186 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
     fiber.pendingChildren = [result]
   }
 
-  // 2. DOM ノードを作る (host element, text)
-  //    関数コンポーネントと HOST_ROOT は createDomFromFiber が null を返す
-  if (fiber.dom === null) {
+  // PLACEMENT の Fiber は DOM ノードを作る (append しない)。UPDATE は alternate から DOM を継承済。
+  if (fiber.dom === null && fiber.type !== HOST_ROOT && typeof fiber.type !== 'function') {
     fiber.dom = createDomFromFiber(fiber)
   }
 
-  // 3. DOM を親に append
-  //    関数 fiber は dom = null なので、その子は **祖先のうち最初に DOM を持つもの** に
-  //    付く。これが「関数コンポーネントは透過」と呼ばれる挙動。
-  if (fiber.parent !== null && fiber.dom !== null) {
-    const parentDom = findClosestDomAncestor(fiber)
-    if (parentDom !== null) {
-      parentDom.appendChild(fiber.dom)
-    }
-  }
-
-  // 4. children を Fiber 化して child / sibling 鎖を張る
   reconcileChildren(fiber, fiber.pendingChildren)
-
-  // 5. 次のユニット: child があれば降りる、なければ sibling、それも無ければ
-  //    parent.sibling を辿って戻りながら探す
   return findNextUnit(fiber)
 }
 
 /**
- * fiber に対応する DOM ノードを生成します。
- * - host element → document.createElement + applyProps
- * - text         → document.createTextNode
- * - function / HOST_ROOT → null（DOM を持たない）
+ * 子要素の Fiber 化 (alternate 比較あり, Part 2.6)。
+ *
+ * 旧 fiber と新 child を **インデックス順で並走** し、type が一致したら DOM を再利用 (UPDATE)、
+ * 不一致なら新規作成 (PLACEMENT) + 旧 fiber を DELETION に振り分け。
+ * 余った旧 fiber は全て DELETION に。
+ *
+ * 制限 (2.7 で改善予定):
+ *   - key による並び替え対応はまだ無い (index ベースの比較のみ)
  */
+function reconcileChildren(
+  wipFiber: Fiber,
+  newChildren: readonly ChibireactNode[],
+): void {
+  let oldFiber: Fiber | null = wipFiber.alternate?.child ?? null
+  let prevSibling: Fiber | null = null
+  let i = 0
+
+  for (const childNode of flatten(newChildren)) {
+    if (
+      childNode === null ||
+      childNode === undefined ||
+      typeof childNode === 'boolean'
+    ) {
+      continue
+    }
+
+    const newFiber = reconcileSingleChild(wipFiber, oldFiber, childNode)
+
+    // 旧 fiber が存在するが type 不一致 → DELETION
+    if (oldFiber !== null && newFiber !== null && newFiber.alternate === null) {
+      oldFiber.effectTag = 'DELETION'
+      deletions.push(oldFiber)
+    }
+
+    if (newFiber !== null) {
+      newFiber.parent = wipFiber
+      if (i === 0) {
+        wipFiber.child = newFiber
+      } else if (prevSibling !== null) {
+        prevSibling.sibling = newFiber
+      }
+      prevSibling = newFiber
+      i++
+    }
+
+    if (oldFiber !== null) {
+      oldFiber = oldFiber.sibling
+    }
+  }
+
+  // 残った旧 fiber は全て DELETION
+  while (oldFiber !== null) {
+    oldFiber.effectTag = 'DELETION'
+    deletions.push(oldFiber)
+    oldFiber = oldFiber.sibling
+  }
+}
+
+/**
+ * 1 つの子要素を reconcile して新しい Fiber を返します。
+ * 旧 fiber と type が一致するなら DOM 再利用 + UPDATE、不一致なら PLACEMENT。
+ */
+function reconcileSingleChild(
+  _wipFiber: Fiber,
+  oldFiber: Fiber | null,
+  childNode: ChibireactNode,
+): Fiber | null {
+  // 文字列・数値: TEXT_ELEMENT
+  if (typeof childNode === 'string' || typeof childNode === 'number') {
+    if (oldFiber !== null && oldFiber.type === TEXT_ELEMENT) {
+      // UPDATE: 同じ text fiber を更新
+      const fiber = createFiber(TEXT_ELEMENT, { nodeValue: String(childNode) })
+      fiber.dom = oldFiber.dom
+      fiber.alternate = oldFiber
+      fiber.effectTag = 'UPDATE'
+      return fiber
+    }
+    // PLACEMENT
+    const fiber = createFiber(TEXT_ELEMENT, { nodeValue: String(childNode) })
+    fiber.effectTag = 'PLACEMENT'
+    return fiber
+  }
+
+  // 配列・null・boolean は呼び出し側でフィルタ済
+  if (childNode === null || childNode === undefined || typeof childNode === 'boolean') {
+    return null
+  }
+  if (isNodeArray(childNode)) return null
+
+  // 通常 element
+  const sameType = oldFiber !== null && oldFiber.type === childNode.type
+  if (sameType && oldFiber !== null) {
+    // UPDATE: DOM 再利用
+    const fiber = createFiber(
+      childNode.type,
+      childNode.props,
+      childNode.key ?? null,
+    )
+    fiber.dom = oldFiber.dom
+    fiber.alternate = oldFiber
+    fiber.effectTag = 'UPDATE'
+    fiber.pendingChildren = childNode.children
+    return fiber
+  }
+  // PLACEMENT
+  const fiber = createFiber(
+    childNode.type,
+    childNode.props,
+    childNode.key ?? null,
+  )
+  fiber.effectTag = 'PLACEMENT'
+  fiber.pendingChildren = childNode.children
+  return fiber
+}
+
+// --- commit phase -----------------------------------------------------------
+
+/**
+ * render phase で組んだ wipRoot を実 DOM に反映します。
+ * 1. 削除を先に処理 (children が再利用される前に消す)
+ * 2. wipRoot を再帰的に walk し、effectTag に従って append/update
+ * 3. currentRoot ← wipRoot に差し替え (次回 render の比較対象になる)
+ */
+function commitRoot(): void {
+  if (wipRoot === null) return
+  for (const d of deletions) {
+    commitDeletion(d)
+  }
+  if (wipRoot.child !== null) {
+    commitWork(wipRoot.child)
+  }
+  currentRoot = wipRoot
+  wipRoot = null
+  deletions = []
+}
+
+function commitWork(fiber: Fiber | null): void {
+  if (fiber === null) return
+
+  const domParent = findClosestDomAncestor(fiber)
+  if (
+    fiber.effectTag === 'PLACEMENT' &&
+    fiber.dom !== null &&
+    domParent !== null
+  ) {
+    domParent.appendChild(fiber.dom)
+  } else if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
+    updateDom(fiber.dom, fiber.alternate?.props ?? {}, fiber.props)
+  }
+
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
+}
+
+function commitDeletion(fiber: Fiber): void {
+  if (fiber.dom !== null) {
+    const parentDom = findClosestDomAncestor(fiber)
+    if (parentDom !== null && fiber.dom.parentNode === parentDom) {
+      parentDom.removeChild(fiber.dom)
+    }
+    return
+  }
+  // 関数コンポーネント Fiber は DOM を持たない → child の DOM を消す
+  if (fiber.child !== null) {
+    commitDeletion(fiber.child)
+  }
+}
+
+// --- DOM ヘルパー ------------------------------------------------------------
+
 function createDomFromFiber(fiber: Fiber): Node | null {
   if (fiber.type === HOST_ROOT) return null
   if (typeof fiber.type === 'function') return null
@@ -176,10 +340,6 @@ function createDomFromFiber(fiber: Fiber): Node | null {
   return dom
 }
 
-/**
- * 「DOM を持つ最寄りの祖先」を返します。関数コンポーネント Fiber は
- * dom = null なので、その子要素は祖父・曽祖父にぶら下がります。
- */
 function findClosestDomAncestor(fiber: Fiber): Node | null {
   let p = fiber.parent
   while (p !== null && p.dom === null) {
@@ -189,59 +349,39 @@ function findClosestDomAncestor(fiber: Fiber): Node | null {
 }
 
 /**
- * children に並んだ vDOM を Fiber 化し、parent.child / sibling 鎖を作ります。
+ * UPDATE 時の DOM プロパティ更新。
  *
- * 配列・null・false など Part 1.7 で扱った "スキップ系" もここで吸収します。
+ * 2.6 では「古いイベントリスナを外して新しいリスナを付け直す」+「すべての new prop を再適用」
+ * という単純な戦略を採る。差分計算で最小限に絞る最適化は 2.7 で。
+ *
+ * 注意点:
+ *   - イベントは古いハンドラを外さないと多重登録される
+ *   - 「古い props にあって新しい props で消えた属性」は今は残ったまま (2.7 で対応)
  */
-function reconcileChildren(
-  parent: Fiber,
-  children: readonly ChibireactNode[],
+function updateDom(
+  dom: Node,
+  oldProps: Record<string, unknown>,
+  newProps: Record<string, unknown>,
 ): void {
-  let prev: Fiber | null = null
-  for (const node of flatten(children)) {
-    const childFiber = nodeToFiber(node)
-    if (childFiber === null) continue
-    childFiber.parent = parent
-    if (parent.child === null) {
-      parent.child = childFiber
-    } else if (prev !== null) {
-      prev.sibling = childFiber
+  // text fiber
+  if (dom.nodeType === Node.TEXT_NODE) {
+    if (oldProps.nodeValue !== newProps.nodeValue) {
+      ;(dom as Text).nodeValue = String(newProps.nodeValue ?? '')
     }
-    prev = childFiber
+    return
   }
+  if (!(dom instanceof HTMLElement)) return
+
+  // 古いイベントリスナを除去
+  for (const [key, value] of Object.entries(oldProps)) {
+    if (isEventProp(key) && typeof value === 'function') {
+      dom.removeEventListener(getEventName(key), value as EventListener)
+    }
+  }
+
+  applyProps(dom, newProps)
 }
 
-/**
- * 1 つの vDOM ノードを Fiber 1 個に変換（リンクは張らない）。
- * 配列・null・undefined・boolean は null を返す（呼び出し側でスキップ）。
- *
- * 2.3 の fiber.ts にも同名 helper があるが、こちらは pendingChildren も
- * 同時に埋める。コード重複は教育目的の許容範囲。
- */
-function nodeToFiber(node: ChibireactNode): Fiber | null {
-  if (node === null || node === undefined || typeof node === 'boolean') return null
-  if (isNodeArray(node)) return null
-  if (typeof node === 'string' || typeof node === 'number') {
-    return createFiber(TEXT_ELEMENT, { nodeValue: String(node) })
-  }
-  const fiber = createFiber(node.type, node.props, node.key ?? null)
-  // host element / function fiber 共通: 元 element の children を保持しておく。
-  // 関数 fiber は performUnitOfWork で関数を呼んだ後に上書きされる。
-  fiber.pendingChildren = node.children
-  return fiber
-}
-
-/**
- * 「次にやるべき Fiber」を決定します:
- *   1. child があれば降りる
- *   2. 自分または上方向の sibling
- *   3. それも無ければ終了 (null)
- *
- * 例: <div><h1/><p/></div>
- *   div → h1   (child)
- *   h1 → p     (sibling)
- *   p → null   (parent.sibling=null, parent.parent=root, root.sibling=null → 終了)
- */
 function findNextUnit(fiber: Fiber): Fiber | null {
   if (fiber.child !== null) return fiber.child
   let next: Fiber | null = fiber

@@ -4,4 +4,5 @@ export default {
   '030-fiber-node': 'Fiber Node とは何か',
   '040-work-loop': 'work loop と作業の単位化',
   '050-scheduler': 'requestIdleCallback と最小スケジューラ',
+  '060-double-buffer': '二重バッファ — current ツリーと workInProgress',
 }

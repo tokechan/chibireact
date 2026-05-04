@@ -59,6 +59,14 @@ export const TEXT_ELEMENT = '__TEXT_ELEMENT__' as const
 
 export type FiberType = string | Function | typeof TEXT_ELEMENT
 
+/**
+ * commit 時に何の操作を行うかを表すフラグ (Part 2.6)。
+ * - PLACEMENT: 新規 Fiber → 親 DOM に append する
+ * - UPDATE   : 前回と同じ type → DOM を再利用し、props のみ更新する
+ * - DELETION : 前回あったが今回無くなった → 親 DOM から removeChild する
+ */
+export type EffectTag = 'PLACEMENT' | 'UPDATE' | 'DELETION'
+
 export type Fiber = {
   type: FiberType
   /** TEXT_ELEMENT の場合、{ nodeValue: string } を持つ */
@@ -83,6 +91,17 @@ export type Fiber = {
    *   - root fiber: [rootElement]
    */
   pendingChildren: readonly ChibireactNode[]
+  /**
+   * 二重バッファ: 前回 commit 済ツリーで対応する Fiber (Part 2.6)。
+   * - 初回 render では null
+   * - 再 render では reconcile 時にセットされ、UPDATE 判定や DOM 再利用に使う
+   */
+  alternate: Fiber | null
+  /**
+   * commit 時に行う操作のフラグ (Part 2.6)。
+   * 未設定なら commit 対象外（root sentinel など）。
+   */
+  effectTag?: EffectTag
 }
 
 /**
@@ -102,6 +121,7 @@ export function createFiber(
     sibling: null,
     dom: null,
     pendingChildren: [],
+    alternate: null,
   }
 }
 

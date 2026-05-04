@@ -9,7 +9,7 @@ export type { IdleDeadline, IdleWorkCallback } from './scheduler'
 export type { ChibireactElement, ChibireactNode } from './types'
 export type { Root } from './create-root'
 export type { Dispatch, SetStateAction } from './hooks-state'
-export type { Fiber, FiberType } from './fiber'
+export type { Fiber, FiberType, EffectTag } from './fiber'
 export type {
   FunctionComponent,
   FC,
