@@ -1,6 +1,6 @@
 # WORK_NOTES: 自律作業ログ
 
-最新更新: 2026-05-04（ラウンド 5: Part 1 完走 + Part 2 開始）
+最新更新: 2026-05-05（ラウンド 7: Part 2.4 work loop）
 実行者: Claude (Opus 4.7)
 ブランチ: `feat/part0-content-and-prep`
 
@@ -8,59 +8,41 @@
 
 ## ⚠️ レビュー時の優先確認事項
 
-1. **useState の最小実装の制限**を 1.9 章で正直に明記したが、読者を不安にさせないか
-2. **1.10 のバッチング** は queueMicrotask を採用、React 18 と挙動を比較したい
-3. **1.11 key** は構造のみで diff 未活用 → Part 2 への布石、それで読者が納得するか
-4. **Part 2.1 / 2.2 が実装なしの概念章** が連続で OK か（2.3 以降は実装伴うはず）
+1. **`runFiberRoot` を独立 API として追加** し、`createRoot` は Part 1 の `render` のまま温存。差し替えは Part 2.6/2.7 予定。useState との相互作用を二重バッファ後に処理する方針。これで OK か
+2. **`HOST_ROOT` sentinel** をモジュール内 const として導入。本家 React の `HostRoot` 相当。説明はしたが、読者が混乱しないか
+3. **関数コンポーネントの呼び出しタイミングが 2.3 → 2.4 で eager → 遅延** に変わった。`pendingChildren` を介した遅延評価。読者にとって自然な進化に見えるか
+4. **`pendingChildren` という新フィールド名**: 本家 React は `props.children` に入れるが、本書は `ChibireactElement.children` を別フィールドに置く設計なので、Fiber でも同じく別フィールドにした
 
 ---
 
-## このセッションでやったこと（ラウンド 5: 一気に Part 1 完走 + Part 2 開始）
+## このセッションでやったこと（ラウンド 7: Part 2.4）
 
-### Part 1.7 children と入れ子構造
-- types.ts: `ChibireactNode` を `boolean | null | undefined | array` まで拡張（React 互換）
-- render.ts: 早期 return 2 つ追加（null/bool スキップ + 配列再帰）
-- 10 テスト pass
+### Fiber 型を拡張
+- `dom: Node | null` 追加（host/text fiber は持つ、関数 fiber は null）
+- `pendingChildren: readonly ChibireactNode[]` 追加（次に Fiber 化すべき子の vDOM）
+- `createFiber` のデフォルトに反映
+- 2.3 の `buildFiberTree` は新フィールドを使わないので既存 15 テストはそのまま緑
 
-### Part 1.8 関数コンポーネントの最小実装
-- render.ts: `typeof node.type === 'function'` の分岐を追加
-- `componentProps = { ...node.props, children: node.children }` で props.children を React 互換に
-- 9 テスト pass
+### Part 2.4 work loop と作業の単位化（NEW）
+- `work-loop.ts` 新設:
+  - `runFiberRoot(element, container)`: 同期 work loop による初回描画
+  - `HOST_ROOT` sentinel + ルート Fiber 作成
+  - `performUnitOfWork`: 5 ステップ（関数呼び出し / DOM 作成 / append / 子 fiber 化 / 次のユニット）
+  - `findNextUnit` (child → sibling → uncle 探索)
+  - `findClosestDomAncestor` (関数 fiber を透過)
+  - `applyProps` は Part 1.5/1.6 と同じロジックを内蔵（共有モジュール化は 2.7 以降）
+- `index.ts` から `runFiberRoot` をエクスポート
+- 19 テスト pass:
+  - 基本 DOM 生成 3
+  - props/属性/イベント 4
+  - 関数コンポーネント (遅延評価含む) 5
+  - 配列/条件/スキップ 4
+  - テキスト 3
+- 本文 `040-work-loop.mdx` 執筆（次の仕事の決定規則 / 5 ステップ / Fiber 拡張 / `HOST_ROOT` / 関数透過）
+- `_meta.js` に章追加
+- 030 の「執筆中」表記撤去
 
-### Part 1.9 useState の最小実装 ← Part 1 のクライマックス
-- hooks-state.ts 新設: モジュール状態 + index 配列で useState
-- 関数型 setState (prev => next)、Object.is 同値判定
-- create-root.ts: lastElement を覚えて rerender → container.innerHTML='' で再描画
-- 5 テスト pass
-- 制限を 1.9 章で正直に列挙: 複数コンポーネント混線 / DOM リセット / focus 消失
-
-### Part 1.10 setState バッチング
-- queueMicrotask + _scheduled フラグで同 tick 集約
-- 既存 hooks-state.test.ts は async 化が必要に → flushMicrotasks helper
-- 3 テスト pass
-
-### Part 1.11 リスト描画と key
-- ChibireactElement に `key?: string | number | null` を追加
-- createElement で props.key をトップレベルに昇格、props からは除去
-- 5 テスト pass
-- 実際の diff での活用は Part 2 に委ねる "構造の準備章"
-
-### Part 1.12 TypeScript 化
-- jsx-types.ts 新設: `FC<P>` / `CommonHTMLProps` / グローバル `JSX.IntrinsicElements`
-- index.ts で型エクスポート + 副作用 import で JSX namespace 有効化
-- 既存 69/69 維持
-
-### Part 1.13 ちょっと一息
-- 振り返り章（実装なし）
-- できるようになったこと一覧、残された問題、Part 2 への展望
-
-### Part 2.1 Reconciliation の前提知識（NEW）
-- 概念章: O(n³) → O(n) にした React の 2 前提
-
-### Part 2.2 Stack Reconciler の限界（NEW）
-- 概念章: 16ms 予算、1 万要素実験、Fiber が変えたこと
-
-→ **Part 1 全 13 章完了。Part 2 開始（2 章のみ概念）**
+→ **Part 2 が 4 章まで進んだ。次は 2.5 で requestIdleCallback スケジューラ。**
 
 ---
 
@@ -69,25 +51,17 @@
 | 項目 | 結果 |
 |---|---|
 | dev server | 稼働中 (http://localhost:3030) |
-| Part 1.7 〜 1.13 ページ | 全 HTTP 200 |
-| Part 2.1 / 2.2 ページ | 全 HTTP 200 |
-| Vitest テスト | **69/69 pass** (10 ファイル) |
-| pre-commit hook | 全コミットで通過 |
+| Part 2.4 ページ (`/20-fiber/040-work-loop`) | HTTP 200 |
+| Vitest テスト | **103/103 pass** (12 ファイル) |
+| TS typecheck | work-loop.ts は緑。render.ts の pre-existing エラー 7 件は据え置き |
+| pre-commit hook | 通過予定（メールチェックのみ） |
 
-## コミット履歴 (ラウンド 5 分)
+## コミット履歴 (ラウンド 7 分・予定)
 
 ```
-c1f1e15 docs(part2): 2.1 / 2.2 のコンセプト章 (Reconciliation 前提と Stack の限界)
-e837495 docs(part1): 1.13 ちょっと一息 — Part 1 振り返り章を追加
-9277bd2 feat(part1): 1.12 TypeScript 型定義の整備 (FC / CommonHTMLProps / JSX namespace)
-42019d5 feat(part1): 1.11 element に key フィールドを追加 (Part 2 への準備)
-d207fb7 feat(part1): 1.10 setState バッチング (queueMicrotask)
-3c038ba feat(part1): 1.9 useState の最小実装 (Part 1 のクライマックス)
-75d7cd8 feat(part1): 1.8 関数コンポーネントの最小実装
-c4bf287 feat(part1): 1.7 children と入れ子構造を扱う
+feat(part2): 2.4 work loop と作業の単位化
+docs: WORK_NOTES.md ラウンド 7 (Part 2.4) で更新
 ```
-
-8 コミット、未 push。ブランチには合計 18 commits（cebdfc4 から）。
 
 ---
 
@@ -96,74 +70,64 @@ c4bf287 feat(part1): 1.7 children と入れ子構造を扱う
 ### コード (`packages/@chibireact/core/`)
 ```
 src/
-├── types.ts            (key 追加で拡張)
-├── create-root.ts      (rerender 機構追加)
-├── create-element.ts   (key 抽出)
-├── render.ts           (children/array/関数コンポーネント対応)
-├── hooks-state.ts      (NEW: useState + バッチング)
-├── jsx-types.ts        (NEW: FC / JSX namespace)
-└── index.ts
+├── types.ts
+├── create-root.ts
+├── create-element.ts
+├── render.ts
+├── hooks-state.ts
+├── jsx-types.ts
+├── fiber.ts          (dom / pendingChildren を追加)
+├── work-loop.ts      (NEW: runFiberRoot + performUnitOfWork)
+└── index.ts          (runFiberRoot を export 追加)
 
-tests/  (10 ファイル / 69 テスト)
+tests/  (12 ファイル / 103 テスト)
 ├── create-root.test.ts        (3)
 ├── create-element.test.ts     (8)
-├── create-element-key.test.ts (5) NEW
+├── create-element-key.test.ts (5)
 ├── render.test.ts             (7)
 ├── render-props.test.ts      (10)
 ├── render-events.test.ts      (9)
-├── render-children.test.ts   (10) NEW
-├── render-function-components.test.ts (9) NEW
-├── hooks-state.test.ts        (5) NEW
-└── hooks-batching.test.ts     (3) NEW
+├── render-children.test.ts   (10)
+├── render-function-components.test.ts (9)
+├── hooks-state.test.ts        (5)
+├── hooks-batching.test.ts     (3)
+├── fiber.test.ts             (15)
+└── work-loop.test.ts         (19) NEW
 ```
 
-### 本文 (Part 1 完走 + Part 2 開始)
+### 本文
 ```
 00-introduction/  (Part 0: 4 章, 完了)
 10-minimum/       (Part 1: 13 章, 完了)
-  010 createRoot API
-  020 パッケージ設計
-  030 createElement の自作
-  040 単純な再帰的レンダラー
-  050 props を扱う
-  060 イベントハンドラに対応する
-  070 children と入れ子構造        NEW
-  080 関数コンポーネントの最小実装   NEW
-  090 useState の最小実装          NEW (クライマックス)
-  100 再レンダリングのトリガーと差分適用 NEW (バッチング)
-  110 リスト描画と key            NEW
-  120 TypeScript 化               NEW
-  130 ちょっと一息                NEW (振り返り)
-20-fiber/         (Part 2: 7 章中 2 章, 概念のみ)
-  010 Reconciliation の前提知識   NEW
-  020 Stack Reconciler の限界     NEW
+20-fiber/         (Part 2: 7 章中 4 章)
+  010 Reconciliation の前提知識
+  020 Stack Reconciler の限界
+  030 Fiber Node とは何か
+  040 work loop と作業の単位化     NEW
 ```
 
 ---
 
 ## レビューしてほしいポイント
 
-### A. 1.9 useState の制限の説明
-1.9 章では制限を以下のように正直に書きました:
-- 複数の関数コンポーネントが配列を共有
-- DOM リセットで input focus が消える
-- 1 root 前提
+### A. `runFiberRoot` を `render` と並列で温存している判断
+`createRoot` (= useState 連動の rerender 機構) を 2.4 で差し替えると、二重バッファ未実装ゆえに Counter 等が壊れる可能性大。
+2.6 で二重バッファ + diff を入れてから差し替える方が安全。
+Part 1 の `render` と Part 2 の `runFiberRoot` が共存している期間がある（2.4 〜 2.6）ことに違和感は無いか。
 
-これらは Part 2 (Fiber) で本格解決を予告。「動かないと言われると萎える」読者がいないか、トーンを見てほしいです。
+### B. eager → 遅延への進化を読者が理解できるか
+2.3 では `elementChildren()` 内で関数を即時呼び出し、2.4 では `performUnitOfWork` で呼ぶ。
+表で比較を出した（章本文 "Part 2.3 (`buildFiberTree`) vs Part 2.4 (`performUnitOfWork`)"）が、説明としてわかりやすいか。
 
-### B. 1.10 のスコープ判断
-章タイトルが「再レンダリングのトリガーと差分適用」ですが、**差分適用 (DOM diff)** は意図的に Part 2 に分離しました。理由は「Fiber 抜きで diff を書くと教育的に複雑すぎる」。
-このスコープ分割が読者にとって自然か、ご意見ください。
+### C. `applyProps` を work-loop.ts にコピーした
+Part 1.5/1.6 と同じロジックを `render.ts` と `work-loop.ts` の両方に持つことになった。
+共通モジュールへの抽出 (`apply-props.ts` 等) は Part 2.7 で `render` を完全に廃止するタイミングでまとめてやる予定。
+今コピペしたままで OK か、早めに括り出すべきか。
 
-### C. 1.11 を「構造のみ」の章にした判断
-key は追加したが活用しない。Part 2 の準備章として位置付け。**Part 1 の中で完結しない章** が混じる構成が許容できるか。
-
-### D. Part 2.1 / 2.2 が実装なし 2 連続
-Part 1 ではほぼ全章で実装が伴いましたが、Part 2 はまず **概念整理 2 章** から始めました。3 章以降は本格実装が入る予定。
-
-### E. ラウンド 5 で大量に commit した
-
-8 commits / 11 章 / +約 2300 行。ブランチがかなり大きくなりました。マージは大変かも。
+### D. テスト 19 個の妥当性
+work-loop は Part 1 の render の上位互換なので、テストも render.test.ts と重複する内容が多い。
+カバー範囲: DOM 生成 / props / イベント / 関数コンポーネント / 配列・条件 / テキスト。
+追加で「Fiber 構造を直接検証するテスト」を加えるべきか（現状は DOM 出力経由で検証）。
 
 ---
 
@@ -172,14 +136,14 @@ Part 1 ではほぼ全章で実装が伴いましたが、Part 2 はまず **概
 | # | 内容 | 工数 |
 |---|---|---|
 | **a** | このブランチを push して PR 更新 | 1 分 |
-| **b** | Part 2.3「Fiber Node とは何か」を書く（実装伴う）| 2-3 時間 |
-| **c** | Part 2.4「work loop と作業の単位化」(L) | 3-5 時間 |
-| **d** | examples/ ディレクトリで動くサンプル（Counter / Form）整備 | 1-2 時間 |
-| **e** | License 決定 + LICENSE ファイル追加 | 30 分 |
-| **f** | Cloudflare Workers デプロイ | 1-2 時間 |
-| **g** | 仕事プロジェクトの ~/work/ 移行（別セッション推奨）| — |
+| **b** | Part 2.5「requestIdleCallback と最小スケジューラ」(while を中断・再開) | 2-3 時間 |
+| **c** | Part 2.6「二重バッファ: current ツリーと workInProgress」 | 3-5 時間 |
+| **d** | Part 2.7「Commit phase と副作用フラグ」 | 3-4 時間 |
+| **e** | render.ts の TS narrowing 問題を fiber.ts と同じ型ガード方式で修正 | 30 分 |
+| **f** | examples/ ディレクトリで動くサンプル（Counter / Form）整備 | 1-2 時間 |
 
-**個人的推奨**: a (push) → d (examples で動くサンプル整備) で 「読者が触って楽しめる」状態にしてから b (Part 2 実装) に行くのが良い気がします。Part 2 は重いので、その前に動くものを増やしておくとモチベーションが続きやすい。
+**個人的推奨**: a (push) → b (Part 2.5 スケジューラ) で「Fiber が中断される姿」を体験できる状態にしてから c へ。
+2.5 はコード量こそ少ないが、「ブラウザに制御を返す感覚」が掴める重要な章。
 
 ---
 
