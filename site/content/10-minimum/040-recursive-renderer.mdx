@@ -1,0 +1,274 @@
+---
+title: 単純な再帰的レンダラー
+description: createElement で作った仮想 DOM を実際の DOM に描画する render を実装します
+---
+
+# 単純な再帰的レンダラー
+
+[前章](./030-create-element)で `createElement` を作り、仮想 DOM 要素を生成できるようになりました。でもまだ、画面には何も出ていません。
+
+> 「element オブジェクトはあるけど、ブラウザに描画されないじゃん？」
+
+その通り。**仮想 DOM を本物の DOM に翻訳する関数** がまだないのです。それをこの章で作ります。
+
+## この章のゴール
+
+- `render(element, container)` で **HTML 要素を実 DOM に描画** できる
+- 文字列・数値の child を **テキストノード** として処理できる
+- **入れ子の element を再帰的に** 処理できる
+- `createRoot(container).render(element)` が初めて画面に何かを出す
+
+> 章末に動くもの: `createRoot(document.body).render(createElement('h1', null, 'Hello'))` でブラウザに `<h1>Hello</h1>` が表示される状態。
+
+前章: [createElement の自作](./030-create-element)
+
+## 前提知識
+
+- DOM API の基本: `document.createElement`, `appendChild`, `createTextNode`
+- 再帰関数の基本
+
+## 設計を考える
+
+仮想 DOM を実 DOM に変換するために、`render` 関数は次のように振る舞えばよさそうです。
+
+```
+render(element, container):
+  if element がテキスト (string | number):
+    container にテキストノードを追加して終了
+  else:
+    document.createElement(element.type) で DOM を作る
+    element.children をそれぞれ render(child, dom) で再帰処理
+    container に dom を追加
+```
+
+「**自分自身を呼び出す**」のがポイントです。子要素もまた element なので、同じ関数で処理できます。
+
+## テストを書く（Red）
+
+`packages/@chibireact/core/tests/render.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { render } from '../src/render'
+import { createElement } from '../src/create-element'
+
+describe('render', () => {
+  let container: HTMLElement
+
+  beforeEach(() => {
+    container = document.createElement('div')
+  })
+
+  it('単一の HTML 要素を container に追加します', () => {
+    const element = createElement('h1', null)
+    render(element, container)
+    expect(container.firstChild?.nodeName).toBe('H1')
+  })
+
+  it('文字列の child をテキストノードに変換します', () => {
+    const element = createElement('p', null, 'Hello')
+    render(element, container)
+    expect(container.firstChild?.textContent).toBe('Hello')
+  })
+
+  it('複数の child を順序通り追加します', () => {
+    const element = createElement('p', null, 'Hello', ' ', 'World')
+    render(element, container)
+    expect(container.firstChild?.textContent).toBe('Hello World')
+  })
+
+  it('入れ子の要素を再帰的にレンダリングします', () => {
+    const element = createElement('div', null,
+      createElement('h1', null, 'Title'),
+      createElement('p', null, 'Body'),
+    )
+    render(element, container)
+
+    const div = container.firstChild as HTMLElement
+    expect(div.children[0].nodeName).toBe('H1')
+    expect(div.children[1].nodeName).toBe('P')
+  })
+})
+```
+
+実行すると失敗します（実装がない）:
+
+```bash
+pnpm --filter @chibireact/core test
+# Cannot find module '../src/render'
+```
+
+## 実装する（Green）
+
+`packages/@chibireact/core/src/render.ts`:
+
+```ts
+import type { ChibireactNode } from './types'
+
+export function render(element: ChibireactNode, container: HTMLElement | Node): void {
+  // テキストノード（文字列・数値）
+  if (typeof element === 'string' || typeof element === 'number') {
+    container.appendChild(document.createTextNode(String(element)))
+    return
+  }
+
+  // 関数コンポーネントは未対応（Part 1.8 で追加）
+  if (typeof element.type !== 'string') {
+    throw new Error(
+      'chibireact: function components are not yet supported (will be added in Part 1.8).'
+    )
+  }
+
+  // HTML 要素を生成
+  const dom = document.createElement(element.type)
+
+  // 子要素を再帰的に処理
+  for (const child of element.children) {
+    render(child, dom)
+  }
+
+  // container に追加
+  container.appendChild(dom)
+}
+```
+
+## createRoot から繋ぐ
+
+`createRoot.render` がこの新しい `render` を呼ぶように変更します。
+
+`packages/@chibireact/core/src/create-root.ts`:
+
+```ts
+import type { ChibireactNode } from './types'
+import { render as renderToContainer } from './render'
+
+export type Root = {
+  render(element: ChibireactNode): void
+}
+
+export function createRoot(container: HTMLElement): Root {
+  return {
+    render(element: ChibireactNode): void {
+      renderToContainer(element, container)
+    },
+  }
+}
+```
+
+`index.ts` で `render` も export します:
+
+```ts
+export { createRoot } from './create-root'
+export { createElement } from './create-element'
+export { render } from './render'
+export type { ChibireactElement, ChibireactNode } from './types'
+export type { Root } from './create-root'
+```
+
+テスト再実行:
+
+```
+ ✓ tests/create-element.test.ts (8 tests)
+ ✓ tests/create-root.test.ts (3 tests)
+ ✓ tests/render.test.ts (8 tests)
+
+ Test Files  3 passed (3)
+      Tests  19 passed (19)
+```
+
+これで **Green**。仮想 DOM が実 DOM に変換されるようになりました。
+
+## 試してみる
+
+ブラウザで動かしてみたい場合は、適当な HTML ファイルを用意します。
+
+```html
+<!-- examples/01-render/index.html -->
+<!doctype html>
+<html lang="ja">
+  <head><meta charset="utf-8" /><title>Render</title></head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
+```
+
+```ts
+// examples/01-render/main.ts
+import { createRoot, createElement } from '@chibireact/core'
+
+const container = document.getElementById('app')!
+const root = createRoot(container)
+
+root.render(
+  createElement('div', null,
+    createElement('h1', null, 'Hello chibireact'),
+    createElement('p', null, 'Part 1.4 で初めて画面に出ました'),
+  ),
+)
+```
+
+これで `#app` に以下が描画されます:
+
+```html
+<div id="app">
+  <div>
+    <h1>Hello chibireact</h1>
+    <p>Part 1.4 で初めて画面に出ました</p>
+  </div>
+</div>
+```
+
+> ※ `examples/` ディレクトリを実際に動かす設定は次の章以降で整えます。今は `pnpm test` だけで十分動作確認できます。
+
+## ちょっと深掘り
+
+### なぜ container 引数の型が `HTMLElement | Node` なのか
+
+最初の呼び出しは `createRoot` 経由で必ず `HTMLElement`（`document.getElementById()` の戻り値など）です。
+ですが**再帰呼び出し**では、自分が作った `dom` 変数（これも `HTMLElement` 型）を container として渡します。
+
+実は型上は両方とも `HTMLElement` で十分なのですが、将来 SVG など `Element` のサブクラスを混在させた時のために `Node` まで広げておきました。テキストノードを追加する `appendChild` は `Node` インターフェースで定義されているので、型エラーにもなりません。
+
+### 「append するだけ」で大丈夫か
+
+このコードは container の中身をクリアせず、**ただ append します**。つまり `root.render()` を 2 回呼ぶと、要素が 2 つ追加されてしまいます:
+
+```ts
+root.render(<App />)
+root.render(<App />) // ← 2 つ目の <App /> が追加される
+```
+
+本家 React では、2 回目の `render` は **既存ツリーを更新** します（差分計算 → 更新）。これを実現するのが Part 1.10「再レンダリングのトリガーと差分適用」です。今はとりあえず「最初の 1 回だけ呼ぶ」前提で進めます。
+
+### Pombo 教材との違い
+
+[Pombo の "Build your own React"](https://pomb.us/build-your-own-react/) では、文字列の child を `createElement` の段階で `TEXT_ELEMENT` 型のオブジェクトに包んで統一的に扱います。
+
+```js
+// Pombo の方式
+function createTextElement(text) {
+  return { type: 'TEXT_ELEMENT', props: { nodeValue: text, children: [] } }
+}
+```
+
+これにより render の中で「文字列か要素か」の分岐が消え、すべて要素として扱えます。本書では JS の自然な値（string / number）をそのまま children に入れる設計を選びましたが、後々 render の中の分岐が増えてきたら、Pombo 方式へのリファクタを検討します。
+
+## まとめ
+
+- `render(element, container)` が**仮想 DOM を実 DOM に変換**するようになりました
+- 入れ子の element を再帰的に処理できます
+- `createRoot.render` が初めて画面に何かを出すようになりました
+- ただし「2 回目の render」「props の反映」「イベント」はまだ未対応
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/040-recursive-renderer.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.4 単純な再帰的レンダラーを実装"
+```
+
+次の章では、props（className / id / style など）を DOM 属性として反映します。
+
+→ 次の章: [props を扱う](./050-props)

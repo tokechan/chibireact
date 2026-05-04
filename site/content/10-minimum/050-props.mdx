@@ -1,0 +1,220 @@
+---
+title: props を扱う
+description: className / id / data-* / style など、props を DOM 属性として反映します
+---
+
+# props を扱う
+
+[前章](./040-recursive-renderer)で `render` が要素と children を扱えるようになりました。でも現状、**props は完全に無視されています**。
+
+```ts
+createElement('h1', { className: 'title' }, 'Hello')
+// → <h1>Hello</h1>  （className が消えている！）
+```
+
+この章で props を DOM の属性として反映させて、`<h1 class="title">Hello</h1>` のようにきちんと出るようにします。
+
+## この章のゴール
+
+- `className` / `id` / `data-*` / `aria-*` などの **props を DOM 属性として反映**
+- `style` オブジェクトを **inline style** に変換
+- `null` / `undefined` の値は安全にスキップ
+- 関数（イベントハンドラ）はこの章では未対応 → 1.6 で扱う
+
+> 章末に動くもの: 10 個の props 関連テストが緑になり、`<button id="submit" class="btn" tabIndex="0">` のような属性付き DOM が生成される状態。
+
+前章: [単純な再帰的レンダラー](./040-recursive-renderer)
+
+## 前提知識
+
+- DOM API: `element.setAttribute`, `element.className`, `element.style`
+- HTML の class / className 問題（`class` は JS の予約語なので React では `className`）
+
+## 設計を考える
+
+props はキーと値のペアです。キーごとに **3 種類の処理** が必要になります。
+
+| 種類 | 例 | 反映方法 |
+|---|---|---|
+| 特殊な属性 | `className` | `dom.className = value` |
+| 特殊な属性（複合）| `style: { color: 'red' }` | `Object.assign(dom.style, value)` |
+| 一般的な属性 | `id`, `data-*`, `aria-*` | `dom.setAttribute(key, value)` |
+| 関数 | `onClick` 等 | （Part 1.6 で対応）|
+
+`children` キーが props 内にあったら念のためスキップします。`null` / `undefined` の値もスキップ（属性として書きたくない）。
+
+## テストを書く（Red）
+
+`packages/@chibireact/core/tests/props.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { render } from '../src/render'
+import { createElement } from '../src/create-element'
+
+describe('render props', () => {
+  let container: HTMLElement
+  beforeEach(() => { container = document.createElement('div') })
+
+  it('className を DOM の className として反映します', () => {
+    render(createElement('div', { className: 'box primary' }), container)
+    const dom = container.firstChild as HTMLElement
+    expect(dom.className).toBe('box primary')
+  })
+
+  it('data-* 属性をそのままの key で反映します', () => {
+    render(createElement('div', { 'data-testid': 'header' }), container)
+    const dom = container.firstChild as HTMLElement
+    expect(dom.getAttribute('data-testid')).toBe('header')
+  })
+
+  it('style オブジェクトを inline style に変換します', () => {
+    render(createElement('div', {
+      style: { color: 'red', fontSize: '16px' }
+    }), container)
+    const dom = container.firstChild as HTMLElement
+    expect(dom.style.color).toBe('red')
+    expect(dom.style.fontSize).toBe('16px')
+  })
+
+  it('null / undefined の値はスキップします', () => {
+    render(createElement('div', {
+      id: 'app', title: null, lang: undefined
+    }), container)
+    const dom = container.firstChild as HTMLElement
+    expect(dom.getAttribute('id')).toBe('app')
+    expect(dom.hasAttribute('title')).toBe(false)
+  })
+})
+```
+
+（実際の test file には他にも data-* / aria-* / 数値 / 真偽値 / 複合パターンなど 10 ケース置いてあります）
+
+実行すると失敗します（実装が props を扱っていない）。
+
+## 実装する（Green）
+
+`render` 関数の内部に `applyProps` ヘルパーを追加します。
+
+`packages/@chibireact/core/src/render.ts`:
+
+```ts
+import type { ChibireactNode } from './types'
+
+export function render(element: ChibireactNode, container: HTMLElement | Node): void {
+  if (typeof element === 'string' || typeof element === 'number') {
+    container.appendChild(document.createTextNode(String(element)))
+    return
+  }
+  if (typeof element.type !== 'string') {
+    throw new Error('chibireact: function components are not yet supported.')
+  }
+
+  const dom = document.createElement(element.type)
+  applyProps(dom, element.props)  // ← ここを追加
+
+  for (const child of element.children) render(child, dom)
+  container.appendChild(dom)
+}
+
+function applyProps(dom: HTMLElement, props: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(props)) {
+    if (key === 'children') continue
+
+    if (key === 'className') {
+      dom.className = String(value)
+      continue
+    }
+
+    if (key === 'style' && typeof value === 'object' && value !== null) {
+      Object.assign(dom.style, value as CSSStyleDeclaration)
+      continue
+    }
+
+    if (value == null) continue
+
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      dom.setAttribute(key, String(value))
+      continue
+    }
+
+    // 関数 (events) は Part 1.6 で対応
+  }
+}
+```
+
+テスト再実行:
+
+```
+ ✓ tests/props.test.ts (10 tests)
+
+ Test Files  4 passed (4)
+      Tests  29 passed (29)
+```
+
+これで **Green**。10 個の props テストが通り、累計 29/29。
+
+## ちょっと深掘り
+
+### `className` を特別扱いする理由
+
+JavaScript で `class` は予約語（クラス定義に使う）なので、HTML 属性 `class` を JS のオブジェクト key にできません。React は `className` という別名を採用しました。
+
+DOM API には `element.className` というプロパティがあり、これは `setAttribute('class', ...)` と同じ効果なので、こちらを使うのが慣習です。
+
+```ts
+// どちらも同じ結果
+dom.className = 'box primary'
+dom.setAttribute('class', 'box primary')
+```
+
+### `style` オブジェクトを `Object.assign` で代入する理由
+
+`element.style` は実は **CSSStyleDeclaration オブジェクト**で、各 CSS プロパティに対する setter を持っています。
+
+```ts
+dom.style.color = 'red'        // OK
+dom.style.fontSize = '16px'    // OK（camelCase）
+dom.style['font-size'] = '16px' // これも OK（kebab-case）
+```
+
+`Object.assign(dom.style, { color: 'red', fontSize: '16px' })` は、上のプロパティ代入を一括で行うのと同じです。
+
+### 真偽値の属性 (`disabled`, `checked`) について
+
+HTML の boolean 属性（`disabled`, `checked`, `readonly` など）は、本来「**属性が存在するかしないか**」で真偽が決まります:
+
+```html
+<button disabled>無効</button>          <!-- true -->
+<button>有効</button>                   <!-- false -->
+<button disabled="false">？</button>    <!-- 実は true（属性が存在するから）-->
+```
+
+本書の最小実装では `disabled: true` を `setAttribute('disabled', 'true')` として反映していますが、これは厳密には正しくありません。本家 React では boolean 属性を**特別に扱って**、`true` のときだけ属性を追加し、`false` のときは削除します。
+
+将来 (Part 2 以降の差分計算で) この扱いを正確にする予定です。今は最小実装で進みます。
+
+### Part 1.6 で対応する関数 props
+
+`onClick`, `onChange` のような `on...` で始まる props は、**関数値**を持ちます。これらは `setAttribute` ではなく `addEventListener` で登録すべきです。
+
+実装は次の章で追加します。
+
+## まとめ
+
+- props を `className` / `style` / 一般属性 の 3 種類に分けて反映するようにしました
+- `null` / `undefined` の値は安全にスキップ
+- 関数（イベント）はまだ未対応 → 次の章で
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/050-props.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.5 props を DOM 属性として反映"
+```
+
+→ 次の章: [イベントハンドラに対応する](./060-event-handlers)

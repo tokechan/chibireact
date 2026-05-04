@@ -1,0 +1,260 @@
+---
+title: createElement の自作
+description: 仮想 DOM の最小単位である element オブジェクトを生成する関数を実装します
+---
+
+# createElement の自作
+
+[前章](./010-create-root-api)で API の入口である `createRoot` を作りました。次は **その入口に渡す「element」を作る関数** が必要です。
+
+> 「render(element) って書いてたけど、その element ってどうやって作るの？」
+
+その答えが `createElement` です。
+
+## この章のゴール
+
+- `createElement(type, props, ...children)` で **仮想 DOM 要素** を生成できる
+- props が `null` / `undefined` でも安全に動く
+- 可変長の children を配列にまとめる
+- 関数コンポーネントも type として渡せる
+
+> 章末に動くもの: 8 個のテストが緑になり、`createElement('h1', { className: 'title' }, 'Hello')` が正しい構造のオブジェクトを返す状態。
+
+前章: [初めてのレンダリングと createRoot API](./010-create-root-api)
+
+## 前提知識
+
+- TypeScript の **可変長引数** (`...args`)
+- TypeScript の **Nullish 合体演算子** (`??`)
+- 仮想 DOM の概念（Part 0 の [030-react-core-components](../00-introduction/030-react-core-components) で扱いました）
+
+## React の `createElement` を眺める
+
+JSX を書くと、Babel/SWC（または TypeScript）が以下のように変換します。
+
+```jsx
+// あなたが書く JSX
+<h1 className="title">Hello</h1>
+
+// コンパイル後（classic runtime）
+React.createElement('h1', { className: 'title' }, 'Hello')
+```
+
+つまり JSX は `createElement` 呼び出しの **シンタックスシュガー** にすぎません（詳しくは Part 4 で扱います）。
+
+返ってくる element オブジェクトの構造はこんな感じ:
+
+```js
+{
+  type: 'h1',
+  props: { className: 'title' },
+  children: ['Hello']
+}
+```
+
+> **注**: 本家 React は実際には `children` を `props` の中に入れます (`{ type, props: { className, children } }`)。本書では教育目的で **トップレベルに分離** する設計を採ります。これにより Renderer や Reconciler の実装が読みやすくなります。
+
+## 共通型を切り出す
+
+前章で `create-root.ts` の中に書いた `ChibireactNode` 型を、共有できるよう `src/types.ts` に切り出します。
+
+```ts
+// packages/@chibireact/core/src/types.ts
+export type ChibireactElement = {
+  type: string | Function
+  props: Record<string, unknown>
+  children: ChibireactNode[]
+}
+
+export type ChibireactNode = ChibireactElement | string | number
+```
+
+そして `create-root.ts` 側はインポートに置き換えます:
+
+```ts
+// packages/@chibireact/core/src/create-root.ts
+import type { ChibireactNode } from './types'
+// (以下の Root 型と createRoot 関数の中身は前章のまま)
+```
+
+これで複数のファイルが同じ型を共有できる準備が整いました。
+
+## テストを書く（Red）
+
+8 つの観点でテストを書きます。
+
+`packages/@chibireact/core/tests/create-element.test.ts`:
+
+```ts
+import { describe, it, expect } from 'vitest'
+import { createElement } from '../src/create-element'
+
+describe('createElement', () => {
+  it('type と props を持つ element オブジェクトを返します', () => {
+    const element = createElement('h1', { className: 'title' })
+    expect(element.type).toBe('h1')
+    expect(element.props).toEqual({ className: 'title' })
+  })
+
+  it('children を渡さないと空配列になります', () => {
+    const element = createElement('div', null)
+    expect(element.children).toEqual([])
+  })
+
+  it('props が null/undefined のときは空オブジェクトを使います', () => {
+    expect(createElement('div', null).props).toEqual({})
+    expect(createElement('div', undefined).props).toEqual({})
+  })
+
+  it('可変長の children を配列にまとめます', () => {
+    const element = createElement('p', null, 'Hello', ' ', 'World')
+    expect(element.children).toEqual(['Hello', ' ', 'World'])
+  })
+
+  it('入れ子の element を children に保持します', () => {
+    const child = createElement('span', null, 'Inner')
+    const parent = createElement('div', null, child)
+    expect(parent.children).toEqual([child])
+  })
+
+  it('数値の child もそのまま保持します', () => {
+    const element = createElement('p', null, 'Count: ', 42)
+    expect(element.children).toEqual(['Count: ', 42])
+  })
+
+  it('type が関数（コンポーネント）の場合もそのまま保持します', () => {
+    const Component = (props: { id: string }) =>
+      createElement('div', { id: props.id })
+    const element = createElement(Component, { id: 'app' })
+    expect(element.type).toBe(Component)
+  })
+
+  it('呼び出すたびに別の props オブジェクトが返ります', () => {
+    const a = createElement('div', null)
+    const b = createElement('div', null)
+    b.props.test = 'mutated'
+    expect(a.props).toEqual({}) // a の props は壊れない
+  })
+})
+```
+
+実行すると当然失敗します:
+
+```bash
+pnpm --filter @chibireact/core test
+```
+
+```
+Cannot find module '../src/create-element'
+```
+
+これが **Red** です。
+
+## 実装する（Green）
+
+最小実装はこれだけです。
+
+`packages/@chibireact/core/src/create-element.ts`:
+
+```ts
+import type { ChibireactElement, ChibireactNode } from './types'
+
+export function createElement(
+  type: string | Function,
+  props: Record<string, unknown> | null | undefined,
+  ...children: ChibireactNode[]
+): ChibireactElement {
+  return {
+    type,
+    props: props ?? {},
+    children,
+  }
+}
+```
+
+`index.ts` でも export します:
+
+```ts
+// packages/@chibireact/core/src/index.ts
+export { createRoot } from './create-root'
+export { createElement } from './create-element'
+export type { ChibireactElement, ChibireactNode } from './types'
+export type { Root } from './create-root'
+```
+
+再度テストを実行:
+
+```
+ ✓ tests/create-root.test.ts (3 tests)
+ ✓ tests/create-element.test.ts (8 tests)
+
+ Test Files  2 passed (2)
+      Tests  11 passed (11)
+```
+
+これが **Green**。たった 8 行のコードで 8 つのテストが通りました。
+
+## ちょっと深掘り
+
+### なぜ `props ?? {}` で十分なのか
+
+`??`（Nullish 合体演算子）は、左辺が **`null` または `undefined` のときだけ** 右辺を返します。`0` や `''` や `false` は左辺がそのまま返ります。
+
+| 左辺 | `?? {}` の結果 |
+|---|---|
+| `null` | `{}` |
+| `undefined` | `{}` |
+| `{}` | `{}`（同じオブジェクト）|
+| `{ a: 1 }` | `{ a: 1 }` |
+| `0` | `0` ⚠️ |
+| `''` | `''` ⚠️ |
+
+ただし上の表の最下 2 行（`0`, `''`）は実際には起きません。createElement の第 2 引数は「props オブジェクト or null」しか期待しないからです。型システム (`Record<string, unknown> | null | undefined`) で許容するのもこの 3 つです。
+
+`||` ではなく `??` を使う理由はこの厳密性です。`||` だと `0` も `''` も右辺に流れてしまいます。
+
+### children を可変長にする理由
+
+JSX は `<div><h1/><p/></div>` のように **複数の子要素を直接書ける** 書式です。これを変換すると:
+
+```js
+createElement('div', null, createElement('h1', null), createElement('p', null))
+```
+
+第 3 引数以降がすべて子要素になります。これを 1 つの引数で受け取りたいので、**可変長引数** (`...children`) を使います。
+
+```ts
+function createElement(type, props, ...children) {
+  // children は必ず配列になる: ['h1の要素', 'pの要素']
+}
+```
+
+### 本家 React との違い
+
+| 観点 | 本家 React | chibireact |
+|---|---|---|
+| children の場所 | `props.children` | トップレベル `element.children` |
+| `key` の扱い | element オブジェクトのトップレベル | （現時点では未対応、Part 1.11 で対応）|
+| `ref` の扱い | element オブジェクトのトップレベル | （Part 3.8 で扱います）|
+| `$$typeof` | `Symbol.for('react.element')` | （省略）|
+| Element の不変性 | `Object.freeze` で凍結 | （省略）|
+
+教育目的の最小実装では、これらの「本番品質に必要な気配り」を意図的に省いています。
+
+## まとめ
+
+- `createElement(type, props, ...children)` で仮想 DOM 要素を生成できるようになりました
+- 8 つのテストで仕様を表現し、すべて通しました
+- JSX は本質的にこの関数の呼び出しに変換されることを理解しました
+- 共通型を `types.ts` に切り出して、複数モジュールで共有できる構造にしました
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/030-create-element.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.3 createElement を実装"
+```
+
+次の章では、ここで作った element を **実際の DOM に描画** します。
+
+→ 次の章: 単純な再帰的レンダラー（執筆中）
