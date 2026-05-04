@@ -11,4 +11,5 @@ export default {
   '100-batching': '再レンダリングのトリガーと差分適用',
   '110-list-and-key': 'リスト描画と key',
   '120-typescript': 'TypeScript 化 — JSX.IntrinsicElements の整備',
+  '130-pause': 'ちょっと一息',
 }
