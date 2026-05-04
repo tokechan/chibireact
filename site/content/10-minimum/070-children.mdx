@@ -1,0 +1,239 @@
+---
+title: children と入れ子構造
+description: null/false/配列の child を React 互換のルールで扱えるようにします
+---
+
+# children と入れ子構造
+
+[1.4 単純な再帰的レンダラー](./040-recursive-renderer)で children を一通り扱えるようになりました。でも実は **React で頻出するパターンが、現状の chibireact では落ちます**:
+
+```jsx
+{cond && <Foo />}              {/* false が child に来る */}
+{items.map(i => <li>{i}</li>)} {/* 配列が child に来る */}
+{maybeNull}                    {/* null が child に来る */}
+```
+
+この章で「**child としての null / undefined / boolean / 配列**」を React と同じルールで扱えるようにします。
+
+## この章のゴール
+
+- `null` / `undefined` / `boolean` の child は **静かにスキップ** する
+- **配列の child** は要素を順に描画する
+- **入れ子配列**（`[a, [b, c]]`）も再帰的に処理する
+- `cond && <Element />` のような条件付きレンダリングが書ける
+- `items.map()` のリストレンダリングが書ける
+
+> 章末に動くもの: 10 個の children テストが緑になり、累計 48/48 緑。`{cond && <span />}` や `items.map(...)` が当たり前に動く状態。
+
+前章: [イベントハンドラに対応する](./060-event-handlers)
+
+## 前提知識
+
+- JS の `Array.isArray()`
+- React の条件付きレンダリングのイディオム (`cond && <X />`)
+- `Array.prototype.map()` でのリスト描画
+
+## なぜ React は false / null をスキップするのか
+
+React の以下のコードは「false の場合は何も描画しない」を表現します:
+
+```jsx
+function Notice({ visible, message }) {
+  return <div>{visible && <span>{message}</span>}</div>
+}
+```
+
+`visible` が `false` のとき、`visible && <span/>` の評価結果は `false`（短絡評価）になります。これを React は **「描画しないでね」と解釈** して、何もしません。
+
+もし React が `false` を文字列化して描画したら、画面に「false」と表示されてしまいます。これでは条件付きレンダリングが書けません。**React は false / null / undefined / true を「描画なし」のサインとして扱う** ことで、JS の自然なイディオムが UI に変換できる仕組みを提供しています。
+
+`true` も同様にスキップされます（`cond ? <A/> : <B/>` でない場合の `cond` 自体が `true` になることがあるため）。
+
+## 配列はどこから来るか
+
+JSX の `{items.map(i => <li>{i}</li>)}` をコンパイルすると:
+
+```ts
+items.map(i => createElement('li', null, i))
+// 戻り値: createElement の配列 = ChibireactElement[]
+```
+
+これが親要素の child として渡されると:
+
+```ts
+createElement('ul', null, items.map(...))
+// element.children = [items.map(...)] = [[li1, li2, li3]]
+//                                       ^^^^^^^^^^^^^^^^^^
+//                                       children[0] が配列
+```
+
+`createElement` の可変長引数の仕組みで、**3 番目の引数（配列 1 つ）が children[0] に入ります**。だから render が `children[0]` を見たとき、配列を展開する処理が要るわけです。
+
+## 型を拡張する
+
+現在 `ChibireactNode` は `element | string | number` の 3 種でした。これを React の `ReactNode` 相当に拡張します。
+
+`packages/@chibireact/core/src/types.ts`:
+
+```ts
+export type ChibireactNode =
+  | ChibireactElement
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | readonly ChibireactNode[]
+```
+
+`readonly` を付けたのは「配列の要素を変更しない」ことを表現するため。配列リテラル `['a', 'b']` を渡せるよう寛容な型にしておきます。
+
+## テストを書く（Red）
+
+`packages/@chibireact/core/tests/render-children.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { render } from '../src/render'
+import { createElement } from '../src/create-element'
+
+describe('render children (null / boolean / array)', () => {
+  let container: HTMLElement
+  beforeEach(() => { container = document.createElement('div') })
+
+  it('null / undefined / false / true は描画されません', () => {
+    render(createElement('div', null, null, undefined, false, true), container)
+    expect((container.firstChild as HTMLElement).childNodes.length).toBe(0)
+  })
+
+  it('配列の child を展開します', () => {
+    render(createElement('div', null, ['a', 'b', 'c']), container)
+    expect(container.firstChild?.textContent).toBe('abc')
+  })
+
+  it('入れ子配列も再帰的に処理します', () => {
+    render(createElement('div', null, ['a', ['b', ['c']]]), container)
+    expect(container.firstChild?.textContent).toBe('abc')
+  })
+
+  it('条件付きレンダリング: cond && <span /> パターン', () => {
+    const cond = true
+    render(createElement('div', null,
+      cond && createElement('span', null, 'shown'),
+      !cond && createElement('span', null, 'hidden'),
+    ), container)
+    expect(container.firstChild?.textContent).toBe('shown')
+  })
+
+  it('items.map() のリストレンダリング', () => {
+    const items = ['Item 1', 'Item 2', 'Item 3']
+    render(createElement('ul', null,
+      items.map(item => createElement('li', null, item))
+    ), container)
+    expect((container.firstChild as HTMLElement).children.length).toBe(3)
+  })
+})
+```
+
+（実際の test file には他のケース含めて 10 件）
+
+実行すると、現状の render は `null.type` で TypeError、配列も `[].type` で同様に落ちて失敗します。
+
+## 実装する（Green）
+
+`render` の冒頭に **2 つの早期 return** を追加します。
+
+`packages/@chibireact/core/src/render.ts`:
+
+```ts
+export function render(node: ChibireactNode, container: HTMLElement | Node): void {
+  // 1. null / undefined / boolean は React と同様にスキップ
+  if (node === null || node === undefined || typeof node === 'boolean') {
+    return
+  }
+
+  // 2. 配列はそれぞれを再帰的に処理（リストレンダリング用）
+  if (Array.isArray(node)) {
+    for (const item of node) render(item, container)
+    return
+  }
+
+  // 以下は前章までと同じ
+  if (typeof node === 'string' || typeof node === 'number') { ... }
+  if (typeof node.type !== 'string') { throw ... }
+
+  const dom = document.createElement(node.type)
+  applyProps(dom, node.props)
+  for (const child of node.children) render(child, dom)
+  container.appendChild(dom)
+}
+```
+
+たった **6 行の追加** で React 互換の children 処理が手に入ります。
+
+テスト再実行:
+
+```
+ ✓ tests/render-children.test.ts (10 tests)
+
+ Test Files  6 passed (6)
+      Tests  48 passed (48)
+```
+
+これで **Green**。10 個の children テストが通り、累計 48/48。
+
+## ちょっと深掘り
+
+### 配列のフラット化を `Array.prototype.flat()` で書かない理由
+
+「配列をフラット化するなら `node.flat(Infinity)` で 1 行じゃない？」と思うかもしれません。確かに書けます:
+
+```ts
+if (Array.isArray(node)) {
+  for (const item of node.flat(Infinity)) render(item, container)
+}
+```
+
+しかし `flat(Infinity)` は **新しい配列を作ります**（メモリ確保 + コピー）。本書の最小実装ではどちらでも動きますが、**再帰的な render 呼び出しでツリーを辿る方が React の Reconciler の動きに近い** ので、本書では再帰版を採用します。
+
+### `null` を配列に混ぜたら `0` の child は？
+
+`React` は `0` を **そのまま描画** します（数値なので）。一方、`<div>{count && <span/>}</div>` で `count = 0` のとき、`0 && X` は `0` に評価されるので `0` が描画されます。これがバグの温床です:
+
+```jsx
+{items.length && <List items={items} />}  {/* items.length が 0 のとき "0" が描画される */}
+```
+
+回避策は `items.length > 0 && ...` で boolean に正規化すること。本書 (chibireact) もこの仕様を **意図的に React と同じ** にしてあります（テストで確認済み: 数値はテキストとして描画される）。
+
+### `key` 属性はまだないけど大丈夫？
+
+リストレンダリングと言えば `key` 属性ですが、**今は関係ありません**。`key` は再レンダリング時の差分計算に使うもので、初回描画には不要です。Part 1.10 と 1.11 で `key` を扱います。今は警告も出さない（React は出します）最小実装です。
+
+### 本家 React の `Children` ユーティリティ
+
+React は `React.Children.map` / `React.Children.forEach` という API を持っています。これは props.children が「単一の値か / 配列か」を意識せずに扱えるユーティリティ:
+
+```js
+React.Children.map(props.children, (child, i) => /* ... */)
+```
+
+本書では **render 側で配列を再帰展開する** ことで同等の結果を得ているので、ユーザーが `React.Children` を呼ぶ必要はありません。
+
+## まとめ
+
+- `null` / `undefined` / `boolean` の child を **静かにスキップ** するようになりました
+- **配列の child** を再帰的に展開できるようになりました
+- `cond && <X />` や `items.map(...)` などの React イディオムが当たり前に動きます
+- たった 6 行の追加で、テスト 10 個が緑に
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/070-children.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.7 children と入れ子構造を扱う"
+```
+
+次の章では、いよいよ **関数コンポーネント** を実装します。`function App() { ... }` が動くようになります。
+
+→ 次の章: [関数コンポーネントの最小実装](./080-function-components)

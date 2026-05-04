@@ -1,0 +1,150 @@
+---
+title: ちょっと一息 — Part 1 で作ったもの
+description: Part 1 を振り返り、できるようになったこと・残された課題を整理します
+---
+
+# ちょっと一息 — Part 1 で作ったもの
+
+Part 1 を 13 章かけて積み上げてきました。まずはコーヒーでも淹れて、これまでに作ったものを眺めましょう。
+
+## できるようになったこと
+
+これらは **chibireact だけ** で動きます:
+
+```tsx
+import { createRoot, createElement, useState, FC } from '@chibireact/core'
+
+type ItemProps = { name: string; price: number }
+const Item: FC<ItemProps> = (props) => {
+  return createElement('li', null, `${props.name} - ¥${props.price}`)
+}
+
+const App: FC = () => {
+  const [items, setItems] = useState([
+    { name: 'Apple', price: 100 },
+    { name: 'Banana', price: 80 },
+  ])
+  const [name, setName] = useState('')
+  const [price, setPrice] = useState(0)
+
+  const addItem = () => {
+    if (!name) return
+    setItems([...items, { name, price }])
+    setName('')
+    setPrice(0)
+  }
+
+  return createElement('div', null,
+    createElement('h1', null, 'Shopping List'),
+    createElement('ul', null,
+      items.map((item, i) => createElement(Item, { ...item, key: i })),
+    ),
+    createElement('div', null,
+      createElement('input', { value: name }),
+      createElement('input', { type: 'number', value: price }),
+      createElement('button', { onClick: addItem }, '追加'),
+    ),
+  )
+}
+
+createRoot(document.getElementById('app')!).render(createElement(App, null))
+```
+
+これが **約 200 行の chibireact 本体** で動きます。
+
+| 機能 | 完成度 |
+|---|---|
+| 仮想 DOM (`createElement`) | 完了 |
+| 再帰的レンダリング | 完了 |
+| props (className / style / data-*) | 完了 |
+| イベントハンドラ (onClick 等) | 完了 |
+| children と入れ子・配列・null | 完了 |
+| 関数コンポーネント | 完了 |
+| `useState` | 完了 |
+| 関数型 setState (prev => next) | 完了 |
+| Object.is での同値スキップ | 完了 |
+| setState バッチング (queueMicrotask) | 完了 |
+| TypeScript 型 (FC / CommonHTMLProps) | 完了 |
+| key フィールド | 構造として用意 (Part 2 で活用) |
+
+| Vitest テスト | **69 個 / 全 pass** |
+
+## 残されている問題
+
+ここまでの最小実装では、以下の致命的な問題があります:
+
+### 1. **入力フォーカスが消える**
+`<input />` で文字を打つと、setState のたびに container をクリアして再描画するため、input 要素自体が新しく作られて focus が失われます。**実用フォームには使えない**状態。
+
+### 2. **同期再帰描画が UI を止める**
+`render` は同期的に再帰でツリーを辿ります。要素数が多いと UI がフリーズします。React 18 の Concurrent Rendering はこれを「中断可能な作業」に解体しています。
+
+### 3. **複数の関数コンポーネントで `useState` が混線**
+現状の実装は **モジュール状態の hooks 配列を全コンポーネントで共有** します。Counter を 2 つ並べたら状態が壊れます。
+
+### 4. **無駄な再計算が多い**
+親が再レンダされたら子も全部再レンダされます。`memo` のような最適化はまだありません。
+
+### 5. **list の並び替え / 削除が雑**
+key を付けても活用していません。並び替えで DOM が再生成されます。
+
+これらすべて、**Part 2 (Fiber) と Part 3 (Hooks) で解決します**。
+
+## どこに向かっているか
+
+ここまでで作った最小 React は、概念としては **「2015 年頃の React (v0.x 〜 v15)」相当** です。当時の React も以下のような方法で動いていました:
+- 同期的な再帰描画 (Stack Reconciler)
+- グローバルな state 管理 (バインディング使い回しの粗い方式)
+- 最小限の差分計算
+
+そして React は 2017 年に **Fiber アーキテクチャに完全書き直し** をしました。これが本書 Part 2 のテーマです。
+
+```
+Part 1 (済): 2015 年の React  → Part 2 (次): 2017 年以降の React (Fiber)
+                                Part 3: Hooks (2019 年〜)
+                                Part 4: JSX (1.0 から続く糖衣構文)
+                                Part 5: Concurrent Rendering (2022)
+                                Part 6: SSR / RSC
+```
+
+## チェックリスト
+
+Part 1 を完了したか、確認してみましょう:
+
+- [ ] `createRoot(container).render(element)` で画面に何かを出せる
+- [ ] `createElement('div', { className: 'x' }, 'hi')` の構造を理解している
+- [ ] `function App() { return createElement(...) }` で関数コンポーネントを書ける
+- [ ] `useState` で状態を持てる
+- [ ] `setState(prev => next)` の関数型更新を使える
+- [ ] `cond && <X />` のパターンが動く
+- [ ] `items.map(...)` でリストを描画できる
+- [ ] バッチングで複数 `setState` が 1 再レンダになる
+- [ ] `pnpm test` で 69 個全部緑になる
+- [ ] 入力 focus が消える問題を **目で見て** 確認した
+
+すべてチェックが付けば、Part 1 卒業です。
+
+## Part 2 の予告: Fiber アーキテクチャ
+
+次の Part では、本書最大の挑戦が待っています:
+
+> **「同期的な再帰」を捨て、「中断可能な作業ユニットの linked list」に書き換える**
+
+これにより:
+- 重い描画でも UI が固まらない
+- ユーザー入力など緊急の更新を割り込ませられる
+- Concurrent Rendering の基礎ができる
+
+そして「**動く React**」が本格的に手元に揃います。
+
+## 著者からひとこと
+
+ここまで読んでくださった方、本当にありがとうございます。chibivue を読んで「Vue の中身がわかった！」と感動した気持ちを、React でも届けたい一心で書いています。
+
+続く Part 2 はかなり骨があります。でも一度 Fiber を実装すれば、React の見え方が **根本から変わります**。「あの React のドキュメント、こういう意味だったのか」と腑に落ちる瞬間が必ず来ます。
+
+もう少しだけ、お付き合いください。
+
+— tokechan
+
+→ 次の章: Part 2「Reconciler の改良: Fiber へ」

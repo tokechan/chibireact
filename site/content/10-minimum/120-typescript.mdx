@@ -1,0 +1,199 @@
+---
+title: TypeScript 化 — JSX.IntrinsicElements の整備
+description: chibireact を TypeScript で書く読者のために、型定義を整えます
+---
+
+# TypeScript 化 — JSX.IntrinsicElements の整備
+
+ここまで TypeScript で書いてきましたが、**型は最低限** でした。`createElement('div', { id: 'app' })` の `'div'` は単なる文字列、`{ id: 'app' }` は `Record<string, unknown>`。
+
+実用に耐える chibireact なら、もう少し型を効かせたいです:
+
+- `'div'` ではなく**有効な HTML タグ名のみ**を受け付ける
+- `<input value={...} />` の `value` は string 限定にする
+- 関数コンポーネントには `FunctionComponent<P>` 型を提供する
+- 将来 JSX を導入したら、TypeScript の `JSX.IntrinsicElements` に乗っかる
+
+この章で **型の入り口** を整備します。
+
+## この章のゴール
+
+- `FunctionComponent<P>` / `FC<P>` 型を提供
+- `CommonHTMLProps`（id / className / style / イベント / data-* / aria-*）を定義
+- グローバル `JSX.IntrinsicElements` の最小版を提供（Part 4 の JSX 対応の準備）
+- 既存テスト 69/69 を維持
+
+> 章末に動くもの: `import { FC } from '@chibireact/core'` でコンポーネント型が使え、JSX 名前空間が用意された状態。実際に JSX を有効化するのは Part 4。
+
+前章: [リスト描画と key](./110-list-and-key)
+
+## 前提知識
+
+- TypeScript の `type` / `interface`
+- ジェネリクス（`<T>`）
+- グローバル namespace 宣言（`declare global`）
+
+## 関数コンポーネントの型
+
+React には `React.FC<Props>` という型があります。本書も同様に提供します:
+
+```ts
+// src/jsx-types.ts
+import type { ChibireactNode } from './types'
+
+export type FunctionComponent<P = Record<string, never>> = (
+  props: P & { children?: ChibireactNode | ChibireactNode[] },
+) => ChibireactNode
+
+export type FC<P = Record<string, never>> = FunctionComponent<P>
+```
+
+これで型付きコンポーネントが書けます:
+
+```tsx
+import { FC, createElement } from '@chibireact/core'
+
+type GreetingProps = { name: string }
+
+const Greeting: FC<GreetingProps> = (props) => {
+  return createElement('h1', null, `Hello, ${props.name}`)
+}
+
+createElement(Greeting, { name: 'tokechan' })  // OK
+createElement(Greeting, { name: 42 })          // Type error: number は string ではない
+createElement(Greeting, {})                    // Type error: name が必須
+```
+
+## CommonHTMLProps の整備
+
+「あらゆる HTML 要素に付けられる props」を共通定義します:
+
+```ts
+export type CommonHTMLProps = {
+  id?: string
+  className?: string
+  style?: Partial<CSSStyleDeclaration> | Record<string, string | number>
+  title?: string
+  // イベント
+  onClick?: (event: MouseEvent) => void
+  onChange?: (event: Event) => void
+  onInput?: (event: InputEvent) => void
+  // ARIA / data-*
+  [key: `data-${string}`]: string | number | boolean | undefined
+  [key: `aria-${string}`]: string | number | boolean | undefined
+  // chibireact 固有
+  key?: string | number | null
+}
+```
+
+`[key: ` + `data-${string}` + `]` は **TypeScript 4.1 以降のテンプレートリテラル型** で、「`data-` で始まる任意のキー」を表現します。`data-testid="..."` などが型エラーにならず通ります。
+
+## グローバル JSX 名前空間
+
+将来 JSX を有効化したとき (`<div id="app">...</div>` のような書き方)、TypeScript は **`JSX.IntrinsicElements`** という名前空間を見て「div は何 props を取るか」を判定します。
+
+ここを最小版で用意:
+
+```ts
+declare global {
+  namespace JSX {
+    type Element = ChibireactElement
+    interface IntrinsicElements {
+      div: CommonHTMLProps
+      h1: CommonHTMLProps
+      p: CommonHTMLProps
+      button: CommonHTMLProps & {
+        type?: 'button' | 'submit' | 'reset'
+        disabled?: boolean
+      }
+      input: CommonHTMLProps & {
+        type?: string
+        value?: string | number
+        // ...
+      }
+      // 他の要素も追加
+    }
+  }
+}
+```
+
+これで Part 4 で `<div id="app"></div>` と書いても TypeScript が文句を言いません。
+
+## index.ts でエクスポート
+
+```ts
+// src/index.ts
+export { createRoot } from './create-root'
+export { createElement } from './create-element'
+export { render } from './render'
+export { useState } from './hooks-state'
+export type { ChibireactElement, ChibireactNode } from './types'
+export type { Root } from './create-root'
+export type { Dispatch, SetStateAction } from './hooks-state'
+export type { FunctionComponent, FC, CommonHTMLProps } from './jsx-types'
+
+// JSX namespace を有効化するために import 副作用を発生させる
+import './jsx-types'
+```
+
+最後の `import './jsx-types'` がポイント。型を export するだけだと global namespace 宣言が **モジュール参照されないと有効化されない** ことがあります。副作用 import で確実に読み込ませます。
+
+## ちょっと深掘り
+
+### なぜ`React.FC` が一時期非推奨と言われたか
+
+React 17 〜 18 のあたりで「`React.FC` は `children` を**暗黙に許す**ので、children を持たないコンポーネントでも `<MyComp>子要素</MyComp>` と書けて型が通ってしまう」という問題が指摘され、一時期は `React.FC` を避けて生関数型 `(props: Props) => JSX.Element` を書くスタイルが推奨されました。
+
+React 18 で `FC` は children を**省略時必須にしない** ように修正されました。本書 chibireact の `FC` も `children?` をオプショナルにしているので、子要素なしのコンポーネントでも警告は出ません。
+
+### `JSX.IntrinsicElements` はどこから読まれるのか
+
+TypeScript の JSX サポートは **`tsconfig.json` の `jsx` オプション** で挙動が変わります:
+
+| `jsx` 値 | 振る舞い |
+|---|---|
+| `react` | `React.createElement` に変換、`React.JSX` を参照 |
+| `react-jsx` | `_jsx` runtime に変換、`React.JSX` を参照 |
+| `preserve` | 変換せず、type check のみ。`global.JSX` を参照 |
+| `react-jsxdev` | dev mode の `_jsxDEV` |
+
+本書 site/ では `preserve` を使っているので、グローバル `JSX` 名前空間が参照されます。本書 Part 4 で chibireact 用の jsx-runtime を書くと、`react-jsx` 相当の挙動になります。
+
+### `data-*` 属性のテンプレート型
+
+```ts
+[key: `data-${string}`]: string | number | boolean | undefined
+```
+
+これにより:
+```tsx
+<div data-testid="header" />     // OK
+<div data-user-id={42} />        // OK
+<div data-open />                // 厳密にはダメ (boolean true のみ書く必要あり)
+```
+
+`data-` で始まらないキー（`title` 等）は別 fields で定義しているので、型補完で「使えるキー一覧」が綺麗に出ます。
+
+### `style` 型の妥協
+
+```ts
+style?: Partial<CSSStyleDeclaration> | Record<string, string | number>
+```
+
+理想は `Partial<CSSStyleDeclaration>` だけで型補完が効きますが、`fontSize: '16px'` の `'16px'` は文字列ですし、CSS 変数 (`--my-color`) はそもそも型に存在しません。妥協で `Record<string, string | number>` も許容しています。
+
+## まとめ
+
+- `FunctionComponent<P>` / `FC<P>` を提供、props に型を付けられる
+- `CommonHTMLProps` に共通プロパティを集約
+- `JSX.IntrinsicElements` に主要 HTML 要素を登録
+- 実際の JSX 構文は Part 4 で扱うが、型の入り口はここで用意
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/120-typescript.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.12 TypeScript 型定義の整備"
+```
+
+→ 次の章: [ちょっと一息](./130-pause)

@@ -1,0 +1,164 @@
+---
+title: Reconciliation の前提知識
+description: 仮想 DOM の差分計算とは何か、どんな問題を解いているのかを整理します
+---
+
+# Reconciliation の前提知識
+
+Part 2 へようこそ。ここから本書最大の山場、**Fiber アーキテクチャ** に挑みます。
+
+その前に「**Reconciliation**（再調整、ろうにん）」という概念を整理しましょう。これは単なる用語ではなく、**「React がなぜ生まれたか」** に直結する考え方です。
+
+## この章のゴール
+
+- Reconciliation とは何かを言える
+- なぜ素朴な「全部書き直し」が駄目なのか分かる
+- 古典的な「ツリー diff アルゴリズム」が理論的に高コストな理由を理解する
+- React が **「現実的な近似」** を選んだ理由が分かる
+
+> 章末に動くもの: なし（概念整理の章）。コード変更もありません。
+
+前章: [Part 1.13 ちょっと一息](../10-minimum/130-pause)
+
+## Reconciliation とは
+
+> **Reconciliation = 古い仮想 DOM ツリーと新しい仮想 DOM ツリーを比較し、実 DOM への最小限の変更を導出するプロセス**
+
+たとえば:
+
+```
+古いツリー         新しいツリー
+<div>             <div>
+  <h1>A</h1>        <h1>A</h1>
+  <p>old</p>        <p>NEW</p>
+</div>            </div>
+```
+
+**全部消して描き直す**こともできますが、それだと「古い h1 を消して、新しい h1 を作って、入力フォーカスが消えて、アニメーションが途切れて...」と無駄が大きい。
+
+Reconciliation は **「`<p>` の中身が `old` → `NEW` に変わっただけ」と見抜き、その変更だけを実 DOM に反映** します。
+
+これが React のすべての出発点です。
+
+## ツリー diff の理論的コスト
+
+「2 つのツリーを比較して、どこが違うか」を厳密に求めるアルゴリズムは古くから研究されています。**Tai (1979) の Tree Edit Distance** は最も有名で、**O(n³)** の時間計算量です（n = ノード数）。
+
+ノード数が少ないうちは問題ないですが、たとえば 1000 ノードのツリーで:
+
+| 計算量 | 操作回数 |
+|---|---|
+| O(n) | 1,000 |
+| O(n log n) | 10,000 |
+| O(n²) | 1,000,000 |
+| O(n³) | **1,000,000,000** |
+
+10 億回。**1 秒の描画予算では絶対に間に合わない**。
+
+React は理論的に正しい diff を諦め、**「現実的な制約のもとで近似する」** 道を選びました。
+
+## React の現実的な近似
+
+React は次の 2 つの**前提**を置いて O(n) に落とします:
+
+### 前提 1: **異なる type の要素は完全に別物**
+
+```
+古い: <div>...</div>
+新しい: <span>...</span>
+```
+
+タグ名が違ったら、その**サブツリー全体を再生成** する。中身が同じでも気にしません。
+
+これは経験則として **ほとんどのケースで正しい**: コンポーネントが `<div>` から `<span>` に変わるとき、ふつう中身も意味的に変わっています。
+
+### 前提 2: **同じ親の中の子要素は key で識別する**
+
+```
+古い: <ul>
+        <li>Apple</li>
+        <li>Banana</li>
+        <li>Cherry</li>
+      </ul>
+新しい: <ul>
+        <li>Cherry</li>
+        <li>Apple</li>
+        <li>Banana</li>
+      </ul>
+```
+
+順序が変わっただけなのに、index 比較だと「全部書き換え」と判定されます。
+React は `key` 属性で「これは同じ要素」を識別:
+
+```
+<li key="apple">Apple</li>
+<li key="banana">Banana</li>
+<li key="cherry">Cherry</li>
+```
+
+key を見れば「`cherry` が先頭に移動した」と分かり、DOM の **moveBefore** 一発で済みます。
+
+## React の reconciliation アルゴリズム
+
+上の 2 前提のもと、React の reconciler は次のように動きます:
+
+```
+function reconcile(oldFiber, newElement):
+  if oldFiber.type === newElement.type:
+    # 同じ型: 再利用 + props 更新
+    update(oldFiber, newElement.props)
+  else:
+    # 違う型: 削除して新規作成
+    delete(oldFiber)
+    create(newElement)
+  
+  reconcile(oldFiber.children, newElement.children, by key)
+```
+
+シンプル。だが効果的。これが React の根幹です。
+
+## 本書 chibireact における Reconciliation
+
+Part 1 までの chibireact では、**reconciliation を放棄して全描画** していました（`container.innerHTML = ''` してから再描画）。これは「Reconciliation が無い」最も愚直な実装。
+
+これから Part 2 で実装する **Fiber** は、まさに上記の Reconciliation を **「中断・再開可能な作業」** として扱う仕組みです。
+
+## ちょっと深掘り
+
+### React の Fiber 以前: Stack Reconciler (v15 以前)
+
+React 15 までは「Stack Reconciler」と呼ばれる方式でした:
+
+- 同期的な再帰でツリーを辿る
+- 一度始めたら**最後まで止まらない**
+- 巨大なツリーで UI が固まる
+
+Part 1 までの chibireact の `render` 関数とほぼ同じ性質です。**Fiber はこれを置き換えるために生まれました**（次章で詳しく）。
+
+### Vue (chibivue) の reconciliation との違い
+
+Vue は **Proxy ベースのリアクティビティ** で「変わった場所が分かっている」状態でレンダリングします。だから React のような「ツリー全体を比較する diff」は本質的に必要ありません（細かい場所のみ更新）。
+
+ただし Vue 3 でも仮想 DOM は使っていて、コンポーネント単位の diff は走ります。Vue の場合は React より **「変更点が事前に分かっている」** ことが多いので、reconciliation が軽量です。
+
+詳しくは [chibivue book](https://book.chibivue.land/) を参照してください。設計思想の違いが面白いです。
+
+### 「O(n³) → O(n)」は人類の英断
+
+React の dan_abramov 氏（当時 Facebook）は講演で:
+
+> 「我々は理論的に正しい diff を諦めた。代わりに **99% のケースで上手くいく近似** を選び、それで Web のフロントエンドを変えた」
+
+と語っています。**完璧主義を捨てて実用主義に倒す** 設計判断が、現代の React の地位を作りました。
+
+## まとめ
+
+- Reconciliation = 仮想 DOM の diff と最小変更の導出
+- 厳密な tree diff は **O(n³)** で実用に耐えない
+- React は「異なる type は別物 / 同じ親の子は key で識別」の **2 前提** で **O(n) に近似**
+- 本書 chibireact は Part 1 まで reconciliation なしの全描画
+- **Part 2 で Fiber として reconciliation を実装** する
+
+## 次の章へ
+
+[Stack Reconciler の限界](./020-stack-reconciler-limits) で、Fiber 以前の素朴な実装の問題点を確認します。

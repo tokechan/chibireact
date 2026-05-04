@@ -1,0 +1,209 @@
+---
+title: Stack Reconciler の限界
+description: なぜ React 16 で Fiber に書き直されたのか、Part 1 のコードで実体験します
+---
+
+# Stack Reconciler の限界
+
+React 15 までは **Stack Reconciler** と呼ばれる方式でした:
+
+- 同期的な再帰でツリーを辿る
+- 一度始めたら最後まで止まらない
+- 巨大なツリーで UI が固まる
+
+本書 Part 1 までの `render` 関数も、実は **Stack Reconciler 相当**です。この章で、その限界を **実際に体験** します。
+
+## この章のゴール
+
+- 同期再帰描画の問題を **数字で実感** する
+- 「16ms フレーム予算」というブラウザ描画の前提を理解する
+- なぜ「中断・再開可能な作業」が必要かが分かる
+
+> 章末に動くもの: なし（実験と考察の章）。コード変更もありません。
+
+前章: [Reconciliation の前提知識](./010-reconciliation-intro)
+
+## ブラウザの描画予算: 16ms
+
+ブラウザは秒間 60 フレーム（60fps）で画面を更新します。1 フレームの予算は:
+
+```
+1000ms / 60 = 16.67ms
+```
+
+この間に:
+1. JavaScript の実行（イベントハンドラ、setState、再レンダ等）
+2. スタイル計算
+3. レイアウト計算
+4. ペイント
+5. コンポジット
+
+**全部** が終わる必要があります。JS が 16ms を超えると、フレームが落ちます。一瞬の **カクつき** として見えます。
+
+## Stack Reconciler はなぜ問題か
+
+本書 Part 1 までの `render`:
+
+```ts
+function render(node, container) {
+  // ... 分岐
+  for (const child of node.children) {
+    render(child, dom)  // ← 同期的な再帰
+  }
+  container.appendChild(dom)
+}
+```
+
+これは **「全ノードを同期的に処理してから戻る」** 構造です。
+
+### 思考実験: 1 万要素のリスト
+
+```tsx
+const App = () => {
+  const items = Array.from({ length: 10000 }, (_, i) => i)
+  return createElement('ul', null,
+    items.map(i => createElement('li', null, `Item ${i}`)),
+  )
+}
+```
+
+ブラウザで動かすと:
+- DOM 操作 1 万回 + テキスト生成 1 万回 = **数百 ms**
+- その間 **メインスレッドがブロック**
+- ユーザーがクリックしても反応しない
+- アニメーションが止まる
+
+これが Stack Reconciler の限界です。**「描画作業を細切れにできない」** ことが本質的な問題。
+
+### 本書 chibireact で実体験
+
+`examples/perf-test/` のような実験スクリプトを書けば、自分の目で確かめられます:
+
+```ts
+import { createRoot, createElement } from '@chibireact/core'
+
+const start = performance.now()
+
+const items = Array.from({ length: 10000 }, (_, i) => i)
+const big = createElement('ul', null,
+  items.map(i => createElement('li', null, `Item ${i}`)),
+)
+
+createRoot(document.getElementById('app')!).render(big)
+
+const elapsed = performance.now() - start
+console.log(`Render took ${elapsed.toFixed(2)} ms`)
+```
+
+手元の MacBook Pro でだいたい **150〜300ms**。16ms 予算の **10〜20 倍** をオーバーしています。この間ブラウザは凍り付きます。
+
+## React 15 でも同じだった
+
+実は React 15 までもまったく同じ問題を抱えていました。
+Facebook の検索ページなど巨大な React アプリで、入力中に **タイピングが重い** という声が常にありました。
+
+これを根本解決するために、React 16 (2017) で Fiber アーキテクチャに **完全書き直し**しました。
+
+## Fiber が変えたこと
+
+Fiber の本質は:
+
+> **描画作業を「小さな単位 (Fiber Node)」に分解し、各単位の処理ごとに「ブラウザに余裕があるか」を確認する**
+
+```
+旧 (Stack):
+  [render 開始 ─────────────────── 終了 (300ms)]
+                          ← この間、何もできない
+
+新 (Fiber):
+  [単位 1] [単位 2] [単位 3] ... [単位 N]
+   ↑       ↑       ↑           ↑
+   余裕    余裕    余裕         余裕
+   ある?   ある?   ある?        ある?
+   yes     yes     no → 中断 → ブラウザに制御を返す
+                       → 余裕ができたら再開
+```
+
+これにより:
+- 重い描画でも **UI が固まらない**
+- ユーザー入力が **割り込める**
+- アニメーションが**滑らか**
+
+## なぜ「Stack」 → 「Fiber」 という名前か
+
+| 古い名前 | 新しい名前 | 構造 |
+|---|---|---|
+| **Stack** Reconciler | — | コールスタックで再帰 |
+| — | **Fiber** Reconciler | 連結リスト (linked list) で順次処理 |
+
+「Stack」は JavaScript のコールスタックそのもの。再帰呼び出しでスタックが積まれていく方式です。
+「Fiber」は OS の **fiber (light-weight thread)** から取られたとも言われます。一つひとつの作業単位を「fiber」と呼び、それを連結リストで管理します。
+
+## 中断・再開のための前提
+
+「中断して後で再開」を実現するには、**作業の状態を保持できる構造** が要ります。再帰呼び出し（Stack）だとローカル変数がスタックフレームに残るだけで、明示的に中断・再開はできません。
+
+Fiber では各作業単位が **オブジェクト**として表現され、「次にやることは何か」「親は誰か」「子は誰か」を全部 **明示的なフィールド** に持たせます:
+
+```ts
+type Fiber = {
+  type: string | Function
+  props: Record<string, unknown>
+  parent: Fiber | null
+  child: Fiber | null
+  sibling: Fiber | null
+  alternate: Fiber | null  // 二重バッファ
+  // ...
+}
+```
+
+これは次章 [Fiber Node とは何か](./030-fiber-node) で詳しく見ます（執筆中）。
+
+## ちょっと深掘り
+
+### `requestIdleCallback` という仕組み
+
+Fiber は内部で **「いま余裕があるか」** をブラウザに問い合わせる仕組みを使います。代表的なのが `requestIdleCallback`:
+
+```js
+requestIdleCallback((deadline) => {
+  while (deadline.timeRemaining() > 0 && hasMoreWork) {
+    doNextUnit()
+  }
+})
+```
+
+`deadline.timeRemaining()` が「次のフレームまでの残り時間」を ms で返します。これがゼロに近づいたら中断、次の余裕ができたコールバックで再開。
+
+ただし `requestIdleCallback` は Safari がまだサポートしていないなどの問題があり、本家 React は **`MessageChannel` ベースの独自スケジューラ** を使っています。本書 chibireact では Part 2.5 で最小スケジューラを書きます。
+
+### React 18 の Concurrent Rendering
+
+Fiber は React 18 で **Concurrent Rendering** として完成形になりました:
+
+- 中断・再開
+- 優先度付き更新
+- 複数のツリーバージョンを並走（current ツリーと workInProgress ツリー）
+- Suspense との統合
+
+これらすべて Fiber が前提です。Fiber なしには Concurrent Rendering は成立しません。本書では Part 5 で Concurrent Rendering を扱います。
+
+### 「実測してみる」を勧める理由
+
+理屈で「Stack は遅い」と聞いても、実感は湧きません。**自分の手元で 1 万要素のリストを描画してフリーズを見る** ことで、Fiber の必要性が身体に染みます。
+
+本書 Part 2 を進めていく途中で「なぜここを複雑にするのか？」と感じたら、ぜひ Part 1 のコードに戻って 1 万要素を描画してみてください。**「ああ、これを解決したかったのか」** と腹落ちするはずです。
+
+## まとめ
+
+- ブラウザの描画予算は **1 フレーム = 16ms**
+- Stack Reconciler（同期再帰）は重いツリーで予算を**大幅に超える**
+- 中断・再開ができないのが本質的な問題
+- React 16 の Fiber は **作業を細切れの単位** にして解決
+- **次章から実装に入る**
+
+## 次の章へ
+
+[Fiber Node とは何か](./030-fiber-node)（執筆中）で、Fiber アーキテクチャの中核データ構造を見ます。
+
+これから本書最大の冒険が始まります。

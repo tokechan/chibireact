@@ -75,12 +75,7 @@ describe('render', () => {
     expect(h2.textContent).toBe('Inner Title')
   })
 
-  it('関数コンポーネントは未対応エラーを投げます', () => {
-    const Comp = () => createElement('div', null)
-    expect(() => render(createElement(Comp, null), container)).toThrow(
-      /function components/i,
-    )
-  })
+  // 関数コンポーネントの詳細テストは tests/render-function-components.test.ts へ
 })
 
 describe('createRoot.render の連携', () => {
