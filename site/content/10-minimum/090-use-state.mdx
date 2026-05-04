@@ -1,0 +1,325 @@
+---
+title: useState の最小実装
+description: 状態を持てる関数コンポーネントを実現します。Part 1 のクライマックスです
+---
+
+# useState の最小実装
+
+ついにここまで来ました。**状態を持つ関数コンポーネント**を chibireact で実現します。これができれば、こんなコードが動きます:
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0)
+  return createElement('button',
+    { onClick: () => setCount(count + 1) },
+    count,
+  )
+}
+
+createRoot(container).render(createElement(Counter, null))
+```
+
+クリックするたびに数字が増えるボタン。**普通の React アプリ** です。
+
+## この章のゴール
+
+- `useState(initial)` で状態を持てる
+- `setState(next)` で再レンダリングがトリガーされる
+- `setState(prev => next)` の関数型更新も動く
+- 同じ値を setState したら**再レンダしない**（`Object.is` 比較）
+- 複数の `useState` を同じコンポーネント内で使える
+- オブジェクトや配列など複合型も状態にできる
+
+> 章末に動くもの: 5 個の useState テストが緑になり、累計 **61/61** 緑。Counter / Form / Object 状態が実際に動く。
+
+前章: [関数コンポーネントの最小実装](./080-function-components)
+
+## 前提知識
+
+- React の `useState` の使い方（読者として）
+- クロージャと「外部変数を関数の中から参照する」パターン
+- `Object.is()` の挙動（`===` との違いは NaN と +0/-0 のみ）
+
+## なぜ普通のローカル変数では駄目なのか
+
+「コンポーネント内で `let count = 0` すれば？」と思うかもしれません。実は駄目です:
+
+```tsx
+function Counter() {
+  let count = 0  // 毎回 0 にリセットされる
+  return createElement('button',
+    { onClick: () => { count++ } },  // 増えるが…
+    count,
+  )
+}
+```
+
+問題:
+1. **コンポーネントが呼ばれるたびに `count = 0` で初期化される**
+2. `count++` してもコンポーネントが再評価されない（再レンダがトリガーされない）
+3. たとえ再レンダしても、また 0 から始まる
+
+`useState` が解決すること:
+1. **値を関数の外に保管する**（再呼び出しでも残る）
+2. setState で **再レンダをトリガー** する
+3. 再レンダでも前回の値を返す
+
+## 設計を考える: 「外」とはどこか
+
+useState の「外」は、技術的にはモジュールスコープ or root スコープです。本書 chibireact では **モジュールスコープに hooks 配列**を持つ最小実装を採ります。
+
+```
+[render 開始]
+  index = 0 にリセット
+  Counter() を呼ぶ
+    useState(0) → hooks[0] が無いので作る → return [0, setState]
+    index = 1
+  描画
+[クリック: setState(1)]
+  hooks[0].state = 1
+  rerender() を呼ぶ
+[render 開始 (2 回目)]
+  index = 0 にリセット
+  Counter() を呼ぶ
+    useState(0) → hooks[0] がある → return [1, setState]  ← 前回の値!
+  描画
+```
+
+「**hooks 配列の同じインデックスを毎回読みに行く**」のがポイント。これが React の **「Hooks のルール: 条件分岐の中で呼ばない」** が必要な理由です。順序が変わると別のインデックスを読んでしまうため。
+
+### この実装の制限（先に正直に）
+
+最小実装ゆえに、以下の制限があります:
+
+| 制限 | いつ解決するか |
+|---|---|
+| **複数の関数コンポーネントが配列を共有** | Part 1.10 / Part 2 (Fiber) |
+| **複数 createRoot で同じ配列** | 同上 |
+| **再レンダが「全部消して描き直し」** | Part 1.10 で差分計算 |
+| **DOM 状態（focus / scroll）が失われる** | Part 1.10 / Part 2 |
+| **入力フォーカスが消えるバグ**（input の中で typing できない） | Part 1.10 |
+
+つまり「**Counter 1 個ならちゃんと動くけど、複雑なアプリはまだ無理**」。Part 1.10 と Part 2 で本格化します。
+
+## 実装する
+
+### Step 1: hooks 状態モジュール
+
+`packages/@chibireact/core/src/hooks-state.ts`:
+
+```ts
+type Hook<T = unknown> = { state: T }
+
+let _rootHooks: Hook[] = []
+let _index = 0
+let _rerender: (() => void) | null = null
+
+export type SetStateAction<T> = T | ((prev: T) => T)
+export type Dispatch<T> = (action: SetStateAction<T>) => void
+
+export function useState<T>(initial: T): [T, Dispatch<T>] {
+  const index = _index++
+
+  if (_rootHooks[index] === undefined) {
+    _rootHooks[index] = { state: initial }
+  }
+
+  const hook = _rootHooks[index] as Hook<T>
+
+  const setState: Dispatch<T> = (action) => {
+    const next = typeof action === 'function'
+      ? (action as (prev: T) => T)(hook.state)
+      : action
+    if (Object.is(hook.state, next)) return // 同じ値ならスキップ
+    hook.state = next
+    _rerender?.()
+  }
+
+  return [hook.state, setState]
+}
+
+/** @internal */
+export function _resetHooks(rerender: () => void): void {
+  _index = 0
+  _rerender = rerender
+}
+```
+
+ポイント:
+- `_index++` で「呼ばれた順番」をインデックスにする
+- 初回は箱を作る、2 回目以降は既存の値を返す
+- setState のクロージャが `hook` オブジェクトを掴み続ける
+- `Object.is` で同値判定 → 無駄な再レンダを防ぐ
+
+### Step 2: createRoot を再レンダ対応にする
+
+`packages/@chibireact/core/src/create-root.ts`:
+
+```ts
+import type { ChibireactNode } from './types'
+import { render as renderToContainer } from './render'
+import { _resetHooks } from './hooks-state'
+
+export type Root = {
+  render(element: ChibireactNode): void
+}
+
+export function createRoot(container: HTMLElement): Root {
+  let lastElement: ChibireactNode | null = null
+
+  const rerender = (): void => {
+    if (lastElement === null) return
+    container.innerHTML = ''
+    _resetHooks(rerender)
+    renderToContainer(lastElement, container)
+  }
+
+  return {
+    render(element: ChibireactNode): void {
+      lastElement = element
+      container.innerHTML = ''
+      _resetHooks(rerender)
+      renderToContainer(element, container)
+    },
+  }
+}
+```
+
+`render` 時に最後の element を覚えておき、setState から `rerender()` が呼ばれたら同じ element をもう一度描画する仕組み。
+
+### Step 3: index.ts でエクスポート
+
+```ts
+export { useState } from './hooks-state'
+export type { Dispatch, SetStateAction } from './hooks-state'
+```
+
+## テスト
+
+5 ケースで検証:
+
+```ts
+it('初期値で状態を持ち、ボタンクリックで更新できます (Counter)', () => {
+  const Counter = () => {
+    const [count, setCount] = useState(0)
+    return createElement('button',
+      { onClick: () => setCount(count + 1) },
+      count,
+    )
+  }
+
+  const root = createRoot(container)
+  root.render(createElement(Counter, null))
+
+  const button = container.firstChild as HTMLButtonElement
+  expect(button.textContent).toBe('0')
+
+  button.click()
+  expect((container.firstChild as HTMLButtonElement).textContent).toBe('1')
+})
+```
+
+ポイント: クリック後、`container.firstChild` で取り直す必要があります。再レンダで DOM が作り直されるためです。
+
+実行:
+
+```
+ ✓ tests/hooks-state.test.ts (5 tests)
+ Test Files  8 passed (8)
+      Tests  61 passed (61)
+```
+
+これで **Green**。
+
+## 試してみる: 動く Counter
+
+ブラウザで実行できるサンプル（`examples/02-counter/main.ts` 想定）:
+
+```ts
+import { createRoot, createElement, useState } from '@chibireact/core'
+
+function Counter() {
+  const [count, setCount] = useState(0)
+
+  return createElement('div', null,
+    createElement('p', null, `Count: ${count}`),
+    createElement('button', { onClick: () => setCount(count - 1) }, '-'),
+    createElement('button', { onClick: () => setCount(count + 1) }, '+'),
+  )
+}
+
+createRoot(document.getElementById('app')!).render(createElement(Counter, null))
+```
+
+これで本物の Counter が動きます。useState の実装はわずか 30 行。
+
+## ちょっと深掘り
+
+### Hooks のルール「条件分岐の中で呼ばない」の理由
+
+React 公式が言う「Hooks のルール」は次の 2 つ:
+1. ループ・条件・ネスト関数の中で呼ばない
+2. React 関数（コンポーネント / カスタムフック）の中でだけ呼ぶ
+
+このうち 1 は **本書の実装で破ると即死**します:
+
+```tsx
+function App() {
+  if (someCond) {
+    const [a] = useState('a')  // hooks[0] = { state: 'a' }
+  }
+  const [b] = useState('b')    // someCond=true なら hooks[1]、false なら hooks[0]
+}
+```
+
+`someCond` の真偽でインデックスがずれて、`b` が `'a'` の値を読んでしまうバグになります。本家 React も同じ理由でこのルールを要求します（Fiber でも hook list は順序依存）。
+
+### 関数型 setState (`setCount(c => c + 1)`) のメリット
+
+```tsx
+// Pattern A: 値を直接渡す
+setCount(count + 1)
+
+// Pattern B: 関数を渡す
+setCount(prev => prev + 1)
+```
+
+クリックを連続したとき、A だとクロージャが古い `count` を掴んでいるため正しくインクリメントされません（古い値 + 1 を 3 回設定 = 1 回しか進まない）。
+
+B は **「最新の値」が引数で渡される** ので、必ず正しくインクリメントされます。本書 chibireact もこの「関数渡しなら最新値を渡す」仕様を実装しています。
+
+### `Object.is` を使う理由（`===` ではなく）
+
+ほぼ `===` と同じですが、2 箇所違います:
+- `Object.is(NaN, NaN)` → `true` （`===` は false）
+- `Object.is(+0, -0)` → `false` （`===` は true）
+
+実用的には NaN の扱いだけが効きます。`setState(NaN)` を 2 回呼んだら 2 回目をスキップしたい、という意図に React と本書ともに合っています。
+
+### 「DOM がリセットされる」問題
+
+現在の実装では setState のたびに `container.innerHTML = ''` で **container を空にしてから描き直し** ます。これは:
+
+- input フィールドの中身が消える（type してたテキストが消える）
+- focus / scroll 位置がリセット
+- input 要素が再生成されるので onChange の連発で typing が成立しない
+
+要するに **本物のフォームには使えない**。これを Part 1.10 で「差分だけ更新」にし、Part 2 で Fiber に置き換えて解消します。
+
+## まとめ
+
+- `useState(initial)` をモジュール状態 + index 配列の最小実装で書きました
+- setState で `container.innerHTML = ''` → 全描画 という最も愚直な再レンダ
+- Counter / Form / Object state まで動く（テスト 5 個 緑）
+- ただし「複数コンポーネントの hooks 共有問題」「DOM リセット問題」は残る → Part 1.10 と Part 2 で解消
+
+これで **「動く React」のごく一部** が手元にあります。次は再レンダの動きを賢くします。
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/090-use-state.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.9 useState の最小実装"
+```
+
+→ 次の章: 再レンダリングのトリガーと差分適用（執筆中）
