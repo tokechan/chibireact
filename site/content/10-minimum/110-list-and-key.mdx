@@ -1,0 +1,220 @@
+---
+title: リスト描画と key
+description: key プロパティを element に持たせて、Part 2 (Fiber) の差分計算に備えます
+---
+
+# リスト描画と key
+
+リスト描画は前章までで動きます:
+
+```tsx
+const items = ['Apple', 'Banana', 'Cherry']
+createElement('ul', null,
+  items.map(item => createElement('li', null, item)),
+)
+```
+
+ただし、現状の chibireact では **`key` を渡しても何もしません**。React は `key` がないとコンソールに警告を出しますが、本書はまだ警告も出していません。
+
+この章で `element.key` を **構造として用意** し、Part 2 (Fiber) で本格活用する準備を整えます。
+
+## この章のゴール
+
+- `createElement('li', { key: 'item-1' }, ...)` で **key が element トップレベルに昇格** する
+- `key` は React と同様に `props` から除去される（DOM の HTML 属性にはならない）
+- 数値・文字列の key を保持できる
+- 5 個の key 関連テストが緑
+
+> 章末に動くもの: 累計 69/69 緑。`element.key` がトップレベルに存在し、後続章で diff に使える状態。
+
+> **本章のスコープについて**: `key` を **使う側**（本格的な list reconciliation）は Part 2 (Fiber) で実装します。本章は **「key を構造として用意」** までです。これは React の `react/jsx-runtime` が key を props 内ではなく element トップレベルに昇格させる仕組みと同じです。
+
+前章: [再レンダリングのトリガーと差分適用](./100-batching)
+
+## 前提知識
+
+- `createElement` の引数構造（[1.3 章](./030-create-element)）
+- なぜリストに `key` が必要か（React 公式の説明）
+
+## なぜ key が必要か
+
+React は再レンダのとき、新旧の element ツリーを比較して **「同じ位置の要素は再利用」** します。リスト描画では「同じ位置」が曖昧になります:
+
+```tsx
+// 状態 A
+<ul>
+  <li>Apple</li>      <!-- 位置 0 -->
+  <li>Banana</li>     <!-- 位置 1 -->
+  <li>Cherry</li>     <!-- 位置 2 -->
+</ul>
+
+// Banana を削除した状態 B
+<ul>
+  <li>Apple</li>      <!-- 位置 0 -->
+  <li>Cherry</li>     <!-- 位置 1 -->
+</ul>
+```
+
+key なしだと React は「位置 0 → 位置 0 (Apple), 位置 1 → 位置 1 (Banana → Cherry に書き換え), 位置 2 を削除」と認識します。Banana の DOM が Cherry に書き換えられ、Cherry の DOM が削除されます。**意図と違う変更**が起きます。
+
+key を付けると:
+
+```tsx
+// 状態 A
+<ul>
+  <li key="apple">Apple</li>
+  <li key="banana">Banana</li>
+  <li key="cherry">Cherry</li>
+</ul>
+
+// 状態 B
+<ul>
+  <li key="apple">Apple</li>
+  <li key="cherry">Cherry</li>
+</ul>
+```
+
+React は「key=banana の要素が消えた、key=cherry は位置 1 に移動した」と正しく認識し、**Banana の DOM を削除して Cherry の DOM を再利用** します。これが key の本質です。
+
+## React の jsx-runtime も key を「特別扱い」する
+
+React の JSX (`<li key="x" id="y">...</li>`) をコンパイルすると、`key` は **props ではなく別の引数** として渡されます:
+
+```js
+// React 17 以降の automatic runtime
+jsx('li', { id: 'y', children: '...' }, 'x')  // 第 3 引数が key
+```
+
+これは「key は DOM 属性ではない」「key は React 内部の識別子」という意味の表現です。
+
+本書 chibireact では classic runtime っぽい呼び出し (`createElement(type, props, ...children)`) を使うので、`key` は props の中に紛れて渡ってきます。それを createElement の中で **掘り出してトップレベルに移す** のが本章の仕事です。
+
+## 設計
+
+`ChibireactElement` に `key` フィールドを追加:
+
+```ts
+// types.ts
+export type ChibireactElement = {
+  type: string | Function
+  props: Record<string, unknown>
+  children: ChibireactNode[]
+  key?: string | number | null
+}
+```
+
+`createElement` で props から key を取り出してトップレベルに:
+
+```ts
+export function createElement(type, props, ...children) {
+  const safeProps = { ...(props ?? {}) }
+  let key: string | number | null | undefined
+
+  if ('key' in safeProps) {
+    const k = safeProps.key
+    if (k != null) key = k as string | number
+    delete safeProps.key
+  }
+
+  return {
+    type,
+    props: safeProps,
+    children,
+    key: key ?? null,
+  }
+}
+```
+
+## テストを書く（Red）
+
+`packages/@chibireact/core/tests/create-element-key.test.ts`:
+
+```ts
+describe('createElement key', () => {
+  it('key 指定がない場合は key は null', () => {
+    const el = createElement('li', null)
+    expect(el.key).toBe(null)
+  })
+
+  it('props.key がトップレベル element.key に昇格します', () => {
+    const el = createElement('li', { key: 'item-1' }, 'A')
+    expect(el.key).toBe('item-1')
+  })
+
+  it('key は props からは除去されます', () => {
+    const el = createElement('li', { key: 'item-1', id: 'a' }, 'A')
+    expect(el.props).toEqual({ id: 'a' })
+    expect('key' in el.props).toBe(false)
+  })
+
+  it('数値の key も保持できます', () => {
+    const el = createElement('li', { key: 42 })
+    expect(el.key).toBe(42)
+  })
+
+  it('リスト内の各要素に key を付けられます', () => {
+    const items = ['a', 'b', 'c']
+    const elements = items.map((label, i) => createElement('li', { key: i }, label))
+    expect(elements.map(e => e.key)).toEqual([0, 1, 2])
+  })
+})
+```
+
+## 実装する（Green）
+
+types.ts と create-element.ts を上の設計通りに更新するだけ。テスト 5 個 緑。
+
+## ちょっと深掘り
+
+### Fiber と key の関係
+
+Part 2 で実装する Fiber では、各 fiber ノードに「対応する element の key」を覚えさせます。再レンダ時の差分計算で:
+
+1. 親 fiber の child fibers を **key でハッシュマップ化**
+2. 新しい element 配列を順番に処理
+3. 同じ key の fiber があれば **再利用 + props 更新**
+4. なければ新規作成
+5. 残った古い fiber は削除
+
+これが React の有名な「list reconciliation」です。詳細は Part 2.4 / 2.7 で扱います。
+
+### key に index を使うのは「ベターよりまし」
+
+```tsx
+{items.map((item, index) => <Item key={index} ... />)}
+```
+
+これは React の警告は消えますが、**並び替え・挿入・削除に弱い**です。`key={index}` だと「位置 0 の item」「位置 1 の item」という識別になり、リスト先頭への挿入で全 item が key の意味で動いてしまいます。
+
+理想は:
+```tsx
+{items.map(item => <Item key={item.id} ... />)}
+```
+
+`item.id` のような **データ固有のユニーク ID** を key にするのがベスト。本書 chibireact もこの React の慣習をそのまま採ります。
+
+### なぜ key を `props` から除外するのか
+
+`<li key="x">` の `key` を **DOM の `class="x"` のように attribute として残す** こともできましたが、React はあえて分離しました。理由:
+
+- `key` は **React 内部の識別子**であり、DOM の表現とは無関係
+- `key="x"` を DOM 属性として書き出すと、用途を誤解させる
+- React の検証 / DevTools が `key` を特別扱いしたい
+
+本書も同じ哲学で、createElement 段階で props から key を抽出します。
+
+## まとめ
+
+- `ChibireactElement` に `key` フィールドを追加
+- `createElement` で `props.key` をトップレベルに昇格、props からは除去
+- React の jsx-runtime と同じ「key は props ではなく別の場所」哲学を採用
+- 実際の **diff での活用は Part 2 (Fiber) で本格化**
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/10-minimum/110-list-and-key.mdx site/content/10-minimum/_meta.js
+git commit -m "feat(part1): 1.11 element に key フィールドを追加 (Part 2 への準備)"
+```
+
+→ 次の章: [TypeScript 化: JSX.IntrinsicElements の整備](./120-typescript)
