@@ -5,4 +5,5 @@ export default {
   '040-work-loop': 'work loop と作業の単位化',
   '050-scheduler': 'requestIdleCallback と最小スケジューラ',
   '060-double-buffer': '二重バッファ — current ツリーと workInProgress',
+  '070-commit': 'Commit phase の最適化と createRoot の Fiber 統合',
 }

@@ -349,14 +349,16 @@ function findClosestDomAncestor(fiber: Fiber): Node | null {
 }
 
 /**
- * UPDATE 時の DOM プロパティ更新。
+ * UPDATE 時の DOM プロパティ更新（Part 2.7 で diff 最小化）。
  *
- * 2.6 では「古いイベントリスナを外して新しいリスナを付け直す」+「すべての new prop を再適用」
- * という単純な戦略を採る。差分計算で最小限に絞る最適化は 2.7 で。
+ * 戦略:
+ *   1. text fiber → nodeValue を比較して必要なら差し替え
+ *   2. 古い props にあって新 props で消えた属性 → DOM から除去
+ *   3. 新しいまたは変わった prop のみ適用
+ *      - イベント: 古いリスナを removeEventListener してから新しいリスナを addEventListener
+ *      - className / style / attribute: 値を入れ替え
  *
- * 注意点:
- *   - イベントは古いハンドラを外さないと多重登録される
- *   - 「古い props にあって新しい props で消えた属性」は今は残ったまま (2.7 で対応)
+ * 不変な prop は触らない → 余計な setAttribute / addEventListener を避ける。
  */
 function updateDom(
   dom: Node,
@@ -372,14 +374,82 @@ function updateDom(
   }
   if (!(dom instanceof HTMLElement)) return
 
-  // 古いイベントリスナを除去
-  for (const [key, value] of Object.entries(oldProps)) {
-    if (isEventProp(key) && typeof value === 'function') {
-      dom.removeEventListener(getEventName(key), value as EventListener)
-    }
+  // 1. 削除された prop を DOM から除去
+  for (const key of Object.keys(oldProps)) {
+    if (key === 'children') continue
+    if (key in newProps) continue // 新側にもあるなら上書きで処理される
+    removeProp(dom, key, oldProps[key])
   }
 
-  applyProps(dom, newProps)
+  // 2. 新規 / 変更された prop を適用
+  for (const [key, newValue] of Object.entries(newProps)) {
+    if (key === 'children') continue
+    const oldValue = oldProps[key]
+    if (Object.is(oldValue, newValue)) continue
+    setProp(dom, key, oldValue, newValue)
+  }
+}
+
+/** 1 つの prop を DOM から除去する。 */
+function removeProp(dom: HTMLElement, key: string, value: unknown): void {
+  if (isEventProp(key) && typeof value === 'function') {
+    dom.removeEventListener(getEventName(key), value as EventListener)
+    return
+  }
+  if (key === 'className') {
+    dom.removeAttribute('class')
+    return
+  }
+  if (key === 'style') {
+    dom.removeAttribute('style')
+    return
+  }
+  dom.removeAttribute(key)
+}
+
+/** 1 つの prop を DOM に設定する（古い値があれば差し替え相当の処理）。 */
+function setProp(
+  dom: HTMLElement,
+  key: string,
+  oldValue: unknown,
+  newValue: unknown,
+): void {
+  if (isEventProp(key)) {
+    if (typeof oldValue === 'function') {
+      dom.removeEventListener(getEventName(key), oldValue as EventListener)
+    }
+    if (typeof newValue === 'function') {
+      dom.addEventListener(getEventName(key), newValue as EventListener)
+    }
+    return
+  }
+  if (key === 'className') {
+    dom.className = String(newValue ?? '')
+    return
+  }
+  if (key === 'style' && typeof newValue === 'object' && newValue !== null) {
+    // 古い style キーで新側に無いものは消す（最小限の style diff）
+    if (oldValue && typeof oldValue === 'object') {
+      for (const styleKey of Object.keys(oldValue as Record<string, unknown>)) {
+        if (!(styleKey in (newValue as Record<string, unknown>))) {
+          ;(dom.style as unknown as Record<string, string>)[styleKey] = ''
+        }
+      }
+    }
+    Object.assign(dom.style, newValue as CSSStyleDeclaration)
+    return
+  }
+  if (newValue == null) {
+    dom.removeAttribute(key)
+    return
+  }
+  if (
+    typeof newValue === 'string' ||
+    typeof newValue === 'number' ||
+    typeof newValue === 'boolean'
+  ) {
+    dom.setAttribute(key, String(newValue))
+  }
 }
 
 function findNextUnit(fiber: Fiber): Fiber | null {

@@ -1,0 +1,318 @@
+---
+title: Commit phase の最適化と createRoot の Fiber 統合
+description: prop の差分計算で commit を最小化し、createRoot を Fiber 版に差し替えて Counter を新基盤に乗せ替えます
+---
+
+# Commit phase の最適化と createRoot の Fiber 統合
+
+[二重バッファ — current ツリーと workInProgress](./060-double-buffer) で「DOM identity が保たれる」骨格は出来ました。
+ですが 2.6 までの `updateDom` は **新 props を全部再適用** するだけで、変わっていない属性にも余計な `setAttribute` を呼んでいます。
+さらに、Part 1.9 で書いた `useState` の Counter は **まだ Stack reconciler 経由** で動いており、Fiber の恩恵を受けていません。
+
+本章で 2 つを仕上げます:
+
+1. **prop diff 最適化**: 変わった prop と消えた prop だけ DOM に反映
+2. **`createRoot` を Fiber 版に差し替え**: useState の setState も二重バッファに乗る → focus 保存などの実利を初体験
+
+## この章のゴール
+
+- updateDom が「変更点だけ」DOM を触ることを確認できる
+- 古い属性が消えるとき DOM から removeAttribute されることを確認できる
+- `createRoot` 経由の Counter で、setState を跨いでも button DOM が同一インスタンスのまま
+- `<input>` の focus が setState を跨いでも保たれる
+
+> 章末に動くもの: prop diff + createRoot Fiber 統合。テスト 7 個追加で累計 **128/128**。Part 2 完走。
+
+前章: [二重バッファ — current ツリーと workInProgress](./060-double-buffer)
+
+## prop の差分計算
+
+2.6 の updateDom は雑に「全部再適用」でした。これを 3 段階に整理します:
+
+```ts
+function updateDom(dom, oldProps, newProps) {
+  // 1. 削除された prop を DOM から除去
+  for (const key of Object.keys(oldProps)) {
+    if (key === 'children') continue
+    if (key in newProps) continue
+    removeProp(dom, key, oldProps[key])
+  }
+
+  // 2. 新規 / 変わった prop だけ適用
+  for (const [key, newValue] of Object.entries(newProps)) {
+    if (key === 'children') continue
+    if (Object.is(oldProps[key], newValue)) continue
+    setProp(dom, key, oldProps[key], newValue)
+  }
+}
+```
+
+`setProp` 内では:
+- イベント: 古いリスナを除去 → 新しいリスナを登録
+- className: `dom.className = newValue`
+- style: 古い style キーで新側に無いものを `''` でクリア + 新側を Object.assign
+- 通常属性: setAttribute / removeAttribute
+
+`removeProp` も対称的に書きます。
+
+> 「変わってない属性は触らない」が原則。setAttribute は意外と重く、特に input の `value` は cursor 位置をリセットすることがあるため、不要な呼び出しを避ける価値があります。
+
+### テスト: setAttribute は変更時のみ呼ばれる
+
+```ts
+it('変わらない属性に対して setAttribute は呼ばれない', () => {
+  runFiberRoot(<div id="same" title="a" />, container)
+  const div = container.firstChild
+  const setAttributeSpy = vi.spyOn(div, 'setAttribute')
+
+  runFiberRoot(<div id="same" title="b" />, container)
+
+  expect(setAttributeSpy).not.toHaveBeenCalledWith('id', expect.anything())
+  expect(setAttributeSpy).toHaveBeenCalledWith('title', 'b')
+})
+```
+
+### テスト: 削除された属性は DOM から消える
+
+```ts
+it('削除された属性は DOM から消える', () => {
+  runFiberRoot(<div id="before" title="tip" />, container)
+  expect(div.hasAttribute('title')).toBe(true)
+
+  runFiberRoot(<div id="after" />, container)
+  expect(div.hasAttribute('title')).toBe(false)
+})
+```
+
+## createRoot を Fiber 版に差し替える
+
+ここまで `runFiberRoot` (同期) と `scheduleFiberRoot` (RIC 版) を **`createRoot` の外** に置いてきました。
+2.7 で `createRoot` の中身を Fiber 版に切り替えます。
+
+### Before (Part 1.9)
+
+```ts
+import { render as renderToContainer } from './render'
+import { _resetHooks } from './hooks-state'
+
+export function createRoot(container) {
+  let lastElement = null
+
+  const rerender = () => {
+    if (lastElement === null) return
+    container.innerHTML = ''           // ★ DOM 全消し
+    _resetHooks(rerender)
+    renderToContainer(lastElement, container)
+  }
+
+  return {
+    render(element) {
+      lastElement = element
+      container.innerHTML = ''
+      _resetHooks(rerender)
+      renderToContainer(element, container)
+    },
+  }
+}
+```
+
+### After (Part 2.7)
+
+```ts
+import { runFiberRoot } from './work-loop'
+import { _resetHooks } from './hooks-state'
+
+export function createRoot(container) {
+  let lastElement = null
+
+  const rerender = () => {
+    if (lastElement === null) return
+    _resetHooks(rerender)
+    runFiberRoot(lastElement, container)  // ★ DOM 全消ししない
+  }
+
+  return {
+    render(element) {
+      lastElement = element
+      _resetHooks(rerender)
+      runFiberRoot(element, container)
+    },
+  }
+}
+```
+
+差分:
+- `container.innerHTML = ''` を **削除**: Fiber が前回ツリーと diff して DOM を再利用
+- `renderToContainer` (Part 1 の `render`) → `runFiberRoot` に置換
+
+useState の `_scheduleRerender` (queueMicrotask によるバッチング) はそのまま動きます。マイクロタスクが flush されたら `rerender()` が呼ばれ、内部で `runFiberRoot` が走ります。
+
+> 補足: 内部で `runFiberRoot` (同期) を使っています。`scheduleFiberRoot` (RIC 版) でも同じ DOM 結果が出ますが、テスト時の `flushMicrotasks` だけでは setTimeout フォールバックを待てないため、教育用には同期で十分。本番想定なら `scheduleFiberRoot` を呼ぶラッパを書けば中断可能になります。
+
+## クライマックス: Counter で DOM identity が保たれる
+
+Part 1.9 の Counter テストはそのまま通ります。ですが今回 **新たに分かること** があります:
+
+```ts
+it('Counter の setState で button DOM identity が保たれる', async () => {
+  const Counter = () => {
+    const [count, setCount] = useState(0)
+    return createElement(
+      'button',
+      { onClick: () => setCount(count + 1) },
+      count,
+    )
+  }
+
+  const root = createRoot(container)
+  root.render(createElement(Counter, null))
+
+  const button1 = container.firstChild as HTMLButtonElement
+  expect(button1.textContent).toBe('0')
+
+  button1.click()
+  await flushMicrotasks()
+
+  const button2 = container.firstChild as HTMLButtonElement
+  expect(button2).toBe(button1) // ★ 同一の DOM ノード
+  expect(button2.textContent).toBe('1')
+})
+```
+
+`button2 === button1`! Part 1.9 の頃は `container.innerHTML = ''` で毎回新しい button が作られていましたが、Fiber では **同じ button が中身だけ更新される** ようになりました。
+
+### focus 保存テスト
+
+DOM 同一性の **最大のご利益** が focus 保存です:
+
+```ts
+it('focus が setState 後も保たれる', async () => {
+  document.body.appendChild(container) // jsdom で focus には attach 必須
+
+  const Field = () => {
+    const [value, setValue] = useState('')
+    return createElement('input', {
+      value,
+      onInput: (e) => setValue((e.target as HTMLInputElement).value),
+    })
+  }
+
+  const root = createRoot(container)
+  root.render(createElement(Field, null))
+
+  const input1 = container.firstChild as HTMLInputElement
+  input1.focus()
+  expect(document.activeElement).toBe(input1)
+
+  // 値を変えて再 render
+  input1.value = 'x'
+  input1.dispatchEvent(new Event('input'))
+  await flushMicrotasks()
+
+  const input2 = container.firstChild as HTMLInputElement
+  expect(input2).toBe(input1)             // 同じ DOM
+  expect(document.activeElement).toBe(input2)  // focus 維持
+})
+```
+
+Part 1.9 の制限「**DOM リセットで input focus が消える**」が、Part 2.7 で解決されたわけです。
+
+## まだやっていないこと（次のステップ）
+
+| 機能 | 状態 |
+|---|---|
+| key を使ったリスト並び替え対応 | ❌（次の "ちょっと深掘り" 参照） |
+| 複数の関数コンポーネント間で hook が混線する問題 | ❌（Part 3.1: hooks を fiber に紐付ける）|
+| useEffect / useMemo / useContext などの追加 hooks | ❌（Part 3 全体）|
+| Concurrent Rendering の優先度 (lane) | ❌（Part 5）|
+
+## ちょっと深掘り
+
+### key reconciliation はなぜ重要か
+
+現状の reconcile は **インデックス順比較** です:
+
+```
+old: [<li>A</li>, <li>B</li>, <li>C</li>]
+new: [<li>C</li>, <li>A</li>, <li>B</li>]
+```
+
+index 0 で「A vs C → 両方 li → sameType=true → UPDATE で text を 'A' → 'C' に書き換え」となり、結果として **3 個全部 UPDATE** になります。「順序が変わっただけ」を検出できません。
+
+`key` で識別すれば「A は 1 番目→ 2 番目に移動」と分かり、`Node.moveBefore` 一発で済みます:
+
+```tsx
+old: [<li key="a">A</li>, <li key="b">B</li>, <li key="c">C</li>]
+new: [<li key="c">C</li>, <li key="a">A</li>, <li key="b">B</li>]
+```
+
+実装の骨子:
+1. old children を `Map<key, Fiber>` に
+2. new children を順に walk し、key で Map を引いて再利用
+3. 余った old fiber は DELETION
+
+本書では Part 3 以降の付録として扱う予定です。Part 1.11 で `element.key` の昇格は済ませてあるため、土台は整っています。
+
+### `runFiberRoot` と `scheduleFiberRoot` の使い分け
+
+| API | 内部 | 適した用途 |
+|---|---|---|
+| `runFiberRoot` | 同期 while で render → commit | 教育・テスト・初回描画の確実性が欲しい場合 |
+| `scheduleFiberRoot` | RIC で中断・再開しながら render → commit | 大きい tree / ユーザー操作中の体感優先 |
+
+`createRoot` は `runFiberRoot` を採用しました。`scheduleFiberRoot` 版が欲しいなら 1 ファイル書き加えれば実現できます。本家 React 18 はこれを **`createConcurrentRoot`** という別 API で表現しています。
+
+### 「`container.innerHTML = ''` を消した」ことのインパクト
+
+地味な 1 行ですが、**この削除が Fiber の存在意義そのもの** です:
+
+- Part 1: 毎フレーム DOM 全消し → focus 消失、アニメ消失、再生中の `<video>` がリセット
+- Part 2: 必要な箇所だけ更新 → 全部保たれる
+
+「**DOM 識別が保たれる = ユーザーの操作状態が保たれる**」これが 60fps の現代 UI の根っこです。
+
+### useState の制限はまだ残る
+
+Part 1.9 で挙げた制限のうち、**「複数の関数コンポーネントが配列を共有」** はまだ未解決です:
+
+```tsx
+function App() {
+  return <><Counter /><Counter /></>  // 2 つの Counter が同じ _rootHooks 配列を共有
+}
+```
+
+これは hook を **fiber 単位** に紐付けることで解決します（Part 3.1 で実装）。
+今はまだ「単一 Counter なら綺麗に動く」段階。
+
+## まとめ
+
+- updateDom を「変わった prop だけ反映」「消えた prop は除去」に最適化
+- `createRoot` の中身を `runFiberRoot` に置換 → useState が Fiber 経由に
+- `container.innerHTML = ''` を削除し、二重バッファによる DOM 再利用に切り替え
+- Counter の button が setState を跨いでも同じ DOM ノード
+- input の focus も setState を跨いで保持される
+- これで **Part 2 完走**。Fiber アーキテクチャの背骨が一通り揃った
+
+## Part 2 を振り返って
+
+| 章 | 何が動くようになったか |
+|---|---|
+| 2.1 / 2.2 | 概念整理（diff / Stack の限界） |
+| 2.3 | Fiber データ構造 (parent / child / sibling / dom / pendingChildren / alternate / effectTag) |
+| 2.4 | work loop と作業の単位化 (`runFiberRoot`) |
+| 2.5 | requestIdleCallback でアイドル時間に少しずつ進める (`scheduleFiberRoot`) |
+| 2.6 | 二重バッファ + commit phase 分離 + effect tag 振り分け |
+| **2.7** | **prop diff 最小化 + createRoot Fiber 統合** |
+
+useState の Counter が、ようやく React の本来の姿で動き始めました。
+
+次の Part 3 では **Hooks の本格実装** に入ります。useState を fiber 単位に紐付け直すところから始めて、useReducer / useEffect / useContext / useMemo / useRef まで一通り作ります。
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/20-fiber/070-commit.mdx site/content/20-fiber/_meta.js
+git commit -m "feat(part2): 2.7 commit phase 最適化と createRoot の Fiber 統合"
+```
+
+→ 次の章: [Part 3.1 Hook の前提知識: なぜルールが必要か](../30-hooks/010-hook-rules)（執筆中）
