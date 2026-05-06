@@ -1,4 +1,11 @@
-import type { EffectHook, Fiber, Hook, MemoHook, StateHook } from './fiber'
+import type {
+  EffectHook,
+  Fiber,
+  Hook,
+  MemoHook,
+  RefHook,
+  StateHook,
+} from './fiber'
 import type { Context } from './context'
 
 /**
@@ -300,6 +307,40 @@ export function useCallback<F extends (...args: never[]) => unknown>(
   deps?: readonly unknown[],
 ): F {
   return useMemo(() => fn, deps)
+}
+
+/**
+ * 再 render 間で同一の `{ current: T }` を保持する hook (Part 3.8)。
+ *
+ * 特徴:
+ *   - 返値の `ref` オブジェクトは初回 render 後ずっと **同じ参照**
+ *   - `.current = ...` で書き換えても再 render を起こさない
+ *   - 用途: DOM ノードへの参照 / mutable な値の保管 (timer ID, 前回値の覚書 等)
+ *
+ * @example
+ *   const inputRef = useRef<HTMLInputElement | null>(null)
+ *   useEffect(() => { inputRef.current?.focus() }, [])
+ *   return createElement('input', { ref: inputRef })
+ *
+ * 注意: 本書 chibireact の createElement は ref props を特別扱いしないので、
+ * 自分で `useEffect` 内から DOM を取りに行くなど工夫が必要 (Part 3.9 で深掘り)。
+ */
+export function useRef<T>(initial: T): { current: T } {
+  if (wipFiber === null) {
+    throw new Error(
+      'useRef can only be called inside a function component (during render).',
+    )
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  if (fiber.hooks[index] === undefined) {
+    fiber.hooks[index] = {
+      kind: 'ref',
+      ref: { current: initial },
+    } satisfies RefHook<T>
+  }
+  return (fiber.hooks[index] as RefHook<T>).ref
 }
 
 /**

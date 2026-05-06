@@ -6,4 +6,5 @@ export default {
   '050-use-layout-effect': 'useLayoutEffect — sync な副作用',
   '060-use-context': 'useContext と Context API',
   '070-use-memo-callback': 'useMemo / useCallback とメモ化',
+  '080-use-ref': 'useRef — ミュータブルな箱',
 }

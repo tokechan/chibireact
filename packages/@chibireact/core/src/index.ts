@@ -9,6 +9,7 @@ export {
   useContext,
   useMemo,
   useCallback,
+  useRef,
 } from './hooks-state'
 export { createContext } from './context'
 export type { Context, ContextProvider } from './context'
@@ -27,6 +28,7 @@ export type {
   StateHook,
   EffectHook,
   MemoHook,
+  RefHook,
 } from './fiber'
 export type {
   FunctionComponent,

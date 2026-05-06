@@ -105,8 +105,15 @@ export type MemoHook = {
   deps?: readonly unknown[]
 }
 
-/** Fiber.hooks に入る discriminated union (Part 3.2 / 3.4 / 3.7)。 */
-export type Hook = StateHook | EffectHook | MemoHook
+/** useRef 系の hook 1 つ分の箱 (Part 3.8)。 */
+export type RefHook<T = unknown> = {
+  kind: 'ref'
+  /** 中身を mutate しても再 render しない安定した箱。 */
+  ref: { current: T }
+}
+
+/** Fiber.hooks に入る discriminated union (Part 3.2 / 3.4 / 3.7 / 3.8)。 */
+export type Hook = StateHook | EffectHook | MemoHook | RefHook
 
 export type Fiber = {
   type: FiberType

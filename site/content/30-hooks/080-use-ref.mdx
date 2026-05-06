@@ -1,0 +1,222 @@
+---
+title: useRef — ミュータブルな箱
+description: 再 render 間で参照が安定する mutable なコンテナ。DOM 参照や render に影響しない値の保持に使います
+---
+
+# useRef — ミュータブルな箱
+
+これまでの hooks (useState / useReducer / useEffect / useLayoutEffect / useContext / useMemo / useCallback) で **「render の世界」** はほぼ揃いました。
+
+本章で実装する `useRef` は React の hooks の中では **少し毛色が違う** 存在です:
+- 値を保持するが **書き換えても再 render しない**
+- 関数の世界の外（DOM, タイマー, ライブラリ）と橋渡しするための「**逃げ道**」
+
+## この章のゴール
+
+- `useRef(initial)` の API と特徴 (mutable / 参照安定 / 再描画しない) が言える
+- DOM ノード参照との違い (本書 chibireact では ref props 自動配線は無い) を理解する
+- 「mutable な値の保管箱」としての useRef の使い方が分かる
+
+> 章末に動くもの: useRef による値の保持。テスト 6 個追加で累計 **173/173**。
+
+前章: [useMemo / useCallback とメモ化](./070-use-memo-callback)
+
+## なぜ useState ではダメか
+
+「ある関数コンポ内で値を覚えたい」なら useState が候補ですが:
+
+```tsx
+function Stopwatch() {
+  const [intervalId, setIntervalId] = useState(0)
+
+  useEffect(() => {
+    const id = setInterval(...)
+    setIntervalId(id)  // ← これは setState なので再 render を起こす
+    return () => clearInterval(id)
+  }, [])
+  // ...
+}
+```
+
+`setIntervalId(id)` は再 render を引き起こします。**「値は覚えたいが render には影響させたくない」** ケースに useState は不向き。
+
+`useRef` は「**値の保管 + 再 render しない**」を提供します:
+
+```tsx
+function Stopwatch() {
+  const intervalIdRef = useRef(0)
+  useEffect(() => {
+    intervalIdRef.current = setInterval(...)
+    return () => clearInterval(intervalIdRef.current)
+  }, [])
+  // ...
+}
+```
+
+## API
+
+```ts
+const ref = useRef(initial)
+// ref: { current: T }
+// ref.current = newValue  ← 自由に書き換え可、再 render しない
+```
+
+## 実装
+
+```ts
+type RefHook<T = unknown> = {
+  kind: 'ref'
+  ref: { current: T }
+}
+
+export function useRef<T>(initial: T): { current: T } {
+  if (wipFiber === null) throw new Error(...)
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  if (fiber.hooks[index] === undefined) {
+    fiber.hooks[index] = {
+      kind: 'ref',
+      ref: { current: initial },
+    }
+  }
+  return (fiber.hooks[index] as RefHook<T>).ref
+}
+```
+
+ポイント:
+- `{ current: initial }` は **初回 render 時に 1 回だけ作る**
+- 2 回目以降は同じオブジェクトを返す → 参照同一性
+- alternate.hooks の浅いコピーで、Hook オブジェクト = 同じ ref が引き継がれる
+- setState 系がないので、`.current = ...` は再 render を起こさない
+
+## テストで動作確認
+
+参照同一性:
+
+```ts
+it('返値オブジェクトは再 render 間で同じ参照', async () => {
+  const seen: { current: number }[] = []
+  const App = () => {
+    const [, setN] = useState(0)
+    const ref = useRef(0)
+    seen.push(ref)
+    // ...
+  }
+  // 3 回 render → seen[1] === seen[0] === seen[2]
+})
+```
+
+mutation の永続化:
+
+```ts
+it('.current の mutation は再 render 後も保持される', async () => {
+  // ref.current = 42 した後、setState で再 render → 表示が '42' になる
+})
+```
+
+再 render を起こさない:
+
+```ts
+it('.current を更新しても再 render は起きない', () => {
+  // render 内で ref.current += 1 しても renderCount は増えない
+})
+```
+
+## DOM ref との関係
+
+本物の React は `<input ref={inputRef} />` のように **DOM ノードを ref に自動入れ** してくれます。
+本書 chibireact では **この機能を実装していない** ので、DOM 参照には useEffect 経由が必要:
+
+```tsx
+const Input = () => {
+  const ref = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    // commit 後に DOM がある状態で ref に手動セット
+    ref.current = document.querySelector('input')  // 雑だが...
+  }, [])
+
+  return createElement('input', null)
+}
+```
+
+`createElement` の props に `ref` を入れて、reconcile 時に `dom.ref = element` のように紐付ける拡張が必要です。本書では実装スコープ外。
+
+## 「mutable で render に影響しない箱」の使い方
+
+useRef の典型用途:
+
+| 用途 | 例 |
+|---|---|
+| 前回値の覚書 | `useRef(prev)` で前回 props と比較 |
+| 外部リソースの ID 保持 | `setInterval` / `setTimeout` の ID |
+| ライブラリインスタンス | `chart.js` の `chart` インスタンス |
+| 値変化を観察する flag | `isMountedRef.current` でアンマウント検知 |
+| forwardRef + useImperativeHandle | (本書スコープ外) |
+
+## ちょっと深掘り
+
+### useRef と useState の使い分け
+
+| | useState | useRef |
+|---|---|---|
+| 書き換え時の再 render | する | しない |
+| 値の取得 | `state` (毎 render の closure) | `ref.current` (常に最新) |
+| 適した用途 | 表示に関わるデータ | 表示に関わらないデータ |
+| 等価性チェック | Object.is でスキップ | 無し |
+
+「**この値が変わったら画面を更新したい**」なら useState、そうでなければ useRef。
+
+### ref.current は render 中に書くな
+
+```tsx
+function App() {
+  const ref = useRef(0)
+  ref.current = Math.random()  // ❌ render 中の mutation
+  return <div>{ref.current}</div>
+}
+```
+
+これは React 公式が **避けるべきパターン** としています:
+- 同じ render が何度も呼ばれる可能性 (Concurrent Rendering)
+- StrictMode で 2 回呼ばれて値が予測できない
+
+ref.current の書き換えは:
+- イベントハンドラ内
+- useEffect / useLayoutEffect の中
+
+で行うのが安全。本書 chibireact では検出しませんが、習慣として守ってください。
+
+### `forwardRef` と `useImperativeHandle` (本書スコープ外)
+
+子コンポーネントが親に「自分の DOM 参照」や「メソッド」を渡したいとき:
+
+```tsx
+const FancyInput = React.forwardRef((props, ref) => {
+  const inputRef = useRef(null)
+  useImperativeHandle(ref, () => ({
+    focus: () => inputRef.current?.focus(),
+  }))
+  return <input ref={inputRef} />
+})
+```
+
+これは React の高度な機能で、本書 chibireact では扱いません。
+興味があれば本家 React のドキュメントを参照してください。
+
+### React Compiler 後の useRef
+
+useState / useReducer / useEffect / useContext と異なり、**useRef は Compiler でも自動挿入できません**。
+副作用やデータの形が決まらないので、開発者が明示的に書き続ける hook です。
+
+## まとめ
+
+- `useRef(initial)` は `{ current: T }` を返す
+- 再 render 間で参照同一、書き換えても再 render しない
+- 用途: DOM 参照（本書では手動）/ 外部 ID 保持 / 前回値の覚書
+- 「mutable な逃げ道」と覚えるのが本質
+
+## 次の章へ
+
+[カスタムフックとロジック再利用](./090-custom-hooks)（執筆中）で、Part 3 で作ってきた基本 hooks を組み合わせて **再利用可能なロジック** を作るパターンを整理します。コード追加はありませんが、Part 3 の総まとめとなる章です。
