@@ -26,6 +26,7 @@ let _scheduled = false
 
 export type SetStateAction<T> = T | ((prev: T) => T)
 export type Dispatch<T> = (action: SetStateAction<T>) => void
+export type Reducer<S, A> = (state: S, action: A) => S
 
 /**
  * 状態を持てる関数を提供します。React の useState と同じ API です。
@@ -64,6 +65,47 @@ export function useState<T>(initial: T): [T, Dispatch<T>] {
   }
 
   return [hook.state, setState]
+}
+
+/**
+ * 状態更新ロジックを reducer (state, action) => newState に外出しできる useState の仲間 (Part 3.3)。
+ *
+ * useState との違い:
+ *   - 状態遷移を関数として表現できるので、複雑なロジックが整理しやすい
+ *   - dispatch(action) が返り、action は任意の型 (typically discriminated union)
+ *
+ * @example
+ *   type Action = { type: 'inc' } | { type: 'dec' }
+ *   const reducer = (s: number, a: Action) =>
+ *     a.type === 'inc' ? s + 1 : s - 1
+ *   const [count, dispatch] = useReducer(reducer, 0)
+ *   dispatch({ type: 'inc' })  // count → 1
+ */
+export function useReducer<S, A>(
+  reducer: Reducer<S, A>,
+  initial: S,
+): [S, (action: A) => void] {
+  if (wipFiber === null) {
+    throw new Error(
+      'useReducer can only be called inside a function component (during render).',
+    )
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  if (fiber.hooks[index] === undefined) {
+    fiber.hooks[index] = { state: initial } as Hook
+  }
+  const hook = fiber.hooks[index] as Hook<S>
+
+  const dispatch = (action: A): void => {
+    const next = reducer(hook.state, action)
+    if (Object.is(hook.state, next)) return
+    hook.state = next
+    _scheduleRerender()
+  }
+
+  return [hook.state, dispatch]
 }
 
 /**
