@@ -301,31 +301,34 @@ function commitRoot(): void {
   currentRoot = wipRoot
   wipRoot = null
   deletions = []
-  // Part 3.4: commit phase 後に effect を走らせる。
-  // 設計上 sync (useLayoutEffect 相当の挙動)。useEffect の async deferral は次章で。
+  // Part 3.4 / 3.5: commit phase 後に effect を走らせる。
+  // 順序: layout effect (DOM 同期) → passive effect (本書では同 tick で続けて実行)。
   if (committedRoot.child !== null) {
-    runEffects(committedRoot.child)
+    runEffects(committedRoot.child, 'layout')
+    runEffects(committedRoot.child, 'passive')
   }
 }
 
 /**
- * Part 3.4: commit 後に pendingCommit が立っている useEffect を実行する。
- * 前回の cleanup → 新しい effect の順で。
+ * commit 後に pendingCommit が立っている useEffect / useLayoutEffect を実行する。
+ * tag で 2 段に分けて呼ぶことで、layout を先に同期実行できる。
+ *
+ * - 'layout': useLayoutEffect。本家でも本書でも sync。DOM 測定 → setState の典型用途
+ * - 'passive': useEffect。本家は async (ペイント後)、本書は sync。Part 5 以降で async 化候補
  */
-function runEffects(fiber: Fiber | null): void {
+function runEffects(fiber: Fiber | null, tag: 'layout' | 'passive'): void {
   if (fiber === null) return
   for (const hook of fiber.hooks) {
     if (hook.kind !== 'effect') continue
+    if (hook.tag !== tag) continue
     if (!hook.pendingCommit) continue
-    // 前回の cleanup を先に実行
     hook.cleanup?.()
-    // effect 本体
     const ret = hook.effect()
     hook.cleanup = typeof ret === 'function' ? ret : undefined
     hook.pendingCommit = false
   }
-  runEffects(fiber.child)
-  runEffects(fiber.sibling)
+  runEffects(fiber.child, tag)
+  runEffects(fiber.sibling, tag)
 }
 
 /**

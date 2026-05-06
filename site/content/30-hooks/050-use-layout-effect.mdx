@@ -1,0 +1,243 @@
+---
+title: useLayoutEffect — sync な副作用
+description: useEffect とほぼ同じだが「commit 直後の同期タイミング」で走る hook。DOM 測定 → setState のフリッカー対策に使います
+---
+
+# useLayoutEffect — sync な副作用
+
+[useEffect — commit 後の副作用](./040-use-effect) で副作用の基盤を作りました。
+本章ではもう一種類の effect、**`useLayoutEffect`** を追加します。
+
+両者の違いは **タイミング** だけ。本家 React では:
+- `useLayoutEffect` → commit 直後・**同期** (DOM 確定後・ペイント前)
+- `useEffect` → commit 後・**非同期** (ペイント後)
+
+本書 chibireact では実装を簡略化して両方 sync ですが、**`tag` を分けて識別** することで「概念は別」を表現します。
+
+## この章のゴール
+
+- `useLayoutEffect` の API と使い分け基準が言える
+- 「ペイント前に同期で走る」必要があるケース (DOM 測定 → setState) を説明できる
+- 本書 chibireact の同期実装と本家 React の async/sync 区別の差を理解する
+- EffectHook の `tag` フィールドが将来 Part 5 (Concurrent) で活きることが見える
+
+> 章末に動くもの: useLayoutEffect が動く、useEffect と並列実行できる。テスト 6 個追加で累計 **152/152**。
+
+前章: [useEffect — commit 後の副作用](./040-use-effect)
+
+## なぜ 2 種類あるのか
+
+「**ペイント前** にやらないと **ちらつきが見える**」副作用があるからです:
+
+```tsx
+function Tooltip({ targetRef }) {
+  const [pos, setPos] = useState(null)
+
+  // ❌ useEffect だとフリッカーする
+  useEffect(() => {
+    const rect = targetRef.current.getBoundingClientRect()
+    setPos({ top: rect.bottom + 4, left: rect.left })
+  }, [])
+
+  return <div style={{ position: 'absolute', ...pos }}>Tooltip</div>
+}
+```
+
+`useEffect` の場合、流れはこうなります:
+1. render: pos=null で `<div>` が描画される（位置が無い → 左上 (0,0)）
+2. ブラウザがペイント（左上にツールチップが映る）
+3. useEffect が走り、setPos で位置を確定
+4. 再 render → 正しい位置に描画
+5. ブラウザがペイント
+
+ステップ 2 と 5 の間に **ちらつき** が見えます。
+
+`useLayoutEffect` だと:
+1. render
+2. commit (DOM 更新)
+3. **useLayoutEffect が同期で走り、setPos**
+4. 再 render → 正しい位置に DOM 更新
+5. **ここで初めてブラウザがペイント** （正しい位置で 1 回だけ）
+
+ペイントが 1 回で済むので、ちらつきません。
+
+## API
+
+```ts
+useLayoutEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void
+```
+
+`useEffect` と **完全に同じシグネチャ**。タイミングだけが違います。
+
+## 実装: tag を足す
+
+EffectHook に `tag: 'passive' | 'layout'` を追加:
+
+```ts
+// fiber.ts
+export type EffectHook = {
+  kind: 'effect'
+  tag: 'passive' | 'layout'  // ← NEW
+  effect: () => void | (() => void)
+  cleanup?: () => void
+  deps?: readonly unknown[]
+  pendingCommit: boolean
+}
+```
+
+`useEffect` は `tag: 'passive'`、`useLayoutEffect` は `tag: 'layout'` を入れる。
+
+```ts
+export function useLayoutEffect(effect, deps?) {
+  // useEffect とほぼ同じ。違いは tag のみ
+  fiber.hooks[index] = {
+    kind: 'effect',
+    tag: 'layout',
+    effect,
+    cleanup: oldHook?.cleanup,
+    deps,
+    pendingCommit: hasChanged,
+  }
+}
+```
+
+## 実装: commit 後の 2 段実行
+
+`commitRoot` 末で `runEffects` を **2 回** 呼びます:
+
+```ts
+function commitRoot(): void {
+  // ... DOM commit
+  if (committedRoot.child !== null) {
+    runEffects(committedRoot.child, 'layout')   // 1. layout 先
+    runEffects(committedRoot.child, 'passive')  // 2. passive 後
+  }
+}
+
+function runEffects(fiber: Fiber | null, tag: 'layout' | 'passive'): void {
+  if (fiber === null) return
+  for (const hook of fiber.hooks) {
+    if (hook.kind !== 'effect') continue
+    if (hook.tag !== tag) continue
+    if (!hook.pendingCommit) continue
+    hook.cleanup?.()
+    const ret = hook.effect()
+    hook.cleanup = typeof ret === 'function' ? ret : undefined
+    hook.pendingCommit = false
+  }
+  runEffects(fiber.child, tag)
+  runEffects(fiber.sibling, tag)
+}
+```
+
+> 本書 chibireact では layout / passive 両方とも sync に実行します。本家 React の **`useEffect` を本物の async に分離** するのは Part 5 (Concurrent Rendering) の作業範囲。
+
+## テストで動作確認
+
+実行順の確認:
+
+```ts
+it('useLayoutEffect → useEffect の順で実行される', () => {
+  const order: string[] = []
+  const App = () => {
+    useEffect(() => order.push('passive'), [])
+    useLayoutEffect(() => order.push('layout'), [])
+    return createElement('div', null)
+  }
+
+  const root = createRoot(container)
+  root.render(createElement(App, null))
+
+  expect(order).toEqual(['layout', 'passive'])  // layout 先
+})
+```
+
+useEffect と同様の deps 動作:
+
+```ts
+it('cleanup も deps 変化で走る', async () => {
+  const order: string[] = []
+  const App = () => {
+    const [count, setCount] = useState(0)
+    useLayoutEffect(() => {
+      order.push(`layout:${count}`)
+      return () => order.push(`cleanup:${count}`)
+    }, [count])
+    return createElement('button', { onClick: () => setCount(count + 1) }, count)
+  }
+  // ... button.click() →
+  // ['layout:0', 'cleanup:0', 'layout:1']
+})
+```
+
+unmount cleanup も同じ仕組みで動きます。
+
+## 使い分けの目安
+
+| 用途 | 適切な hook |
+|---|---|
+| API 呼び出し / データ取得 | useEffect |
+| ログ送信 / analytics | useEffect |
+| イベントリスナ登録 (window/document) | useEffect |
+| **DOM サイズ・位置の測定 → setState** | **useLayoutEffect** |
+| **scroll 位置の復元** | **useLayoutEffect** |
+| **要素の visibility / focus 切り替え** | **useLayoutEffect** |
+| Tooltip / Popover の位置決定 | useLayoutEffect |
+
+ルール: **ユーザーがペイント前に DOM 確定を見る必要があるなら useLayoutEffect**。
+それ以外（描画の正しさに直接影響しないもの）は useEffect。
+
+## ちょっと深掘り
+
+### 「LayoutEffect の方が遅い」のではなく、「ペイントを止めている」
+
+useLayoutEffect は同期実行なので、effect 内で重い処理をすると **ペイントがブロック** されます。
+逆に useEffect は非同期なので、ペイントを邪魔しません。
+
+「**useLayoutEffect = 必要なら使うが、できれば避けたい**」が React 公式の立場。
+DOM 測定 → setState のような **やむを得ない sync 副作用** に限定するのが推奨です。
+
+### Server-side Rendering (SSR) と useLayoutEffect
+
+SSR では DOM が無いので useLayoutEffect は走りません。React は警告を出します:
+
+> Warning: useLayoutEffect does nothing on the server, because its effect cannot be encoded into the server renderer's output format.
+
+`useEffect` は SSR でも問題ない（ペイント後＝そもそもサーバには無い概念）が、`useLayoutEffect` は client-only。
+本書 chibireact は SSR を扱わないので無関係ですが、知識として持っておいてください。
+
+### 本書 chibireact の同期 useEffect が孕む問題
+
+本書では useEffect も同期実行です。これは厳密には useLayoutEffect の挙動。
+DOM 測定 → setState パターンでも (本書では) フリッカーは見えません。
+ですが本物の useEffect の async 動作との差を理解しないと、Part 5 (Concurrent Rendering) で混乱します。
+
+| | 本家 React | 本書 chibireact |
+|---|---|---|
+| useEffect | async (ペイント後) | sync (commit 直後) |
+| useLayoutEffect | sync (ペイント前) | sync (commit 直後) |
+
+将来 useEffect を真の async にするなら:
+- runEffects(passive) を `queueMicrotask` でラップ
+- 既存テストは `await flushMicrotasks()` を render() 後にも入れる
+
+実装は容易だが、テストの widespread な書き換えが要るので本書では割愛。
+
+### React Forget は useEffect を不要にしない
+
+「useMemo / useCallback はコンパイラが自動挿入してくれる」は知られていますが、
+**useEffect は副作用の境界** なので、コンパイラが除去するのは無理です。
+useState 同様、明示的に書く必要があり続けます。
+
+## まとめ
+
+- `useLayoutEffect(effect, deps)` で commit 直後・同期に副作用を実行
+- API は useEffect と同一、内部は EffectHook.tag = 'layout' で識別
+- 実行順は **layout → passive**
+- DOM 測定 → setState のフリッカー対策に使う
+- 本書 chibireact は両方 sync。本家との真の async 差は Part 5 で扱う
+
+## 次の章へ
+
+[useContext と Context API](./060-use-context)（執筆中）で、prop drilling を回避する仕組みを作ります。
+Provider / Consumer の概念と、関数コンポーネントから祖先の値を直接読む実装。

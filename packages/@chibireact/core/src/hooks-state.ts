@@ -143,6 +143,53 @@ export function useEffect(
 
   fiber.hooks[index] = {
     kind: 'effect',
+    tag: 'passive',
+    effect,
+    cleanup: oldHook?.cleanup,
+    deps,
+    pendingCommit: hasChanged,
+  } satisfies EffectHook
+}
+
+/**
+ * commit 直後の同期タイミングで副作用を走らせる hook (Part 3.5)。
+ *
+ * useEffect との違い:
+ *   - 本家 React: useLayoutEffect は sync（DOM 更新前にユーザーが見るペイントの直前）、
+ *                  useEffect は async（ペイント後）
+ *   - 本書 chibireact: 両方 sync。違いは EffectHook.tag のみ。
+ *                      将来 Part 5 で async に分けたいときの拡張点として残す。
+ *
+ * 用途:
+ *   - DOM のサイズや位置を測定して setState する（フリッカー無し）
+ *   - layout に影響する DOM 操作を commit と同期で実行
+ *
+ * @example
+ *   const ref = useRef(null)
+ *   useLayoutEffect(() => {
+ *     const rect = ref.current.getBoundingClientRect()
+ *     setSize({ width: rect.width })  // 描画前に確定
+ *   }, [])
+ */
+export function useLayoutEffect(
+  effect: () => void | (() => void),
+  deps?: readonly unknown[],
+): void {
+  if (wipFiber === null) {
+    throw new Error(
+      'useLayoutEffect can only be called inside a function component (during render).',
+    )
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  const oldHook = fiber.hooks[index] as EffectHook | undefined
+  const hasChanged =
+    !oldHook || deps === undefined || depsChanged(oldHook.deps, deps)
+
+  fiber.hooks[index] = {
+    kind: 'effect',
+    tag: 'layout',
     effect,
     cleanup: oldHook?.cleanup,
     deps,

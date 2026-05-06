@@ -70,9 +70,22 @@ export type EffectTag = 'PLACEMENT' | 'UPDATE' | 'DELETION'
 /** useState 系の hook 1 つ分の箱 (Part 3.2)。 */
 export type StateHook<T = unknown> = { kind: 'state'; state: T }
 
-/** useEffect 系の hook 1 つ分の箱 (Part 3.4)。 */
+/**
+ * useEffect / useLayoutEffect 系の hook 1 つ分の箱 (Part 3.4 / 3.5)。
+ *
+ * `tag` で実行タイミングを区別する:
+ *   - 'layout': commit 直後に同期実行 (本家 useLayoutEffect 相当)
+ *   - 'passive': commit 後に同期実行 (本書 chibireact では sync。本家は async)
+ *
+ * 本書では両方とも sync 実行だが、tag を分けておくと:
+ *   - layout だけ走らせる / passive だけ走らせる、の選択肢が将来作れる
+ *   - 「今は同じだが概念は別」と読者に伝わる
+ */
+export type EffectTag2 = 'passive' | 'layout'
+
 export type EffectHook = {
   kind: 'effect'
+  tag: EffectTag2
   /** 副作用本体。返値が cleanup 関数。 */
   effect: () => void | (() => void)
   /** 前回 effect が返した cleanup。次回 effect の前と削除時に呼ぶ。 */
