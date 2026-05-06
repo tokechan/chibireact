@@ -297,9 +297,50 @@ function commitRoot(): void {
   if (wipRoot.child !== null) {
     commitWork(wipRoot.child)
   }
+  const committedRoot = wipRoot
   currentRoot = wipRoot
   wipRoot = null
   deletions = []
+  // Part 3.4: commit phase 後に effect を走らせる。
+  // 設計上 sync (useLayoutEffect 相当の挙動)。useEffect の async deferral は次章で。
+  if (committedRoot.child !== null) {
+    runEffects(committedRoot.child)
+  }
+}
+
+/**
+ * Part 3.4: commit 後に pendingCommit が立っている useEffect を実行する。
+ * 前回の cleanup → 新しい effect の順で。
+ */
+function runEffects(fiber: Fiber | null): void {
+  if (fiber === null) return
+  for (const hook of fiber.hooks) {
+    if (hook.kind !== 'effect') continue
+    if (!hook.pendingCommit) continue
+    // 前回の cleanup を先に実行
+    hook.cleanup?.()
+    // effect 本体
+    const ret = hook.effect()
+    hook.cleanup = typeof ret === 'function' ? ret : undefined
+    hook.pendingCommit = false
+  }
+  runEffects(fiber.child)
+  runEffects(fiber.sibling)
+}
+
+/**
+ * Part 3.4: 削除される fiber の effect cleanup を全部呼ぶ。
+ * 関数コンポ内に登録された timer / subscription をリークさせない。
+ */
+function runCleanupsForDeletion(fiber: Fiber | null): void {
+  if (fiber === null) return
+  for (const hook of fiber.hooks) {
+    if (hook.kind === 'effect') {
+      hook.cleanup?.()
+    }
+  }
+  runCleanupsForDeletion(fiber.child)
+  runCleanupsForDeletion(fiber.sibling)
 }
 
 function commitWork(fiber: Fiber | null): void {
@@ -321,6 +362,8 @@ function commitWork(fiber: Fiber | null): void {
 }
 
 function commitDeletion(fiber: Fiber): void {
+  // Part 3.4: 部分木の effect cleanup を先に呼ぶ
+  runCleanupsForDeletion(fiber)
   if (fiber.dom !== null) {
     const parentDom = findClosestDomAncestor(fiber)
     if (parentDom !== null && fiber.dom.parentNode === parentDom) {

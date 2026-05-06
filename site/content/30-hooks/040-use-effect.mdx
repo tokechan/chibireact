@@ -1,0 +1,278 @@
+---
+title: useEffect — commit 後の副作用
+description: タイマー・購読・DOM 直接操作などの「描画の外」の処理を、commit 後に実行する仕組みを作ります
+---
+
+# useEffect — commit 後の副作用
+
+ここまで作った useState / useReducer は **「pure な状態管理」** でした。
+ですが現実のアプリには **副作用** があります:
+
+- API 呼び出し
+- タイマー (setInterval / setTimeout)
+- subscription (WebSocket / EventEmitter)
+- DOM への直接アクセス (focus, scroll)
+- localStorage への保存
+
+これらを **render の中** に書くと:
+- render は何度も呼ばれるので副作用が多重実行される
+- render 中の副作用が再 render を引き起こすと無限ループ
+
+`useEffect` は副作用を **「commit phase 後」** にひっそり走らせる仕組みです。
+
+## この章のゴール
+
+- `useEffect(effect, deps)` の API が書ける
+- 依存配列の意味と「省略 / `[]` / `[a, b]`」の挙動の違いを言える
+- cleanup 関数の役割（次 effect の前 / unmount 時に呼ばれる）が分かる
+- 内部で「Hook の discriminated union 化」を行い、StateHook / EffectHook を区別できる
+
+> 章末に動くもの: タイマー / subscription / DOM 操作などが Hook 化できる。テスト 9 個追加で累計 **146/146**。
+
+前章: [useReducer の実装](./030-use-reducer)
+
+## API
+
+```ts
+useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void
+```
+
+| 呼び方 | 走るタイミング |
+|---|---|
+| `useEffect(fn)` | **毎 commit 後** |
+| `useEffect(fn, [])` | **mount 1 回のみ** |
+| `useEffect(fn, [a, b])` | a or b が変わったとき + mount |
+
+`fn` は cleanup 関数を返せます。次回 effect の前 / コンポーネント削除時に呼ばれます。
+
+## Hook を discriminated union に
+
+`Fiber.hooks` 配列に **2 種類** の hook が入るようになりました:
+
+```ts
+// fiber.ts
+export type StateHook<T = unknown> = { kind: 'state'; state: T }
+export type EffectHook = {
+  kind: 'effect'
+  effect: () => void | (() => void)
+  cleanup?: () => void
+  deps?: readonly unknown[]
+  pendingCommit: boolean
+}
+export type Hook = StateHook | EffectHook
+```
+
+useState は `kind: 'state'` を、useEffect は `kind: 'effect'` を入れる。
+commit phase で `kind === 'effect'` を walk すれば effect だけ取り出せます。
+
+> 既存の useState / useReducer も `kind: 'state'` を付ける形にリファクタしました。本書ではこのタイミングで discriminated union 化するのが、ちょうど 2 種類目が登場する自然な瞬間です。
+
+## 実装: useEffect (render 時は予約だけ)
+
+```ts
+export function useEffect(
+  effect: () => void | (() => void),
+  deps?: readonly unknown[],
+): void {
+  if (wipFiber === null) throw new Error(...)
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  const oldHook = fiber.hooks[index] as EffectHook | undefined
+  const hasChanged =
+    !oldHook || deps === undefined || depsChanged(oldHook.deps, deps)
+
+  fiber.hooks[index] = {
+    kind: 'effect',
+    effect,
+    cleanup: oldHook?.cleanup, // 前回の cleanup を引き継ぐ
+    deps,
+    pendingCommit: hasChanged, // commit 後に走らせるか
+  }
+}
+```
+
+`depsChanged` は単純な `Object.is` 比較:
+
+```ts
+function depsChanged(oldDeps, newDeps): boolean {
+  if (!oldDeps) return true
+  if (oldDeps.length !== newDeps.length) return true
+  for (let i = 0; i < oldDeps.length; i++) {
+    if (!Object.is(oldDeps[i], newDeps[i])) return true
+  }
+  return false
+}
+```
+
+> ポイント: render 中は **effect を予約するだけ**。本体は走らせません。
+> render 中に副作用を走らせると、無限ループや状態の不整合が起きます。
+
+## 実装: commit 後に走らせる
+
+`commitRoot` の最後で `runEffects` を呼びます:
+
+```ts
+function commitRoot(): void {
+  // ... 既存の DOM commit
+  currentRoot = wipRoot
+  wipRoot = null
+  // NEW: commit 後に effect を走らせる
+  if (currentRoot.child !== null) {
+    runEffects(currentRoot.child)
+  }
+}
+
+function runEffects(fiber: Fiber | null): void {
+  if (fiber === null) return
+  for (const hook of fiber.hooks) {
+    if (hook.kind !== 'effect') continue
+    if (!hook.pendingCommit) continue
+    hook.cleanup?.()  // 前回の cleanup
+    const ret = hook.effect()
+    hook.cleanup = typeof ret === 'function' ? ret : undefined
+    hook.pendingCommit = false
+  }
+  runEffects(fiber.child)
+  runEffects(fiber.sibling)
+}
+```
+
+## 実装: unmount 時の cleanup
+
+コンポーネントが消えたときも cleanup を走らせます:
+
+```ts
+function commitDeletion(fiber: Fiber): void {
+  // 部分木の effect cleanup を先に呼ぶ (timer / subscription を漏らさないため)
+  runCleanupsForDeletion(fiber)
+  // ... 既存の DOM 削除
+}
+
+function runCleanupsForDeletion(fiber: Fiber | null): void {
+  if (fiber === null) return
+  for (const hook of fiber.hooks) {
+    if (hook.kind === 'effect') hook.cleanup?.()
+  }
+  runCleanupsForDeletion(fiber.child)
+  runCleanupsForDeletion(fiber.sibling)
+}
+```
+
+## テストで動作確認
+
+cleanup の実行順:
+
+```ts
+it('cleanup が次の effect 前に走る', async () => {
+  const order: string[] = []
+  const App = () => {
+    const [count, setCount] = useState(0)
+    useEffect(() => {
+      order.push(`effect:${count}`)
+      return () => order.push(`cleanup:${count}`)
+    }, [count])
+    return createElement('button', { onClick: () => setCount(count + 1) }, count)
+  }
+
+  const root = createRoot(container)
+  root.render(createElement(App, null))
+  expect(order).toEqual(['effect:0'])
+
+  button.click()
+  await flushMicrotasks()
+  expect(order).toEqual(['effect:0', 'cleanup:0', 'effect:1'])
+})
+```
+
+`['effect:0', 'cleanup:0', 'effect:1']` の順。**cleanup の中の `count` は前回値 (0)** であることに注目。クロージャでキャプチャされているからです。
+
+unmount 時:
+
+```ts
+it('コンポーネントが消えたときに cleanup が走る', () => {
+  const cleanup = vi.fn()
+  const Child = () => {
+    useEffect(() => cleanup, [])
+    return createElement('span', null, 'child')
+  }
+  const App = ({ show }) =>
+    show ? createElement(Child, null) : createElement('span', null, 'placeholder')
+
+  root.render(createElement(App, { show: true }))
+  expect(cleanup).not.toHaveBeenCalled()
+  root.render(createElement(App, { show: false }))
+  expect(cleanup).toHaveBeenCalledTimes(1)
+})
+```
+
+deps が無関係な state には反応しない:
+
+```ts
+it('deps に含まれない state を変えても effect は再実行されない', async () => {
+  // useState で count と other を持つ
+  // useEffect deps は [count] のみ
+  // → other を変えても effect は走らない
+})
+```
+
+## ちょっと深掘り
+
+### useEffect の本物のタイミング (本書との違い)
+
+本家 React の useEffect は **「ブラウザが描画した後の非同期タイミング」** で走ります:
+
+```
+本家: render → commit → ブラウザ描画 → useEffect (非同期 = MessageChannel タスク)
+本書: render → commit → useEffect (同期、commitRoot の最後)
+```
+
+本書 chibireact の useEffect は厳密には **`useLayoutEffect`** に近い挙動 (commit 直後・同期)。
+本家の真の非同期 deferral は次章 [3.5 useLayoutEffect](./050-use-layout-effect)（執筆中）で扱います。
+
+### 同期 useEffect の問題点
+
+DOM 測定後に setState する典型パターン:
+
+```tsx
+useEffect(() => {
+  const rect = ref.current.getBoundingClientRect()
+  setSize({ width: rect.width })  // 再レンダ
+}, [])
+```
+
+本書の同期 useEffect では、setState がマイクロタスクで再レンダを起こします。
+本家 React の async useEffect では、ブラウザ描画 → effect → setState → 次フレームで再レンダ、と「フリッカー無し」で進みます。
+
+「フリッカーが見えるか見えないか」が両者の差。ですが学習目的では同期実装で十分です。
+
+### 依存配列の lint
+
+`eslint-plugin-react-hooks` の `exhaustive-deps` ルールが「effect 内で参照している変数を deps に含めろ」と警告します。これがあると:
+
+```tsx
+useEffect(() => {
+  console.log(count)
+}, [])  // ← lint warning: 'count' が deps に無い
+```
+
+本書ではこの lint を仕込まないので、書き手がルールを守る必要があります。実プロジェクトでは必ず ESLint plugin を使ってください。
+
+### React の useEffect は「副作用」というより「同期化」
+
+dan_abramov 氏の有名な記事 [A Complete Guide to useEffect](https://overreacted.io/a-complete-guide-to-useeffect/) では、useEffect を **「props/state を外部システムに同期する」** ものと位置付けています。
+
+たとえば `<input value={text} />` は React のレンダリングシステムが props と DOM を同期します。
+`useEffect` は **任意の外部システム** (ブラウザ API, タイマー, リモートサーバ) と props/state を同期する一般化、と捉えるとスッキリします。
+
+## まとめ
+
+- `useEffect(effect, deps)` で commit 後に副作用を実行
+- Hook を discriminated union 化 (StateHook / EffectHook) して 2 種類を扱う
+- deps 比較で再実行を最適化、`[]` で 1 回のみ
+- cleanup は **次 effect の前** と **unmount 時** に呼ばれる
+- 本書では同期実行 (本家は async)、3.5 で違いを掘り下げる
+
+## 次の章へ
+
+[useLayoutEffect の違い](./050-use-layout-effect)（執筆中）で、useEffect と useLayoutEffect の **タイミングの違い** とその使い分けを扱います。

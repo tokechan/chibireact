@@ -67,8 +67,24 @@ export type FiberType = string | Function | typeof TEXT_ELEMENT
  */
 export type EffectTag = 'PLACEMENT' | 'UPDATE' | 'DELETION'
 
-/** useState などの hook 1 つ分の状態を入れる箱 (Part 3.2)。 */
-export type Hook<T = unknown> = { state: T }
+/** useState 系の hook 1 つ分の箱 (Part 3.2)。 */
+export type StateHook<T = unknown> = { kind: 'state'; state: T }
+
+/** useEffect 系の hook 1 つ分の箱 (Part 3.4)。 */
+export type EffectHook = {
+  kind: 'effect'
+  /** 副作用本体。返値が cleanup 関数。 */
+  effect: () => void | (() => void)
+  /** 前回 effect が返した cleanup。次回 effect の前と削除時に呼ぶ。 */
+  cleanup?: () => void
+  /** 依存配列。undefined なら毎 commit 後に走る。 */
+  deps?: readonly unknown[]
+  /** 次の commit phase 後に effect を走らせるべきかのフラグ。 */
+  pendingCommit: boolean
+}
+
+/** Fiber.hooks に入る discriminated union (Part 3.2 / 3.4)。 */
+export type Hook = StateHook | EffectHook
 
 export type Fiber = {
   type: FiberType

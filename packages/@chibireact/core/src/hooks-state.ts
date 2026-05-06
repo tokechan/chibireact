@@ -1,4 +1,4 @@
-import type { Fiber, Hook } from './fiber'
+import type { EffectHook, Fiber, Hook, StateHook } from './fiber'
 
 /**
  * useState の per-fiber 実装 (Part 3.2)。
@@ -50,9 +50,9 @@ export function useState<T>(initial: T): [T, Dispatch<T>] {
   const index = hookIndex++
 
   if (fiber.hooks[index] === undefined) {
-    fiber.hooks[index] = { state: initial } as Hook
+    fiber.hooks[index] = { kind: 'state', state: initial } as Hook
   }
-  const hook = fiber.hooks[index] as Hook<T>
+  const hook = fiber.hooks[index] as StateHook<T>
 
   const setState: Dispatch<T> = (action) => {
     const next =
@@ -94,9 +94,9 @@ export function useReducer<S, A>(
   const index = hookIndex++
 
   if (fiber.hooks[index] === undefined) {
-    fiber.hooks[index] = { state: initial } as Hook
+    fiber.hooks[index] = { kind: 'state', state: initial } as Hook
   }
-  const hook = fiber.hooks[index] as Hook<S>
+  const hook = fiber.hooks[index] as StateHook<S>
 
   const dispatch = (action: A): void => {
     const next = reducer(hook.state, action)
@@ -106,6 +106,64 @@ export function useReducer<S, A>(
   }
 
   return [hook.state, dispatch]
+}
+
+/**
+ * 副作用を commit phase 後に実行する hook (Part 3.4)。
+ *
+ * 仕様:
+ *   - render 時は effect を fiber.hooks に「予約」するだけ（ここでは走らない）
+ *   - commit phase の最後に「pendingCommit が立っている effect」を実行
+ *   - 依存配列 `deps` が前回と変わっていなければスキップ
+ *   - `deps` 省略 → 毎 commit 後に走る
+ *   - `deps = []` → 初回のみ走る
+ *   - effect が cleanup 関数を return すれば、次 effect 前 / unmount 時に呼ばれる
+ *
+ * @example
+ *   useEffect(() => {
+ *     const id = setInterval(tick, 1000)
+ *     return () => clearInterval(id)
+ *   }, [])  // mount 時のみ走り、unmount で cleanup
+ */
+export function useEffect(
+  effect: () => void | (() => void),
+  deps?: readonly unknown[],
+): void {
+  if (wipFiber === null) {
+    throw new Error(
+      'useEffect can only be called inside a function component (during render).',
+    )
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  const oldHook = fiber.hooks[index] as EffectHook | undefined
+  const hasChanged =
+    !oldHook || deps === undefined || depsChanged(oldHook.deps, deps)
+
+  fiber.hooks[index] = {
+    kind: 'effect',
+    effect,
+    cleanup: oldHook?.cleanup,
+    deps,
+    pendingCommit: hasChanged,
+  } satisfies EffectHook
+}
+
+/**
+ * 依存配列の変化を検知。Object.is 比較で 1 つでも違えば true。
+ * 長さが違うのも変化。新側 undefined は呼び出し側で別判定。
+ */
+function depsChanged(
+  oldDeps: readonly unknown[] | undefined,
+  newDeps: readonly unknown[],
+): boolean {
+  if (!oldDeps) return true
+  if (oldDeps.length !== newDeps.length) return true
+  for (let i = 0; i < oldDeps.length; i++) {
+    if (!Object.is(oldDeps[i], newDeps[i])) return true
+  }
+  return false
 }
 
 /**
