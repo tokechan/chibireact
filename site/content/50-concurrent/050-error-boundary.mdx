@@ -1,0 +1,278 @@
+---
+title: Error Boundary
+description: render 中の Error を境界で捕まえ、fallback UI に切り替える仕組み。アプリ全体が真っ白になるのを防ぐ最後の砦
+---
+
+# Error Boundary
+
+[Suspense](./040-suspense) で **Promise の throw** を捕まえました。
+本章では同じ仕組みを **Error の throw** に適用する **Error Boundary** を実装します。
+
+`<SomeComponent />` が `throw new Error()` したとき、アプリ全体が真っ白になるのを防ぐ最後の砦です。
+
+## この章のゴール
+
+- Error Boundary が **render 中のエラーを境界で捕まえる** 仕組みが言える
+- Suspense との実装の差 (Promise vs Error) が分かる
+- `fallback` を **関数** として渡して error 詳細を表示できる
+- ネスト・伝播の挙動を確認する
+
+> 章末に動くもの: ErrorBoundary。テスト 7 個追加で累計 **213/213**。
+
+前章: [Suspense — 「読み込み中」の一般化](./040-suspense)
+
+## API
+
+```tsx
+<ErrorBoundary fallback={<ErrorMessage />}>
+  <RiskyComponent />
+</ErrorBoundary>
+
+// または fallback を関数で
+<ErrorBoundary fallback={(err) => <div>Failed: {err.message}</div>}>
+  <RiskyComponent />
+</ErrorBoundary>
+```
+
+## 実装: コンポーネント本体
+
+```ts
+// error-boundary.ts
+export type ErrorBoundaryProps = {
+  fallback: ChibireactNode | ((error: unknown) => ChibireactNode)
+  children?: unknown
+}
+
+export function ErrorBoundary(props: ErrorBoundaryProps): ChibireactNode {
+  return (props.children ?? null) as ChibireactNode
+}
+```
+
+Suspense と同じく **children を素通りさせるだけ** の薄いラッパ。
+重要なのは work-loop 側のキャッチ処理。
+
+## 実装: work-loop の catch 拡張
+
+Suspense の Promise キャッチに **Error 経路** を追加:
+
+```ts
+} catch (thrown) {
+  if (thrown && typeof thrown.then === 'function') {
+    // Suspense へ
+    let cursor = fiber.parent
+    while (cursor !== null) {
+      if (cursor.type === Suspense) {
+        cursor.suspended = true
+        cursor.thrownPromise = thrown
+        cursor.child = null
+        return cursor
+      }
+      cursor = cursor.parent
+    }
+    throw thrown
+  }
+  // ★ 通常の Error → ErrorBoundary を探す
+  let cursor = fiber.parent
+  while (cursor !== null) {
+    if (cursor.type === ErrorBoundary) {
+      cursor.error = thrown
+      cursor.child = null
+      return cursor
+    }
+    cursor = cursor.parent
+  }
+  throw thrown
+}
+```
+
+ErrorBoundary fiber の処理:
+
+```ts
+} else if (fiber.type === ErrorBoundary && fiber.error !== undefined) {
+  const fb = fiber.props.fallback
+  const node = typeof fb === 'function'
+    ? (fb as (e: unknown) => ChibireactNode)(fiber.error)
+    : (fb as ChibireactNode)
+  fiber.pendingChildren = [node]
+}
+```
+
+`fallback` が関数なら **error を引数に呼び出す** ことで詳細を fallback UI に渡せます。
+
+## Fiber 型の拡張
+
+```ts
+export type Fiber = {
+  // ... existing
+  error?: unknown  // Error Boundary 用
+}
+```
+
+reconcile 時に alternate からは **コピーしない**:
+- 親が再 render したなら recovery 試行 = エラー再評価のチャンス
+- 子がまた throw すれば error 再セット
+- 子が成功すれば error は undefined のまま → 通常表示
+
+## テストで動作確認
+
+基本: throw → fallback 表示
+
+```ts
+it('子が Error を throw すると fallback が表示される', () => {
+  const Boom = () => { throw new Error('crashed') }
+
+  const App = () => createElement(ErrorBoundary,
+    { fallback: createElement('span', null, 'recovered') },
+    createElement(Boom, null),
+  )
+
+  root.render(createElement(App, null))
+  expect(container.firstChild?.textContent).toBe('recovered')
+})
+```
+
+fallback が関数:
+
+```ts
+it('fallback が関数なら error を引数に呼ばれる', () => {
+  const Boom = () => { throw new Error('boom!') }
+
+  const App = () => createElement(ErrorBoundary,
+    { fallback: (err) => createElement('span', null, `error: ${err.message}`) },
+    createElement(Boom, null),
+  )
+
+  root.render(createElement(App, null))
+  expect(container.firstChild?.textContent).toBe('error: boom!')
+})
+```
+
+ネストの内側優先:
+
+```ts
+it('ネストした ErrorBoundary では最も近いものが捕まえる', () => {
+  const Boom = () => { throw new Error('inner') }
+
+  const App = () => createElement(ErrorBoundary,
+    { fallback: 'outer-fallback' },
+    createElement(ErrorBoundary,
+      { fallback: 'inner-fallback' },
+      createElement(Boom, null),
+    ),
+  )
+
+  // 内側が勝つ
+  expect(container.firstChild?.textContent).toBe('inner-fallback')
+})
+```
+
+ErrorBoundary が無ければ propagate:
+
+```ts
+it('ErrorBoundary が無いとエラーが伝播する', () => {
+  const Boom = () => { throw new Error('uncaught') }
+  expect(() => root.render(createElement(Boom, null))).toThrow(/uncaught/)
+})
+```
+
+Promise はスルーされる:
+
+```ts
+it('Promise を throw した場合は ErrorBoundary では捕まえない (Suspense の仕事)', () => {
+  const promise = new Promise(() => {})
+  const Suspended = () => { throw promise }
+  // ErrorBoundary は Promise をスルーして Suspense を探す → Suspense なし → throw
+})
+```
+
+## ちょっと深掘り
+
+### 本家 React は class component を使う
+
+歴史的に Error Boundary は **クラスコンポーネント** でしか作れません:
+
+```tsx
+class ErrorBoundary extends React.Component {
+  state = { hasError: false, error: null }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error, info) {
+    logErrorToService(error, info)
+  }
+
+  render() {
+    return this.state.hasError ? this.props.fallback : this.props.children
+  }
+}
+```
+
+理由は **render 中の throw を catch** するのが instance method (ライフサイクル) ベースで、関数コンポと相性が悪いから。
+
+本書 chibireact では **work-loop 側で catch** することで、関数コンポーネントとして書けるようにしました。これは React 19+ の `react-error-boundary` ライブラリと似た発想です。
+
+### `react-error-boundary` ライブラリ
+
+実プロジェクトでは [`react-error-boundary`](https://github.com/bvaughn/react-error-boundary) が定番:
+
+```tsx
+import { ErrorBoundary } from 'react-error-boundary'
+
+<ErrorBoundary
+  fallback={({ error, resetErrorBoundary }) => (
+    <div>
+      <p>Error: {error.message}</p>
+      <button onClick={resetErrorBoundary}>Try again</button>
+    </div>
+  )}
+  onError={(error, info) => logToSentry(error, info)}
+  onReset={() => clearLocalState()}
+>
+  <App />
+</ErrorBoundary>
+```
+
+`resetErrorBoundary` で error 状態をクリアして retry できる API が便利。
+本書 chibireact でも同様に `resetError()` を fallback の引数に渡す拡張は数行で追加できます (今回は割愛)。
+
+### Error Boundary が捕まえないもの
+
+Error Boundary は **render / lifecycle / constructor / commit** のエラーを捕まえますが、以下は捕まえません:
+- **イベントハンドラ内** のエラー (try/catch を自分で)
+- **非同期コールバック** (setTimeout, Promise.then)
+- **SSR** のエラー (サーバ側で別途)
+
+```tsx
+function Bad() {
+  return (
+    <button onClick={() => {
+      throw new Error('not caught')  // ← Error Boundary はキャッチしない
+    }}>click</button>
+  )
+}
+```
+
+「**render path のエラー専用**」と覚えるのが正解。
+
+### 本書実装の制限
+
+- **Error Boundary 配下で実行された useEffect の cleanup** が漏れる: `child = null` で fiber を捨てるが、commit 済 fiber の cleanup は呼ばない
+- **componentDidCatch 相当 (副作用) なし**: ロギング等を hook 化できる API は本書未実装
+- **resetError API なし**: 親が key を変えるなどで強制再 render する必要がある
+
+教育目的としては「境界で catch する」感覚を伝えるには十分。
+
+## まとめ
+
+- ErrorBoundary は子孫の **Error throw** を境界で catch する
+- 実装は work-loop の try/catch に Error 経路を追加するだけ
+- fallback は値でも関数でも OK (関数なら error を渡せる)
+- ネストは内側が勝つ
+- イベントハンドラ・非同期エラーは捕まえない (本家も同じ)
+
+## 次の章へ
+
+[Portal](./060-portal)（執筆中）で、子要素を **DOM ツリーの別の場所** に描画する仕組みを実装します。
+Modal / Tooltip / Toast の典型実装で必須の API です。
