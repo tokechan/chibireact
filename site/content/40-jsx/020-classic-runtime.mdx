@@ -1,0 +1,277 @@
+---
+title: classic runtime — JSX → createElement 変換
+description: React 17 以前で使われていた classic runtime での JSX 変換ルールを、入力と出力を 1 対 1 で対応させながら見ていきます
+---
+
+# classic runtime — JSX → createElement 変換
+
+[JSX とは何か](./010-jsx-intro) で「JSX は createElement に変換される」ということを見ました。
+本章では **その変換ルール** を、Babel 的な視点で **入力 → 出力** のペアで具体的に見ていきます。
+
+これは React 17 以前で使われていた **classic runtime** と呼ばれる方式です。
+React 17 から **automatic runtime** がデフォルトに変わりましたが、classic を理解しておくと変換の本質が掴めます。
+
+## この章のゴール
+
+- JSX → createElement の変換ルール 5 種類が言える
+- なぜ React 16 まで `import React from 'react'` が必要だったか分かる
+- spread props (`{...props}`) や fragment (`<>`) の変換も理解する
+- 章末で「すべての JSX を頭の中で createElement 呼び出しに展開できる」状態になる
+
+> 章末に動くもの: なし（変換ルールの理解）。実装は 4.4 で。
+
+前章: [JSX とは何か](./010-jsx-intro)
+
+## ルール 1: 通常の HTML タグ
+
+```tsx
+<div className="box">Hello</div>
+```
+
+↓
+
+```ts
+React.createElement('div', { className: 'box' }, 'Hello')
+```
+
+ポイント:
+- タグ名 `div` は **文字列リテラル** になる (小文字始まりだから)
+- `className="box"` は props オブジェクトの 1 プロパティ
+- 子テキスト `Hello` は 3 つ目以降の引数
+
+## ルール 2: 関数コンポーネント
+
+```tsx
+<MyComp name="alice" />
+```
+
+↓
+
+```ts
+React.createElement(MyComp, { name: 'alice' })
+```
+
+ポイント:
+- タグ名 `MyComp` は **変数参照** (大文字始まりだから)
+- 子要素なしなので props のみ
+
+## ルール 3: 中括弧の展開
+
+```tsx
+<button onClick={handleClick} disabled={!ready}>
+  {label}
+</button>
+```
+
+↓
+
+```ts
+React.createElement(
+  'button',
+  { onClick: handleClick, disabled: !ready },
+  label,
+)
+```
+
+ポイント:
+- `{handleClick}` は **JS 式の評価結果** がそのまま値になる
+- `{!ready}` も同じ (式の結果が boolean)
+- `{label}` は children として変数 label の値
+
+## ルール 4: 入れ子と複数 children
+
+```tsx
+<div>
+  <h1>Title</h1>
+  <p>Body</p>
+</div>
+```
+
+↓
+
+```ts
+React.createElement('div', null,
+  React.createElement('h1', null, 'Title'),
+  React.createElement('p', null, 'Body'),
+)
+```
+
+ポイント:
+- 子が複数あれば **3 つ目以降に並ぶ**
+- props が空なら **null** を入れる
+- 入れ子は再帰的に同じ変換
+
+## ルール 5: spread props
+
+```tsx
+<input {...rest} type="email" />
+```
+
+↓
+
+```ts
+React.createElement('input', { ...rest, type: 'email' })
+```
+
+ポイント:
+- `{...rest}` は props オブジェクトに **スプレッド** される
+- 並び順を保つ: 後ろの属性が前のキーを上書き
+- 上記なら `rest.type` があっても最終的には `'email'` になる
+
+## ルール 6: Fragment
+
+```tsx
+<>
+  <h1>Title</h1>
+  <p>Body</p>
+</>
+```
+
+↓
+
+```ts
+React.createElement(React.Fragment, null,
+  React.createElement('h1', null, 'Title'),
+  React.createElement('p', null, 'Body'),
+)
+```
+
+ポイント:
+- `<>...</>` は `React.Fragment` のシンタックスシュガー
+- 親 DOM を増やさず複数要素を返したいときに使う
+- 本書 chibireact では Fragment 未対応 (Part 5 で扱う候補)
+
+## なぜ classic は `import React` が必要か
+
+```tsx
+// User が書くファイル
+function App() {
+  return <h1>Hello</h1>  // ← ここに React は明示的に出てこない
+}
+```
+
+しかし変換後:
+
+```ts
+function App() {
+  return React.createElement('h1', null, 'Hello')
+}
+```
+
+**コード本文に `React.createElement` が現れる** ので、`React` という識別子がスコープに必要です。
+
+```tsx
+import React from 'react'  // ← 必須
+function App() { return <h1>Hello</h1> }
+```
+
+これは React 16 までの「**`React` を使ってないように見えても import が要る**」事情の正体。
+React 17 以降は **automatic runtime** で `import React` が不要になりました（次章 4.3 で詳細）。
+
+## まとめると変換は 6 ルール
+
+| 入力 (JSX) | 出力 (JS) |
+|---|---|
+| `<div />` | `createElement('div', null)` |
+| `<MyComp />` | `createElement(MyComp, null)` |
+| `<div className="x">` | `createElement('div', { className: 'x' })` |
+| `<div>{expr}</div>` | `createElement('div', null, expr)` |
+| `<div {...p} />` | `createElement('div', { ...p })` |
+| `<>...</>` | `createElement(Fragment, null, ...)` |
+
+これだけ覚えれば、**任意の JSX を頭の中で createElement に展開できます**。
+
+## 練習: 変換してみる
+
+入力:
+
+```tsx
+const Counter = ({ initial }: { initial: number }) => {
+  const [count, setCount] = useState(initial)
+  return (
+    <div className="counter">
+      <h1>Count: {count}</h1>
+      <button onClick={() => setCount(c => c + 1)}>+</button>
+      <button onClick={() => setCount(c => c - 1)}>-</button>
+    </div>
+  )
+}
+```
+
+出力:
+
+```ts
+const Counter = ({ initial }: { initial: number }) => {
+  const [count, setCount] = useState(initial)
+  return React.createElement(
+    'div',
+    { className: 'counter' },
+    React.createElement('h1', null, 'Count: ', count),
+    React.createElement('button',
+      { onClick: () => setCount(c => c + 1) },
+      '+',
+    ),
+    React.createElement('button',
+      { onClick: () => setCount(c => c - 1) },
+      '-',
+    ),
+  )
+}
+```
+
+> 微妙な点: `<h1>Count: {count}</h1>` は **2 つの child**（文字列 `'Count: '` と変数 `count`）になります。テキスト内に `{}` が入ると、その境界で children が分割されます。
+
+## ちょっと深掘り
+
+### 「JSX 内の `{}` は文ではなく式」もう一度
+
+```tsx
+{cond ? <A /> : <B />}    // OK 三項演算子は式
+{(() => {
+  if (cond) return <A />
+  return <B />
+})()}                     // OK 即時関数で return できる
+{cond && <A />}           // OK 短絡評価は式
+```
+
+```tsx
+{if (cond) <A /> else <B />}  // ❌ if 文は値を持たない
+{for (...)} ...               // ❌ for 文は値を持たない
+```
+
+**式 (expression) と文 (statement)** の区別は JavaScript の基礎ですが、JSX を書くときに改めて意識する場面が多くなります。
+
+### コメントの書き方
+
+```tsx
+<div>
+  {/* これは JSX 内のコメント */}
+  <h1>Title</h1>
+  // これは ❌ NG（{}/JSX の中ではダメ）
+</div>
+```
+
+JSX 内では `{/* ... */}` でしかコメントできません。これは「**`{}` の中に式を書く**」ルールから来ています (`/* */` は式でも何でもないが、JS の構文として許される)。
+
+### React.createElement vs jsx の違い
+
+これは次章 (4.3) で詳しく。簡単に言うと:
+- `createElement(type, props, ...children)`: classic runtime
+- `jsx(type, props)`: automatic runtime（children は props.children に入る）
+
+引数の数と children の扱いが違います。
+
+### Babel の挙動を実際に見るには
+
+[Babel REPL](https://babeljs.io/repl) で JSX を貼り付けると **左に入力 / 右に変換結果** が出ます。
+本書を読みながら自分の書いた JSX を貼り付けて試してみると理解が深まります。
+
+## まとめ
+
+- JSX は 6 つの変換ルールで完全に createElement 呼び出しに展開できる
+- React 16 まで `import React` が必須だった理由は createElement の参照が必要だったから
+- 自分の書く JSX を頭の中で展開する習慣をつけると、TypeScript の型エラーや高度な使い方が理解しやすくなる
+
+## 次の章へ
+
+[automatic runtime — React 17+ の jsx() 変換](./030-automatic-runtime) で、classic を置き換える新しい変換方式を見ます。`import React` が不要になった理由が分かります。
