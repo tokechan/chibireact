@@ -1,0 +1,234 @@
+---
+title: Concurrent Rendering の前提知識
+description: React 18 の主機能「並行レンダリング」とは何か。Fiber + scheduler が下地となり、優先度・中断・並走を可能にする仕組みの全体像
+---
+
+# Concurrent Rendering の前提知識
+
+Part 5 へようこそ。本書最難関の Part に到達しました。
+
+これまで作ってきた **Fiber + scheduler** が下地となり、ここで **「中断・優先度・並走」** という React 18 の真骨頂が活きます。
+最初の章はコード変更ゼロで、**Concurrent Rendering とは何か** を整理します。
+
+## この章のゴール
+
+- 「並行 (concurrent)」が「並列 (parallel)」とは違うことを理解する
+- React 16 の Fiber と React 18 の Concurrent Rendering の関係が分かる
+- **lane** という優先度モデルの考え方を掴む
+- Part 5 で扱う 5 機能 (startTransition / useDeferredValue / Suspense / Error Boundary / Portal) の位置付けを言える
+
+> 章末に動くもの: なし（概念整理）。実装は次章 5.2 から。
+
+前章: [Part 4.5 JSX の TypeScript 型](../40-jsx/050-jsx-types)
+
+## 「Concurrent」とは
+
+> **Concurrent (並行)** = 複数の処理が **「進行中」** の状態を同時に保てる
+>
+> **Parallel (並列)** = 複数の処理が **「同時刻」** に実行される (CPU コアを別々に使う)
+
+JavaScript はシングルスレッドなので、本物の **parallel** はできません (Worker は別)。
+ですが **concurrent** なら可能です:
+
+```
+並行 (concurrent):
+  時刻軸 →
+  task A: ━━━━━━ 中断 ━━━━━━ 完了
+  task B:        ━━ 中断 ━━ 完了
+  (A と B は時間を共有しているが、それぞれ「進行中」状態を保持)
+
+並列 (parallel):
+  時刻軸 →
+  task A: ━━━━━━━━━━━━━━━━ 完了 (CPU 1)
+  task B: ━━━━━━━━━━━━━━━━ 完了 (CPU 2)
+```
+
+React 18 の Concurrent Rendering は **「並行」**:
+- 複数の render を同時に「進行中」にできる
+- ユーザー入力など高優先度の作業が来たら現在の render を **中断** して即応
+- アイドル時間に低優先度の作業を **再開**
+
+## React 16 の Fiber と React 18 の Concurrent
+
+### Fiber (React 16, 2017)
+- **データ構造**: linked-list、parent/child/sibling
+- **work loop**: 中断・再開可能なループ
+- **目的**: メインスレッドを長時間占有しない
+
+→ Part 2 で実装済
+
+### Concurrent Mode (React 18, 2022)
+- **lane**: 優先度の数値（0-31 のビットマスク）
+- **複数 root の並走**: 異なる優先度のレンダリングを同時進行
+- **transition / Suspense との統合**: 「待つ・諦める」を組み込む
+- **目的**: ユーザー体感の "なめらかさ" を最優先
+
+→ Part 5 で実装
+
+> Fiber は「**できるようになった**」段階、Concurrent は「**それを使い切る**」段階。両者は同じ Fiber アーキテクチャの上に立ちます。
+
+## lane (優先度) のモデル
+
+React 18 は内部的に **31 個の lane** を持ち、それぞれにビットマスクが割り当てられています:
+
+```
+SyncLane           = 0b0000000000000000000000000000001
+InputContinuousLane = 0b0000000000000000000000000000100
+DefaultLane        = 0b0000000000000000000000000010000
+TransitionLane1    = 0b0000000000000000000000010000000
+...
+IdleLane           = 0b0010000000000000000000000000000
+```
+
+各 setState はどれかの lane を持ち、優先度の高い lane から処理されます:
+- ユーザー入力 → `InputContinuousLane`
+- 通常 setState → `DefaultLane`
+- `startTransition` 内 → `TransitionLane`
+- `useDeferredValue` の遅延コピー → `TransitionLane` 相当
+
+複数 lane を **bitwise OR** で組み合わせて「これらの lane が pending」を表現:
+
+```
+pendingLanes = SyncLane | DefaultLane = 0b...10001
+```
+
+> 本書 chibireact ではこの 31 lane モデルは実装せず、**もっと単純な 2 段階の優先度** (即時 / 遅延) で同じ概念を伝えます。
+
+## Part 5 で扱う 5 機能
+
+### startTransition
+
+「この更新は **重要じゃない** から、優先度の高い更新に割り込まれて OK」と宣言する API。
+
+```tsx
+import { startTransition } from 'react'
+
+const handleSearch = (query) => {
+  setInputValue(query)  // 高優先度: input 表示は即時
+  startTransition(() => {
+    setSearchResults(filter(items, query))  // 低優先度: 検索結果は遅延 OK
+  })
+}
+```
+
+入力中の UX を犠牲にせず、重い再描画を後回しにできる。Part 5.2 で実装。
+
+### useDeferredValue
+
+「**最新値はあるが、UI 上では古い値で描画してもいい**」という遅延値を返す hook。
+
+```tsx
+const Search = ({ query }) => {
+  const deferredQuery = useDeferredValue(query)
+  // 入力中は deferredQuery が遅れて、結果リストの再計算をスキップできる
+  return <Results query={deferredQuery} />
+}
+```
+
+startTransition の **value 版**。Part 5.3 で実装。
+
+### Suspense
+
+「データ取得中」「コード分割中」を **境界 (boundary)** として表現する仕組み。
+
+```tsx
+<Suspense fallback={<Spinner />}>
+  <SlowComponent />
+</Suspense>
+```
+
+中の `<SlowComponent />` がデータ未読みなら **fallback の Spinner を表示**。
+データが揃ったら自動で本物に切り替わる。Part 5.4 で実装。
+
+### Error Boundary
+
+「子の render エラーを **境界で捕まえる**」仕組み。
+
+```tsx
+<ErrorBoundary fallback={<ErrorMessage />}>
+  <RiskyComponent />
+</ErrorBoundary>
+```
+
+`<RiskyComponent>` が例外を投げたら、親の Error Boundary が **fallback の ErrorMessage を表示**。
+アプリ全体が真っ白にならない。Part 5.5 で実装。
+
+### Portal
+
+「子要素を **DOM ツリー上の別の場所** に描画する」API。Modal / Tooltip / Toast の典型実装。
+
+```tsx
+<div className="container">
+  {createPortal(<Modal />, document.body)}
+</div>
+```
+
+Part 5.6 で実装。
+
+## 本書 chibireact の方針
+
+Part 5 では **「概念を分かる最小の実装」** を目指します:
+
+| 機能 | 本家 React 18 | 本書 chibireact |
+|---|---|---|
+| lane | 31 ビット優先度 | 2 段階 (`urgent` / `transition`) |
+| 並走 | 複数 root 同時 | 1 root + 優先度キュー |
+| Suspense | thrown promise + fiber.alternate 切替 | thrown promise + fallback fiber 表示 |
+| Error Boundary | クラスコンポーネント (componentDidCatch) | 関数コンポ + ErrorBoundary 専用ラッパ |
+| Portal | createPortal + DOM 切り替え | createPortal + container 指定 |
+
+**学習目的としての分かりやすさ**を優先し、本物の React の細部までは追いません。
+
+## ちょっと深掘り
+
+### なぜ「並行」がこんなに重要か
+
+UI の体感品質は **「ユーザーの動作にどれだけ早く UI が反応するか」** で決まります。
+重い処理 (数千要素のリスト sort、巨大 SVG の更新) が走っていると、その間に来た **クリック・キー入力** が遅延します:
+
+```
+従来 (同期):
+  巨大 sort 開始 ━━━━━━━━━━━━━━ 完了
+                            ↑
+                            ここで来たクリックが反映されるのは sort 完了後
+                            ユーザーは「あれ、反応してない?」と感じる
+
+Concurrent:
+  巨大 sort 開始 ━━━ 中断 (クリック反映) ━━━ 再開 ━━━ 完了
+                  ↑ ユーザー体感: 即時反応
+```
+
+並行性は **CPU 効率** の話ではなく **UX の話**。これが React 18 の思想の根っこです。
+
+### Vue と比較
+
+Vue は **きめ細かい依存追跡** で「どこが変わったか」を Proxy で追えるので、そもそも巨大な再描画が発生しにくい設計。
+React は **コンポーネントを丸ごと再評価** する設計なので、巨大な再描画が頻繁に起きうる → 並行性で緩和、というアプローチ。
+
+設計思想の違いから、Vue にはそもそも startTransition のような API が無いケースが多い (3.x で追加された [Vapor Mode](https://github.com/vuejs/core-vapor) は別のアプローチ)。
+
+### React Forget (Compiler) との関係
+
+Part 3 でも触れた React Compiler は、**コンポーネント単位のメモ化** を自動挿入することで、Concurrent Rendering の「中断コスト」自体を減らす方向です:
+- メモ化されると無駄な再 render が減る
+- 結果として concurrent でやらなくても十分速くなる
+
+Compiler が完成すれば、`useMemo` / `useCallback` だけでなく `startTransition` の使用機会も減るかもしれません。
+
+### 「Concurrent Mode」 vs 「Concurrent Features」
+
+React 18 の正式名称は **「Concurrent Features」** で、**「Concurrent Mode」ではありません**。
+かつての alpha 期 (React 17 時代) は "Concurrent Mode" として **アプリ全体を切り替える** 設計でしたが、移行コストが高すぎて廃案。
+代わりに **「機能単位 (`startTransition` / `useDeferredValue` / `Suspense`)** で部分的に有効化する形に落ち着きました。だから既存 React アプリも段階的に Concurrent 化できます。
+
+## まとめ
+
+- **Concurrent (並行)** は「進行中」状態を複数同時に保てる、JS シングルスレッドでも実現できる
+- React 18 は Fiber + lane (優先度) で「中断・優先・再開」を実現
+- 本書 chibireact では 2 段階優先度の単純化版で同じ概念を伝える
+- Part 5 で扱う 5 機能はすべて「並行性をユーザーに見せる API」
+
+## 次の章へ
+
+[startTransition と低優先度更新](./020-start-transition) で、最初の Concurrent API を実装します。
+「重い更新を後回しにできる」感覚を体感する章です。
