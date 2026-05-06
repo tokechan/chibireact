@@ -7,6 +7,8 @@ export {
   useEffect,
   useLayoutEffect,
   useContext,
+  useMemo,
+  useCallback,
 } from './hooks-state'
 export { createContext } from './context'
 export type { Context, ContextProvider } from './context'
@@ -24,6 +26,7 @@ export type {
   Hook,
   StateHook,
   EffectHook,
+  MemoHook,
 } from './fiber'
 export type {
   FunctionComponent,

@@ -1,4 +1,4 @@
-import type { EffectHook, Fiber, Hook, StateHook } from './fiber'
+import type { EffectHook, Fiber, Hook, MemoHook, StateHook } from './fiber'
 import type { Context } from './context'
 
 /**
@@ -249,6 +249,57 @@ export function useContext<T>(context: Context<T>): T {
     cursor = cursor.parent
   }
   return context._defaultValue
+}
+
+/**
+ * 計算結果を deps に基づいてメモ化する hook (Part 3.7)。
+ *
+ * - 初回 render: factory を呼び、結果と deps を保存
+ * - 2 回目以降:
+ *   - deps が変わっていれば factory を再実行して値を更新
+ *   - 変わっていなければ前回の値をそのまま返す（参照同一性を保つ）
+ *
+ * 使い所:
+ *   - 重い計算結果を再 render 間で再利用したい
+ *   - 子コンポーネントに渡すオブジェクトの参照を安定させたい
+ *
+ * @example
+ *   const sorted = useMemo(() => list.sort(), [list])
+ */
+export function useMemo<T>(factory: () => T, deps?: readonly unknown[]): T {
+  if (wipFiber === null) {
+    throw new Error(
+      'useMemo can only be called inside a function component (during render).',
+    )
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  const oldHook = fiber.hooks[index] as MemoHook | undefined
+  const hasChanged =
+    !oldHook || deps === undefined || depsChanged(oldHook.deps, deps)
+
+  const value = hasChanged ? factory() : (oldHook as MemoHook).value
+  fiber.hooks[index] = { kind: 'memo', value, deps } satisfies MemoHook
+  return value as T
+}
+
+/**
+ * 関数の参照を deps に基づいて安定させる hook (Part 3.7)。
+ * `useMemo(() => fn, deps)` のショートカット。
+ *
+ * 主な用途: 子コンポーネントへ props として関数を渡すとき、参照が変わると不要な
+ * 再描画を引き起こすため固定したい。
+ *
+ * @example
+ *   const handleClick = useCallback(() => doStuff(id), [id])
+ *   <Child onClick={handleClick} />
+ */
+export function useCallback<F extends (...args: never[]) => unknown>(
+  fn: F,
+  deps?: readonly unknown[],
+): F {
+  return useMemo(() => fn, deps)
 }
 
 /**

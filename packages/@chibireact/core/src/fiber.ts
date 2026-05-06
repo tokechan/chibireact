@@ -96,8 +96,17 @@ export type EffectHook = {
   pendingCommit: boolean
 }
 
-/** Fiber.hooks に入る discriminated union (Part 3.2 / 3.4)。 */
-export type Hook = StateHook | EffectHook
+/** useMemo / useCallback 系の hook 1 つ分の箱 (Part 3.7)。 */
+export type MemoHook = {
+  kind: 'memo'
+  /** 直近の factory 実行結果。useCallback の場合は関数そのもの。 */
+  value: unknown
+  /** 依存配列。undefined なら毎 render で factory を再実行。 */
+  deps?: readonly unknown[]
+}
+
+/** Fiber.hooks に入る discriminated union (Part 3.2 / 3.4 / 3.7)。 */
+export type Hook = StateHook | EffectHook | MemoHook
 
 export type Fiber = {
   type: FiberType
