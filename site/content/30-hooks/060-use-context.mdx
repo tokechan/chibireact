@@ -1,0 +1,282 @@
+---
+title: useContext と Context API
+description: prop drilling を回避する Context API の最小実装。fiber tree を遡って祖先 Provider の値を読みます
+---
+
+# useContext と Context API
+
+ここまでの hooks (useState / useReducer / useEffect / useLayoutEffect) はコンポーネント内に閉じた仕組みでした。
+本章では **「祖先から子孫へ値を一気に届ける」** ための Context API を作ります。
+
+「テーマ」「言語設定」「ログインユーザー」のような **広範囲で使う値** を、props の引き回し（**prop drilling**）無しに利用できます。
+
+## この章のゴール
+
+- `createContext(default)` で Context オブジェクトを作れる
+- `<Context.Provider value={x}>` で値を流し込める
+- `useContext(Context)` でツリー上の最寄り Provider 値を取れる
+- ネストした Provider は **内側優先** であることが分かる
+- Provider value 変化で子孫が re-render する仕組みが見える
+
+> 章末に動くもの: テーマ切替などの典型パターン。テスト 7 個追加で累計 **159/159**。
+
+前章: [useLayoutEffect — sync な副作用](./050-use-layout-effect)
+
+## 解決したい問題: prop drilling
+
+```tsx
+function App() {
+  return <Page user={user} theme={theme} />
+}
+function Page({ user, theme }) {
+  return <Sidebar user={user} theme={theme} />
+}
+function Sidebar({ user, theme }) {
+  return <UserBadge user={user} theme={theme} />
+}
+function UserBadge({ user, theme }) {
+  return <div className={theme}>{user.name}</div>
+}
+```
+
+`user` や `theme` を **使うのは UserBadge だけ** なのに、途中の Page や Sidebar が経路として保持しています。これが **prop drilling**。コンポーネントが増えるほど苦しくなります。
+
+Context API を使うと:
+
+```tsx
+const ThemeContext = createContext('light')
+
+function App() {
+  return (
+    <ThemeContext.Provider value="dark">
+      <Page user={user} />
+    </ThemeContext.Provider>
+  )
+}
+function UserBadge({ user }) {
+  const theme = useContext(ThemeContext)  // 直接読む
+  return <div className={theme}>{user.name}</div>
+}
+```
+
+**経路上のコンポーネントは theme を意識しなくていい**。
+
+## API
+
+```ts
+const Context = createContext(defaultValue)
+
+// 値を流す
+<Context.Provider value={x}>
+  ...
+</Context.Provider>
+
+// 値を読む
+const value = useContext(Context)
+```
+
+## 実装: createContext
+
+```ts
+// context.ts
+export type ContextProvider<T> = (props: { value: T; children?: unknown }) => ChibireactNode
+
+export type Context<T> = {
+  _defaultValue: T
+  Provider: ContextProvider<T>
+}
+
+export function createContext<T>(defaultValue: T): Context<T> {
+  const context = {
+    _defaultValue: defaultValue,
+    Provider: undefined as unknown as ContextProvider<T>,
+  } as Context<T>
+
+  // Provider は children を流すだけのシンプルな関数コンポーネント
+  context.Provider = function ContextProvider(props) {
+    return (props.children ?? null) as ChibireactNode
+  }
+
+  return context
+}
+```
+
+ポイント:
+- **Provider 自体は値をどこにも保存しない**。children を素通りさせるだけ
+- 値の保管場所は `<Provider value={x}>` の **fiber.props.value** (work loop が普通に保持する)
+- 「Provider という関数コンポーネントの fiber」が tree 上の目印になる
+
+## 実装: useContext
+
+```ts
+export function useContext<T>(context: Context<T>): T {
+  if (wipFiber === null) throw new Error(...)
+
+  let cursor: Fiber | null = wipFiber.parent
+  while (cursor !== null) {
+    if (cursor.type === context.Provider) {
+      const value = cursor.props.value as T | undefined
+      return value !== undefined ? value : context._defaultValue
+    }
+    cursor = cursor.parent
+  }
+  return context._defaultValue
+}
+```
+
+たった 13 行。**fiber.parent を辿って Provider 関数 (=context.Provider) を探す** だけです。
+- 見つかれば `props.value` を返す
+- 見つからなければ `defaultValue`
+
+`context.Provider` は `createContext` で作った **特定の関数参照** なので、`===` で識別できます。
+
+## なぜこれで動くのか
+
+work loop が以下の順で fiber を作っていることを思い出してください:
+
+```
+App fiber
+  └ ThemeContext.Provider fiber  (props.value = 'dark')
+       └ Page fiber
+            └ Sidebar fiber
+                 └ UserBadge fiber  ← ここで useContext(ThemeContext)
+```
+
+UserBadge を処理する瞬間、`wipFiber = UserBadge`。`wipFiber.parent = Sidebar`、その parent が Page、その parent が ThemeContext.Provider。
+ループで遡っていくと、Provider 関数を type に持つ fiber に当たります。`fiber.props.value === 'dark'` を取り出して return。
+
+## ネストした Provider
+
+```tsx
+<ThemeContext.Provider value="outer">
+  <ThemeContext.Provider value="inner">
+    <Show />
+  </ThemeContext.Provider>
+</ThemeContext.Provider>
+```
+
+`Show` の親チェーンは inner Provider → outer Provider → ...。
+`useContext` は **最初に見つけた** Provider で return するので、**inner** が勝ちます。
+React 公式仕様も同じ「最寄り Provider」セマンティクスです。
+
+## 値の更新
+
+```tsx
+const App = () => {
+  const [value, setValue] = useState('initial')
+  return (
+    <Ctx.Provider value={value}>
+      <Show />
+      <button onClick={() => setValue('updated')}>change</button>
+    </Ctx.Provider>
+  )
+}
+```
+
+`setValue` で `value` が変わると、App が re-render。Provider fiber が UPDATE され、子孫の Show fiber も UPDATE される (我々の reconcile は同 type は再 render)。Show 内で `useContext(Ctx)` が呼ばれ、新しい props.value (= 'updated') を取得。
+
+> 制限: 本書 chibireact では Provider が UPDATE されると **そのサブツリー全体が再 render**。本家 React は「useContext を呼んでいる fiber だけ」を選んで更新する **bailout 最適化** を持つ。Part 3.7 (useMemo) でも触れる。
+
+## テストで動作確認
+
+最寄り Provider が勝つこと:
+
+```ts
+it('ネストされた Provider は最も近いものが優先される', () => {
+  const Ctx = createContext('default')
+  const Show = () => {
+    const v = useContext(Ctx)
+    return createElement('span', null, v)
+  }
+  const App = () =>
+    createElement(Ctx.Provider, { value: 'outer' },
+      createElement(Ctx.Provider, { value: 'inner' },
+        createElement(Show, null),
+      ),
+    )
+
+  // ...
+  expect(container.textContent).toBe('inner')
+})
+```
+
+複数 Context の併用:
+
+```ts
+const A = createContext('a-default')
+const B = createContext('b-default')
+const Show = () => {
+  const a = useContext(A)
+  const b = useContext(B)
+  return createElement('span', null, `${a}/${b}`)
+}
+// ... 'A!/B!'
+```
+
+setState 経由の Provider value 更新で子孫が更新される:
+
+```ts
+it('Provider の value が変わると子孫が再描画される', async () => {
+  // ... button click → 'initial' → 'updated'
+})
+```
+
+## ちょっと深掘り
+
+### なぜ Consumer は実装しない？
+
+React 16.3 〜 17 までは `<Context.Consumer>{value => ...}</Context.Consumer>` という render prop API もありました。Hook が出てから完全に置き換わり、現代では Consumer は legacy 扱い。
+本書では useContext のみ実装します。
+
+### 「Provider の value 変化で子孫全部 re-render」の最適化
+
+本書の単純実装ではこれが起きますが、本家 React は次の最適化があります:
+- **useContext を呼んでいない fiber は再描画しない** (bailout)
+- **memo() でラップした子孫はさらに props が変わらないと bailout**
+
+実装は複雑なので本書では割愛しますが、**Context は安易に大きな値を流すと過剰再描画の温床** という認識は重要です。
+
+### Context value のメモ化
+
+Provider の value に毎回新しいオブジェクトを渡すと、useContext を読む全コンポーネントが再描画されます:
+
+```tsx
+// ❌ 毎 render で新オブジェクト
+<UserContext.Provider value={{ name: user.name, age: user.age }}>
+
+// ✅ useMemo でメモ化
+const ctxValue = useMemo(() => ({ name: user.name, age: user.age }), [user.name, user.age])
+<UserContext.Provider value={ctxValue}>
+```
+
+`useMemo` は次章 (Part 3.7) で実装します。
+
+### State + Context の組み合わせは Redux 代替になる
+
+```tsx
+const StoreContext = createContext(null)
+const Provider = ({ children }) => {
+  const [state, dispatch] = useReducer(reducer, initialState)
+  return <StoreContext.Provider value={{ state, dispatch }}>{children}</StoreContext.Provider>
+}
+```
+
+これだけで Redux ライクな global store が作れます。本格的な複雑アプリでない限り、useReducer + useContext で十分なケースは多い。
+
+### Server Components / RSC との関係
+
+React 18 以降の Server Components では Context は **client component の中だけで動く**。
+Server component は Context を読めません (理由: render する場所が違う)。
+これは本書 Part 5 / Part 6 で扱う想定。
+
+## まとめ
+
+- `createContext(default)` で Context を作り、`<Context.Provider value={x}>` で流す
+- `useContext(context)` は **fiber.parent を遡って最寄りの Provider** を見つけ、その value を返す
+- 実装は 13 行 + Provider 5 行とコンパクト
+- ネストした Provider は内側優先
+- Provider value 変化で子孫再描画 (bailout 最適化は本書スコープ外)
+
+## 次の章へ
+
+[useMemo / useCallback とメモ化](./070-use-memo-callback)（執筆中）で、計算結果や関数の参照を再 render 間で保持する仕組みを作ります。Context との相性も再確認します。

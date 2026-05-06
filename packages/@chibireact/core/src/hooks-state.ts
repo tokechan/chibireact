@@ -1,4 +1,5 @@
 import type { EffectHook, Fiber, Hook, StateHook } from './fiber'
+import type { Context } from './context'
 
 /**
  * useState の per-fiber 実装 (Part 3.2)。
@@ -211,6 +212,43 @@ function depsChanged(
     if (!Object.is(oldDeps[i], newDeps[i])) return true
   }
   return false
+}
+
+/**
+ * Context の値を読む hook (Part 3.6)。
+ *
+ * 戦略: 呼ばれた瞬間に wipFiber.parent から祖先を辿り、**type が context.Provider と
+ * 一致する最も近い fiber** を探す。見つかればその props.value を、無ければ defaultValue を返す。
+ *
+ * 制限 (現時点):
+ *   - 並び替えに弱い (Provider が同じツリー位置を保つ前提)
+ *   - useContext を呼ぶ fiber が parent チェーンを遡れる必要がある
+ *   - bailout 最適化なし: Provider の value が変わると子孫全部 re-render する
+ *
+ * @example
+ *   const ThemeContext = createContext('light')
+ *   const Toolbar = () => {
+ *     const theme = useContext(ThemeContext)
+ *     return createElement('div', { className: theme })
+ *   }
+ *   // Toolbar を <ThemeContext.Provider value="dark"> で包むと theme = 'dark'
+ */
+export function useContext<T>(context: Context<T>): T {
+  if (wipFiber === null) {
+    throw new Error(
+      'useContext can only be called inside a function component (during render).',
+    )
+  }
+  // hookIndex は進めない (useContext は Hook 配列に箱を持たない最小実装)
+  let cursor: Fiber | null = wipFiber.parent
+  while (cursor !== null) {
+    if (cursor.type === context.Provider) {
+      const value = cursor.props.value as T | undefined
+      return value !== undefined ? value : context._defaultValue
+    }
+    cursor = cursor.parent
+  }
+  return context._defaultValue
 }
 
 /**

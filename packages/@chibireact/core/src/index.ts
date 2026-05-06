@@ -6,7 +6,10 @@ export {
   useReducer,
   useEffect,
   useLayoutEffect,
+  useContext,
 } from './hooks-state'
+export { createContext } from './context'
+export type { Context, ContextProvider } from './context'
 export { buildFiberTree, createFiber, TEXT_ELEMENT } from './fiber'
 export { runFiberRoot, scheduleFiberRoot } from './work-loop'
 export { requestIdleWork } from './scheduler'
