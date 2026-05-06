@@ -1,0 +1,278 @@
+---
+title: JSX とは何か — シンタックスシュガーの正体
+description: HTML のように見える JSX の正体を解明します。実は単なる JavaScript 式の糖衣で、ビルド時にただの関数呼び出しへ展開されます
+---
+
+# JSX とは何か — シンタックスシュガーの正体
+
+Part 4 へようこそ。ここまで chibireact のテストやサンプルコードは **すべて `createElement` を直接呼んで** いました:
+
+```ts
+createElement('h1', { className: 'title' }, 'Hello')
+```
+
+ですが普通の React アプリではこう書きます:
+
+```tsx
+<h1 className="title">Hello</h1>
+```
+
+**両者は完全に等価**。`<h1>...</h1>` は **コンパイル時に** `createElement('h1', ...)` に置き換わります。
+本章ではその変換の正体を解明します。コードゼロの概念章です。
+
+## この章のゴール
+
+- JSX が HTML ではなく **JavaScript 式** であることを言える
+- `<Foo>` と `<foo>` の違い（大文字始まり = component, 小文字始まり = HTML タグ）を理解する
+- JSX 内の `{...}` が **任意の JS 式** であることを分かる
+- ビルド時に何が起きているかの全体像が見える
+
+> 章末に動くもの: なし（概念整理）。実装は次章 (4.2) から。
+
+前章: [Part 3.9 カスタムフックとロジック再利用](../30-hooks/090-custom-hooks)
+
+## JSX とは
+
+> **JSX = JavaScript に XML 風の構文を追加した言語拡張**
+
+「**式 (expression)**」として扱える点がポイント:
+
+```tsx
+const greeting = <h1>Hello</h1>  // 値として変数に代入できる
+const list = items.map(item => <li>{item}</li>)  // 関数の戻り値にもなる
+```
+
+これらが「**HTML が文字列で書けてる**」のではなく **JavaScript 式** であることに注意。
+`<h1>Hello</h1>` という一塊は、コンパイル後に `createElement('h1', null, 'Hello')` という関数呼び出しになります。
+だから変数代入もできるし、関数の戻り値にもできるし、配列に入れることもできます。
+
+## 「コンパイル時に変換される」とはどういうことか
+
+ブラウザの JavaScript エンジンは **JSX を直接読めません**:
+
+```js
+// ブラウザはこれを SyntaxError 扱いする
+const x = <h1>Hello</h1>
+```
+
+なので開発者が書いた JSX は、ブラウザに届く前に **コンパイラ** で普通の JS に書き換えられます:
+
+```
+[開発時]                       [ビルド時]                    [ブラウザ]
+src/App.tsx                    Babel / SWC / esbuild        bundle.js
+                               の JSX 変換
+const x = <h1>Hi</h1>    →    const x = createElement(...)  →  実行
+```
+
+このコンパイラのことを「**JSX トランスフォーマ**」と呼びます。代表は:
+- **Babel** + `@babel/plugin-transform-react-jsx`
+- **SWC** (Rust 製)
+- **esbuild** (Go 製)
+- **TypeScript Compiler** (`tsc --jsx`)
+
+どれを使っても同じ結果が出ます。本書では Part 4.4 で **最小の自前トランスフォーマ** を作ります。
+
+## ルール 1: 大文字 vs 小文字
+
+```tsx
+<div />        // 小文字 → HTML タグ → createElement('div', null)
+<MyComp />     // 大文字 → 変数参照 → createElement(MyComp, null)
+```
+
+JSX の **タグ名の最初の文字** で挙動が変わります:
+
+| 開始文字 | 意味 | 変換結果 |
+|---|---|---|
+| 小文字 | HTML タグ名 (string) | `createElement('div', ...)` |
+| 大文字 | 変数参照 (関数 or クラス) | `createElement(MyComp, ...)` |
+
+これは React の規約で、Babel もそれを実装しています。
+だから関数コンポーネントの名前は **必ず大文字始まり**:
+
+```tsx
+function counter() { ... }   // ❌ コンパイラが <counter /> を HTML 'counter' タグ扱いする
+function Counter() { ... }   // ✅
+```
+
+## ルール 2: 中括弧で JS 式を埋め込める
+
+```tsx
+<div>
+  Hello, {user.name}!     {/* 文字列補間 */}
+  <p>Count: {count + 1}</p>  {/* 算術 */}
+  {items.map(i => <li>{i}</li>)}  {/* 配列 */}
+  {cond && <span>shown</span>}  {/* 条件付きレンダ */}
+</div>
+```
+
+`{...}` の中は **JavaScript 式なら何でも書けます**。
+- 値を読む: `{user.name}`
+- 計算する: `{a + b}`
+- 関数呼び出し: `{format(date)}`
+- map / filter: `{items.map(...)}`
+- 三項演算子: `{cond ? <A /> : <B />}`
+- 短絡評価: `{cond && <Foo />}`
+
+ただし **文 (statement) は書けない**:
+
+```tsx
+{if (x) <A /> else <B />}    // ❌ if は文
+{cond ? <A /> : <B />}        // ✅ 三項演算子は式
+{(() => { if (x) return <A />; return <B /> })()}  // ✅ IIFE で式化
+```
+
+## ルール 3: 属性は props になる
+
+```tsx
+<input type="text" disabled />
+```
+
+これは:
+
+```ts
+createElement('input', { type: 'text', disabled: true })
+```
+
+ポイント:
+- 文字列リテラル: `type="text"` → `type: 'text'` (string)
+- 中括弧: `value={x}` → `value: x` (式の評価結果)
+- 真偽値ショート: `disabled` → `disabled: true`
+- スプレッド: `<input {...props} />` → `createElement('input', { ...props })`
+
+## ルール 4: children は可変長引数
+
+```tsx
+<div>
+  <h1>Title</h1>
+  <p>Body</p>
+</div>
+```
+
+これは:
+
+```ts
+createElement('div', null,
+  createElement('h1', null, 'Title'),
+  createElement('p', null, 'Body'),
+)
+```
+
+`createElement` の **3 つ目以降の引数** がすべて children として扱われます。
+本書 chibireact の `createElement` は rest parameter で受けています:
+
+```ts
+export function createElement(
+  type: string | Function,
+  props: Record<string, unknown> | null,
+  ...children: ChibireactNode[]  // ← ここ
+): ChibireactElement
+```
+
+## Vue (chibivue) との違い
+
+Vue は **テンプレート言語** を持っており、HTML ベースで `v-if` `v-for` `v-bind` などのディレクティブで JS との架け橋を作ります:
+
+```vue
+<template>
+  <div>
+    <p v-if="show">Hello, {{ name }}</p>
+    <li v-for="item in items">{{ item }}</li>
+  </div>
+</template>
+```
+
+これに対し React/JSX は **「JS の中に XML 風 syntax を混ぜる」** アプローチ。
+- Vue: HTML が主、JS が従 (テンプレート内に式を書く)
+- React: JS が主、HTML 風が従 (JS の中に JSX を書く)
+
+どちらも一長一短ですが、JSX のメリットは **「JS の式・制御構造をそのまま使える」** こと。
+- if 文 → 三項演算子で表現
+- for 文 → map で表現
+- ローカル変数で構造を組み立てる
+
+「JSX は JavaScript」という mental model が定着すると、**ライブラリの高度な活用** や **TypeScript の型推論** が圧倒的に楽になります。
+
+## ちょっと深掘り
+
+### JSX は React 専用ではない
+
+JSX は **React のための文法ではなく、汎用の syntax 拡張**。
+- Preact は React 互換 API なので同じ JSX が使える
+- Vue 3 でも `@vue/babel-plugin-jsx` で JSX が書ける（少数派）
+- Solid.js は独自の JSX runtime
+- Inferno, Mithril, ... など複数のライブラリが JSX を採用
+
+「JSX = React」ではなく、「JSX という構文を解釈する `pragma` (= 何の関数に変換するか) を指定できる」と考えるのが正確。
+
+### 「pragma」とは
+
+各ファイルの先頭に書ける指定:
+
+```tsx
+/** @jsx myCreateElement */
+
+const x = <h1>Hi</h1>  // → myCreateElement('h1', null, 'Hi')
+```
+
+`@jsx myCreateElement` で「createElement の代わりに myCreateElement に変換しろ」と指示できます。
+本書 chibireact なら `/** @jsx createElement */` か、Babel の設定で:
+
+```json
+{
+  "plugins": [["@babel/plugin-transform-react-jsx", { "pragma": "createElement" }]]
+}
+```
+
+これで JSX が `createElement` 呼び出しに変換されます。
+
+### React 17 から「automatic runtime」が標準に
+
+長らく JSX は `React.createElement` に変換されていましたが、React 17 から **automatic runtime** が導入され:
+
+```tsx
+// 開発者の書くコード
+const x = <h1>Hi</h1>
+
+// 旧 (classic): React のインポートが必須
+import React from 'react'  // ← 使ってないように見えても必要
+const x = React.createElement('h1', null, 'Hi')
+
+// 新 (automatic): 自動で runtime をインポート
+import { jsx as _jsx } from 'react/jsx-runtime'  // コンパイラが自動挿入
+const x = _jsx('h1', { children: 'Hi' })
+```
+
+利点:
+- ファイルの先頭で `import React` を書かなくて良い
+- bundle サイズがわずかに減る (createElement より jsx の方が軽い)
+
+詳細は Part 4.3 で。
+
+### TypeScript の `.tsx` 拡張子
+
+TypeScript の `.tsx` 拡張子は **「このファイルは JSX を含むよ」** を意味します。
+`.ts` だと `<T>` がジェネリクスとして解釈されますが、`.tsx` だと `<Foo>` が JSX 開始タグ扱いに。
+そのため `.tsx` ではジェネリクスを `<T,>` (trailing comma) で書く必要があります:
+
+```ts
+// .ts
+function id<T>(x: T): T { return x }
+
+// .tsx — trailing comma が必要
+function id<T,>(x: T): T { return x }
+```
+
+これは TypeScript 固有の事情で、本書 chibireact の各テストは `.ts` (JSX 不使用、createElement 直書き) なので影響を受けていません。
+
+## まとめ
+
+- JSX は **JavaScript の式** であり、HTML 文字列ではない
+- 大文字始まり = 変数参照 (component)、小文字始まり = HTML タグ
+- 中括弧 `{...}` の中は任意の JS 式
+- 属性 → props、子要素 → 可変長引数
+- ビルド時に Babel/SWC/TSC が `createElement` 呼び出しに変換する
+- 次章から「変換の中身」を実装で見ていく
+
+## 次の章へ
+
+[classic runtime — JSX → createElement 変換](./020-classic-runtime) で、React 17 以前から使われている **classic runtime** を実装ベースで見ます。
