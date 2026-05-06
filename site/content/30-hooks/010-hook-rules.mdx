@@ -1,0 +1,224 @@
+---
+title: Hook の前提知識 — なぜルールが必要か
+description: 関数コンポーネントに状態を持たせる仕組み (Hooks) と、その「使い方の制約」が実装側の事情から来る理由を整理します
+---
+
+# Hook の前提知識 — なぜルールが必要か
+
+Part 3 へようこそ。ここから React の **主役機能** である Hooks を本格的に作ります。
+最初の章はコード変更ゼロの **概念整理** です。
+
+なぜわざわざ概念章から入るのか？ それは **「Hook ルール」** という存在を理解しないと、useState 1 つの実装すら危うくなるからです。
+
+## この章のゴール
+
+- React 公式が言う **Rules of Hooks** を 2 行で説明できる
+- ルールの背景にある **「実装の都合」** が分かる
+- Part 1.9 で書いた useState がなぜ脆いか、構造的に説明できる
+- Part 3 の各章で何を作っていくかが見える
+
+> 章末に動くもの: なし（実装ゼロ）。
+
+前章: [Part 2.7 Commit phase の最適化と createRoot の Fiber 統合](../20-fiber/070-commit)
+
+## Hook とは
+
+> Hook = **関数コンポーネントに React の機能（state / 副作用 / context …）を「フックする」関数**
+
+Class コンポーネントでは:
+
+```tsx
+class Counter extends React.Component {
+  state = { count: 0 }
+  componentDidMount() { /* 副作用 */ }
+  render() { return <button onClick={...}>{this.state.count}</button> }
+}
+```
+
+このクラスはたくさんの仕事を抱えています: state, ライフサイクル, render。
+**関数コンポーネント** はもともと「props を受け取り JSX を返すだけ」だったので、これらの仕事を持てませんでした。
+
+Hooks (React 16.8, 2019) は関数コンポーネントに **同じ機能を取り戻す** ために導入されました:
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0)
+  useEffect(() => { /* 副作用 */ })
+  return <button onClick={...}>{count}</button>
+}
+```
+
+クラスを使わなくて良いだけでなく、**ロジックの再利用** (custom hook) や **関心の分離** が劇的に改善しました。
+
+## Rules of Hooks
+
+React 公式は 2 つだけルールを挙げています:
+
+> 1. **Hooks を呼ぶのはトップレベルだけ** — ループ・条件・ネストした関数の中で呼んではいけない
+> 2. **Hooks を呼ぶのは React 関数の中だけ** — 関数コンポーネント or カスタムフックの中で
+
+特に **(1)** が厳しい:
+
+```tsx
+function App() {
+  const [a, setA] = useState('a')          // ← OK
+  if (someCond) {
+    const [b, setB] = useState('b')        // ← NG (条件分岐の中)
+  }
+  for (const x of xs) useState(x)          // ← NG (ループの中)
+}
+```
+
+なぜこんな制約が要るのか? **実装が「順序」に依存しているから** です。
+
+## なぜ「順序」に依存するのか
+
+Part 1.9 で書いた useState を思い出してください:
+
+```ts
+let _rootHooks: Hook[] = []
+let _index = 0
+
+export function useState<T>(initial: T): [T, Dispatch<T>] {
+  const index = _index++
+  if (_rootHooks[index] === undefined) {
+    _rootHooks[index] = { state: initial }
+  }
+  // ...
+}
+```
+
+`_index++` が表す通り、**「呼ばれた順番」がインデックスになる** 設計です。
+
+```
+1 回目の render:
+  useState(0)  → index=0 → hooks[0] = { state: 0 }
+  useState('') → index=1 → hooks[1] = { state: '' }
+
+2 回目の render (再 render):
+  useState(0)  → index=0 → hooks[0] を読む  ←★ 同じ場所にあるから前回値が取れる
+  useState('') → index=1 → hooks[1] を読む
+```
+
+`_index` が **2 回 render 間で同じ順序** だからこそ動きます。
+ところが if で囲った場合:
+
+```tsx
+function App() {
+  if (cond) useState('a')  // cond=true なら hooks[0]
+  useState('b')            // cond=true なら hooks[1]、false なら hooks[0]
+  //                         ↑ cond の真偽でズレる！
+}
+```
+
+`cond` が `false` から `true` に変わると、`b` の useState が読みに行くインデックスが変わって **前回の値を取り違える**。
+これは React 公式の useState でもまったく同じ問題で、「壊れ方」も同じです。
+
+## React の選択: 「実装を簡単に」を取った
+
+理屈としては「**毎回 hook を「名前」で識別すれば、順序依存しない**」設計も可能でした:
+
+```tsx
+const count = useState('count', 0)  // 仮想的な API
+```
+
+ですがこれは:
+- 名前の重複を防ぐ責任が開発者に行く
+- 各 hook の lookup が O(log n) になる
+- TypeScript で型推論しづらい
+
+React は **「順序ベース」+「ルールでカバー」** を選びました。**「実装の単純さ」と「使い方の制約」のトレードオフ** です。
+
+> dan_abramov 氏の言葉:
+> 「私たちはトレードオフを意図的に選んだ。ルールは厳しいが、実装は劇的に単純になる。lint で機械的に検出できる」
+
+実際 ESLint plugin (`eslint-plugin-react-hooks`) の `rules-of-hooks` ルールが、トップレベル以外での hook 呼び出しを検出します。**ルール違反は機械的に潰せる** のがポイント。
+
+## 本書 chibireact の現状の脆さ
+
+Part 1.9 で書いた useState は **モジュール状態の 1 配列** に依存しています。
+これには 2 つの大きな脆さがあります:
+
+### 脆さ 1: 順序ルール違反でクラッシュ
+React と同じ「条件分岐の中で呼ばない」ルール違反でズレる。これは React 自体と同じなので、本書としては妥当な制約です。
+
+### 脆さ 2: 複数の関数コンポーネントが配列を共有
+```tsx
+function App() {
+  const [a] = useState('a')  // _rootHooks[0]
+  return <Counter />          // ← ここで Counter() の useState は _rootHooks[1] を読む！
+}
+
+function Counter() {
+  const [count] = useState(0) // _rootHooks[1] が 'a' のままなら型がメチャクチャ
+}
+```
+
+これは **本家 React にはない問題** です。本家は「**hook は呼んでいる関数コンポーネントの fiber に紐付く**」ので、別コンポーネント間で混線しません。
+
+本書 chibireact の最小 useState はこの紐付けが無いまま「動くケースに限定して動かす」状態。
+
+## Part 3 でやること
+
+| 章 | 概要 |
+|---|---|
+| **3.1** | この章。なぜルールが要るか |
+| **3.2** | **useState を fiber に紐付け直す** — 脆さ 2 を解決 |
+| 3.3 | useReducer (useState の上位互換) |
+| 3.4 | useEffect (commit 後の副作用) |
+| 3.5 | useLayoutEffect (commit 中の同期副作用) |
+| 3.6 | useContext と Context API |
+| 3.7 | useMemo / useCallback (メモ化) |
+| 3.8 | useRef (ミュータブルな箱) |
+| 3.9 | カスタムフックとロジック再利用 |
+
+## ちょっと深掘り
+
+### Hook を fiber に紐付けるとは
+
+Part 2 で各関数コンポーネントは **1 つの Fiber** で表されることを見ました。
+hook を fiber に紐付けるとは、Fiber 型に `hooks: Hook[]` のフィールドを足し、そのコンポーネントの hook データをそこに置くこと:
+
+```ts
+type Fiber = {
+  // ... existing
+  hooks: Hook[]  // この fiber の useState などのデータ
+}
+```
+
+work loop が関数 fiber を処理するとき:
+1. `currentFiber = fiber` をモジュール状態にセット
+2. `hookIndex = 0` リセット
+3. 関数を呼ぶ
+4. 関数内の `useState` は `currentFiber.hooks[hookIndex++]` を読む
+
+これで複数のコンポーネントが独立した hook データを持てるようになります。
+具体的なコードは次章 3.2 で。
+
+### Why class components didn't have this problem
+
+クラスでは `this.state` がインスタンス変数なので、コンポーネントごとに独立。
+関数コンポーネントは **インスタンスを持たない** ので、external な箱（hook）に頼る必要があります。
+そして「どの関数のどの呼び出し回かを区別する」必要が生まれ、結果として「順序ベース」の設計に至りました。
+
+### React Forget の話 (進行中の研究)
+
+「順序ルールがあるのは認知的な負担」と感じる開発者向けに、Meta は **React Forget** (後の React Compiler) を開発中。
+これは Babel 互換のコンパイラで、自動的に useMemo / useCallback を挿入します。
+`useState` 自体のルールは残りますが、メモ化系は人間が書かなくて良くなる、という方向性。
+
+本書では React Forget は扱いません。陳腐化が早い領域なので、原典を当たってください。
+
+## まとめ
+
+- Hooks は関数コンポーネントに状態と副作用を持たせる仕組み
+- ルール 2 つ: トップレベルでだけ呼ぶ / React 関数内でだけ呼ぶ
+- 「順序ベースの実装」がルールの根っこ。dan は意図的に「単純さ」を取った
+- 本書 chibireact の現状は **モジュール状態 1 配列** で複数コンポーネントが混線
+- **次章で fiber に紐付け直す** ことで脆さを解消する
+
+## 次の章へ
+
+[useState を fiber に紐付け直す](./020-use-state-per-fiber) で、**脆さ 2** を解決します。
+
+ここから Part 3 の実装ラッシュです。
