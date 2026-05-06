@@ -1,0 +1,299 @@
+---
+title: automatic runtime — React 17+ の jsx() 変換
+description: React 17 で導入された新方式。`import React` が要らなくなった理由と、classic との 3 つの違いを実装目線で見ます
+---
+
+# automatic runtime — React 17+ の jsx() 変換
+
+[classic runtime](./020-classic-runtime) で `<div />` → `React.createElement('div', null)` の変換を見ました。
+React 17 (2020) でこれが置き換わり、**automatic runtime** が標準になりました。
+
+新方式の主な改善:
+- `import React from 'react'` を **書かなくて良くなった**
+- bundle が **わずかに小さくなる**
+- 内部で **`jsx` / `jsxs` / `Fragment`** という別 API に変換される
+
+## この章のゴール
+
+- automatic runtime と classic の 3 つの違いを言える
+- `jsx(type, props, key)` の引数仕様を理解する
+- `jsxs` (複数 children 用) と `jsx` (単一 children 用) が分かれている理由が分かる
+- なぜ `import React` 不要になったかを実装目線で説明できる
+
+> 章末に動くもの: なし（仕様の理解）。実装は 4.4 で。
+
+前章: [classic runtime — JSX → createElement 変換](./020-classic-runtime)
+
+## 違い 1: 変換先の関数
+
+### Classic
+
+```tsx
+<div className="x">Hi</div>
+```
+
+↓
+
+```ts
+React.createElement('div', { className: 'x' }, 'Hi')
+```
+
+### Automatic
+
+```tsx
+<div className="x">Hi</div>
+```
+
+↓
+
+```ts
+import { jsx as _jsx } from 'react/jsx-runtime'  // ← 自動挿入
+_jsx('div', { className: 'x', children: 'Hi' })
+```
+
+ポイント:
+- `React.createElement` ではなく `jsx` という別 API
+- `react/jsx-runtime` という専用エントリから import
+- **`import` 文がコンパイラによって自動で追加される** → 開発者は何も書かなくていい
+
+## 違い 2: children の渡し方
+
+### Classic
+
+children は **3 つ目以降の引数** として並ぶ:
+
+```ts
+React.createElement('div', null, child1, child2, child3)
+```
+
+### Automatic
+
+children は **props.children** に入る:
+
+```ts
+_jsx('div', { children: [child1, child2, child3] })
+// または単一なら
+_jsx('div', { children: 'Hi' })
+```
+
+children を props 内に押し込んだことで:
+- 引数の数が **常に 2 (or 3)** で固定
+- 単一 child のときに配列にしないので軽い
+
+## 違い 3: 単一 child と複数 child で関数が変わる
+
+automatic runtime は実は **2 つの関数** に分かれています:
+
+```ts
+import { jsx as _jsx } from 'react/jsx-runtime'    // 単一 child
+import { jsxs as _jsxs } from 'react/jsx-runtime'  // 複数 children
+```
+
+### Single (`jsx`)
+
+```tsx
+<div>Hi</div>
+```
+
+↓
+
+```ts
+_jsx('div', { children: 'Hi' })
+```
+
+### Multiple (`jsxs`)
+
+```tsx
+<div>
+  <h1>A</h1>
+  <p>B</p>
+</div>
+```
+
+↓
+
+```ts
+_jsxs('div', { children: [
+  _jsx('h1', { children: 'A' }),
+  _jsx('p', { children: 'B' }),
+]})
+```
+
+なぜ分けるのか:
+- 単一 child のときは Array を作らずに済むので速い
+- React 内部でも処理を分岐できる（最適化）
+
+## 違い 4: `key` が props と分離
+
+```tsx
+<li key="item-1">Item</li>
+```
+
+### Classic
+
+```ts
+React.createElement('li', { key: 'item-1' }, 'Item')
+// key も props に混ざる
+```
+
+### Automatic
+
+```ts
+_jsx('li', { children: 'Item' }, 'item-1')
+//                                  ↑ key は第 3 引数として独立
+```
+
+key を props から取り出すのは React の昔からの設計（element.key として独立して持つ）。
+automatic runtime ではコンパイラが **明示的に第 3 引数に渡す** 形に変わりました。
+
+本書 chibireact では Part 1.11 で element.key を props から分離する処理を `createElement` 内に書きました。
+automatic runtime ではこれを **コンパイラが事前に分けてくれる** ので、ランタイム側の実装が少し楽になります。
+
+## なぜ `import React` が要らなくなったか
+
+Classic では生成コードに `React.createElement` という識別子が現れたため、`React` がスコープに必要でした:
+
+```ts
+// 開発者が書く
+function App() { return <div /> }
+
+// 変換後
+function App() { return React.createElement('div', null) }
+//                       ↑ ここに React 識別子が必要
+```
+
+Automatic では:
+- 変換時に `import { jsx as _jsx } from 'react/jsx-runtime'` を **コンパイラが自動挿入**
+- 識別子は `_jsx` (アンダースコア prefix で衝突回避)
+- 開発者のコード中に `React` 識別子は出てこない
+
+```ts
+// 開発者が書く
+function App() { return <div /> }
+
+// 変換後
+import { jsx as _jsx } from 'react/jsx-runtime'  // 自動挿入
+function App() { return _jsx('div', {}) }
+```
+
+そのため `import React from 'react'` を書く必要がなくなりました。
+
+## どちらを使えばいいか
+
+**新規プロジェクト → automatic 一択**。
+
+- React 17+ の Vite / Next.js / CRA ではデフォルトで automatic
+- React 16 で運用中のレガシーアプリだけ classic が残る
+- TypeScript の `tsconfig.json` で `"jsx": "react-jsx"` が automatic、`"jsx": "react"` が classic
+
+設定で言うと:
+
+```json
+{
+  "compilerOptions": {
+    "jsx": "react-jsx"  // automatic (推奨)
+    // "jsx": "react"   // classic
+  }
+}
+```
+
+## 本書 chibireact の方針
+
+本書は **classic runtime 互換** を採ります:
+- `createElement(type, props, ...children)` API を提供
+- 学習者にとって「children が可変長引数」という素直な形が分かりやすい
+- 自分で書く Babel プラグイン (4.4) も classic 方式の方が単純
+
+automatic runtime に対応するには:
+- 別エントリ `@chibireact/jsx-runtime` を作って `jsx` / `jsxs` / `Fragment` を export
+- それぞれの内部で createElement に橋渡し
+
+これは興味があれば付録的に取り組める課題ですが、**本書のスコープ外** とします。
+
+## ちょっと深掘り
+
+### `jsx` の内部実装イメージ
+
+本家 React の `jsx` 実装 (簡略):
+
+```ts
+// react/jsx-runtime.js (概念コード)
+function jsx(type, props, key) {
+  // 1. children は props.children として既に入っている
+  // 2. ref と key は props から分離
+  // 3. ReactElement オブジェクトを作る
+  return {
+    $$typeof: REACT_ELEMENT_TYPE,
+    type,
+    key: key !== undefined ? '' + key : null,
+    ref: props.ref ?? null,
+    props,  // children も含む
+  }
+}
+
+const jsxs = jsx  // 中身はほぼ同じ
+```
+
+`jsx` と `jsxs` は **同じ実装**。違いは TypeScript / コンパイラ向けのヒントです。本家でも分けているのは保守性とドキュメント性のため。
+
+### `Fragment` の扱い
+
+```tsx
+<>...</>
+```
+
+automatic runtime では:
+
+```ts
+import { Fragment as _Fragment } from 'react/jsx-runtime'
+_jsxs(_Fragment, { children: [...] })
+```
+
+`Fragment` はただの **シンボル/sentinel オブジェクト**。React 側で「これが Fragment だ」と識別する目印として使います。本書では Fragment を未実装ですが、追加するなら `createElement` で `type === Fragment` のときに children を直接 parent に流す挙動を入れます。
+
+### development build と production build
+
+automatic runtime には実は 2 種類あります:
+- `react/jsx-runtime` (production)
+- `react/jsx-dev-runtime` (development)
+
+開発時には `jsxDEV` が呼ばれて、追加の引数（ファイル名・行番号など）が渡されます。
+これは **DevTools のスタックトレース** や **エラーメッセージ** で使われます。
+production build では minify 時にこれらが削られます。
+
+```ts
+// development
+_jsxDEV('div', { children: 'Hi' }, undefined, false, { fileName: 'App.tsx', lineNumber: 5 }, this)
+
+// production
+_jsx('div', { children: 'Hi' })
+```
+
+本書 chibireact は production 相当のシンプル版のみ扱います。
+
+### `react/jsx-runtime` のエントリポイント問題
+
+`react/jsx-runtime` のような **package の subpath import** は package.json の `exports` フィールドで定義されています:
+
+```json
+{
+  "exports": {
+    ".": "./index.js",
+    "./jsx-runtime": "./jsx-runtime.js",
+    "./jsx-dev-runtime": "./jsx-dev-runtime.js"
+  }
+}
+```
+
+これにより `import { jsx } from 'react/jsx-runtime'` が機能します。本書 chibireact が automatic 対応するなら同じ仕組みで `@chibireact/core/jsx-runtime` を提供することになります。
+
+## まとめ
+
+- automatic runtime は React 17 で導入、`import React` 不要
+- classic との違い 4 つ: 変換先関数 / children を props 内 / 単一/複数で関数分離 / key 独立引数
+- TypeScript 設定: `"jsx": "react-jsx"` で automatic
+- 本書 chibireact は classic 互換で進める（4.4 で実装）
+
+## 次の章へ
+
+[簡単な JSX トランスフォーマを実装する](./040-jsx-transformer) で、JSX → createElement の変換を **自分で実装** します。本物の Babel ではなく、最小限の文字列ベース変換で「コンパイラの中身」を体感します。
