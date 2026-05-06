@@ -1,0 +1,294 @@
+---
+title: Portal
+description: 子要素を DOM ツリー上の別の場所に描画する API。Modal / Tooltip / Toast の典型実装で必須
+---
+
+# Portal
+
+[Error Boundary](./050-error-boundary) で render エラーを境界処理しました。
+本章は **Concurrent Rendering とは少し毛色が違う** 機能、`createPortal` を実装します。
+
+「子要素は **論理的にはここに居る** が、**実 DOM 上は別の場所** に描画したい」という場面のための API です。
+
+## この章のゴール
+
+- Portal の API と用途 (Modal / Tooltip / Toast) が言える
+- 「DOM 階層は別だが React ツリー的には親子」が成立する仕組みが分かる
+- `createPortal(children, container)` の最小実装ができる
+- イベントが React ツリーに沿って伝播することを理解する
+
+> 章末に動くもの: createPortal。テスト 4 個追加で累計 **217/217**。**Part 5 完走** で全 53 章中 47 章 (89%) 到達。
+
+前章: [Error Boundary](./050-error-boundary)
+
+## 何のために要るのか
+
+### Modal の典型問題
+
+```tsx
+function Page() {
+  return (
+    <div className="page" style={{ overflow: 'hidden' }}>
+      <article>
+        <h1>記事タイトル</h1>
+        <Modal>...</Modal>  {/* ← article の中だと overflow:hidden で切れる */}
+      </article>
+    </div>
+  )
+}
+```
+
+Modal を `article` 内に書くと、親の `overflow: hidden` で切れたり、`z-index` の積層に巻き込まれたりします。
+本来 Modal は **画面全体を覆う** ものなので、`document.body` 直下に置きたい。
+
+`createPortal` を使うと:
+
+```tsx
+function Modal({ children }) {
+  return createPortal(
+    <div className="modal">{children}</div>,
+    document.body,  // ← 物理 DOM 上は body 直下に置く
+  )
+}
+```
+
+- React ツリー: Page → article → Modal → div.modal
+- 実 DOM: body > document の最後の子 → div.modal
+
+論理的には親子関係 (props や Context が伝わる) ですが、実 DOM では分離。
+
+## API
+
+```ts
+const portalElement = createPortal(children, container)
+```
+
+戻り値は通常の React 要素風オブジェクトで、JSX/createElement の child として使えます:
+
+```tsx
+<div>
+  <span>normal</span>
+  {createPortal(<span>portal</span>, document.body)}
+</div>
+```
+
+## 実装
+
+### portal.ts
+
+```ts
+export const PORTAL = '__PORTAL__' as const
+
+export function createPortal(
+  children: ChibireactNode,
+  container: HTMLElement,
+): ChibireactElement {
+  return {
+    type: PORTAL,
+    props: { container },
+    children: [children],
+    key: null,
+  }
+}
+```
+
+`type` を sentinel `PORTAL` にし、`props.container` に行き先 DOM を保持。
+`children` は通常の child 配列なので、reconcileChildren が自動で処理。
+
+### work-loop の調整
+
+Portal fiber の **dom = container** にする:
+
+```ts
+// performUnitOfWork 内
+if (fiber.type === PORTAL && fiber.dom === null) {
+  fiber.dom = fiber.props.container as Node
+}
+```
+
+これだけで、Portal の **子の `findClosestDomAncestor` が container を見つける** ようになり、子 DOM は container に append されます。
+
+ただし Portal 自身の DOM (= container) は **既に document に存在する** ので、parent DOM への append は **しない**:
+
+```ts
+// commitWork 内
+if (
+  fiber.effectTag === 'PLACEMENT' &&
+  fiber.dom !== null &&
+  domParent !== null &&
+  fiber.type !== PORTAL  // ← Portal は除外
+) {
+  domParent.appendChild(fiber.dom)
+}
+```
+
+`createDomFromFiber` も Portal をスキップ:
+
+```ts
+function createDomFromFiber(fiber): Node | null {
+  if (fiber.type === HOST_ROOT) return null
+  if (fiber.type === PORTAL) return null  // dom は別途設定済
+  // ...
+}
+```
+
+`commitDeletion` も Portal を特別扱い (container 自体を消さない):
+
+```ts
+function commitDeletion(fiber): void {
+  if (fiber.type === PORTAL) {
+    if (fiber.child !== null) commitDeletion(fiber.child)
+    return
+  }
+  // ... 通常の DOM 削除
+}
+```
+
+## テスト
+
+別 container に描画されることを確認:
+
+```ts
+it('children が portal の container に描画される', () => {
+  const mainContainer = document.createElement('div')
+  const portalContainer = document.createElement('div')
+
+  const App = () => createElement('div', null,
+    createElement('span', null, 'normal'),
+    createPortal(createElement('span', null, 'in-portal'), portalContainer),
+  )
+
+  const root = createRoot(mainContainer)
+  root.render(createElement(App, null))
+
+  // 通常 child は main 内
+  expect(main.children[0].textContent).toBe('normal')
+  // portal child は portalContainer 内
+  expect(portalContainer.firstChild?.textContent).toBe('in-portal')
+  // 通常側に portal child は無い (= 物理 DOM 上は分離)
+  expect(main.children.length).toBe(1)
+})
+```
+
+複数 portal:
+
+```ts
+it('複数の portal を別々の container に向けられる', () => {
+  const c1 = ...
+  const c2 = ...
+  const App = () => createElement('div', null,
+    createPortal(<span>first</span>, c1),
+    createPortal(<span>second</span>, c2),
+  )
+  // c1.firstChild → 'first'
+  // c2.firstChild → 'second'
+})
+```
+
+再 render:
+
+```ts
+it('portal の中身を再 render すると container 内で更新される', () => {
+  // portal の DOM は alternate を使った reconcile で UPDATE される
+  // container 内の DOM identity が保たれる
+})
+```
+
+## ちょっと深掘り
+
+### イベントは React ツリーに沿って伝播する
+
+Portal 配下の DOM は **物理 DOM では別の場所** にありますが、**React の合成イベントは親 React ツリーまで伝わります**:
+
+```tsx
+function Page() {
+  return (
+    <div onClick={() => console.log('Page clicked')}>
+      <Modal>
+        <button>Click me</button>  {/* portal の中 */}
+      </Modal>
+    </div>
+  )
+}
+```
+
+`button` をクリックすると、物理 DOM では body 直下なので Page の onClick はキャッチしないように見えますが、**React は React ツリーで伝播** させるので Page の onClick も発火します。
+
+本書 chibireact では React 合成イベントシステムを実装していないので、この挙動は再現できません。実 DOM のイベントバブリングのみ。実プロジェクトで Modal 内のクリックを Page 内 onClick で受けたいなら、Portal の挙動を理解しておくと便利です。
+
+### Portal は SSR と相性が悪い
+
+Server-side Rendering では document が無いので `createPortal` は使えません。
+- 開発時: SSR は portal をスキップ、クライアント hydration で初めて portal が生える
+- 設計時: portal の中身は SSR で見えないことを前提に作る
+
+本書 chibireact は SSR 未対応なので影響なし。
+
+### Tooltip / Toast の実装パターン
+
+Tooltip の典型実装:
+
+```tsx
+function Tooltip({ targetRef, children }) {
+  const [pos, setPos] = useState(null)
+
+  useLayoutEffect(() => {
+    const rect = targetRef.current.getBoundingClientRect()
+    setPos({ top: rect.bottom + 4, left: rect.left })
+  }, [targetRef])
+
+  if (!pos) return null
+  return createPortal(
+    <div className="tooltip" style={{ position: 'absolute', ...pos }}>
+      {children}
+    </div>,
+    document.body,
+  )
+}
+```
+
+`useLayoutEffect` で位置を測ってから、`createPortal` で `document.body` に描画。
+親要素の z-index や overflow に影響されずに常に最前面に出せます。
+
+### 「Portal は Concurrent じゃない」
+
+タイトルにある「Concurrent Rendering と Suspense」のうち、**Portal は厳密には Concurrent 機能ではありません**:
+- Concurrent: 並行性 / 優先度 / 中断 (5.2-5.4)
+- Error Boundary: render エラー処理 (5.5)
+- Portal: DOM 配置の柔軟性 (本章)
+
+ただし Concurrent と組み合わせて使われる典型機能なので、同じ Part にまとめてあります (本家 React の構成も同じ)。
+
+## まとめ
+
+- `createPortal(children, container)` で子要素を別 DOM に描画
+- 内部実装は **type=PORTAL の sentinel** + work-loop の数行の特別扱い
+- Modal / Tooltip / Toast の根幹技術
+- React の合成イベントは React ツリーに沿うので、論理的な親子関係は保たれる
+
+## Part 5 を振り返って
+
+| 章 | 内容 |
+|---|---|
+| 5.1 | Concurrent Rendering の前提知識（並行 vs 並列、lane モデル）|
+| 5.2 | startTransition と低優先度更新（urgent / transition の 2 段階）|
+| 5.3 | useDeferredValue（値の遅延コピー）|
+| 5.4 | Suspense（Promise throw による境界）|
+| 5.5 | Error Boundary（Error throw による境界）|
+| **5.6** | **Portal（DOM 配置の自由度）** |
+
+chibireact が **「動く React の主要機能ほぼ全て」** を持つに至りました。
+
+## chibireact の現在地（Part 5 完走時点）
+
+```
+Part 0: ✓  Part 1: ✓  Part 2: ✓  Part 3: ✓  Part 4: ✓  Part 5: ✓ ← ここ
+Part 6: ⏳ (Web Application Essentials)
+Part 7: ⏳ (付録)
+```
+
+53 章中 **47 章 (89%) 完了**。残りは **Web Essentials** と **付録** のみ。
+
+## 次の Part へ
+
+[Part 6: Web Application Essentials](../60-web-essentials/010-web-essentials-intro)（執筆中）で、ルーティング・フォーム・リスト最適化・アクセシビリティなど **実 Web アプリで欠かせない要素** を整理します。React 自体には含まれない領域ですが、典型実装パターンを紹介します。
