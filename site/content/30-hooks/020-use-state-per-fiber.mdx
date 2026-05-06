@@ -1,0 +1,288 @@
+---
+title: useState を fiber に紐付け直す
+description: モジュール状態 1 配列で混線していた useState を、Fiber 単位の hooks 配列に置き換えます
+---
+
+# useState を fiber に紐付け直す
+
+[Hook の前提知識](./010-hook-rules) で、Part 1.9 の useState が **複数の関数コンポーネント間で混線する** 問題を見ました。
+
+本章でそれを解消します。各 Fiber に `hooks: Hook[]` を持たせ、useState はそのコンポーネントの fiber のみ書き換えるようにします。**Part 3 で最も短く、最も効くリファクタ** です。
+
+## この章のゴール
+
+- `Fiber` に `hooks` フィールドが追加された理由が言える
+- `setWipFiber` がどう work loop と useState を繋げているかが分かる
+- 複数の関数コンポーネントが独立した state を持つことを確認できる
+- alternate.hooks の **浅いコピー** が再 render 時に setState の値を引き継ぐ仕組みを理解する
+
+> 章末に動くもの: 2 つの Counter が独立して動く。テスト 4 個追加で累計 **132/132**。
+
+前章: [Hook の前提知識 — なぜルールが必要か](./010-hook-rules)
+
+## 何が壊れていたか（Before）
+
+`hooks-state.ts` (Part 1.9) はモジュール変数 1 個に全 hook を詰め込んでいました:
+
+```ts
+// Part 1.9 の実装
+let _rootHooks: Hook[] = []
+let _index = 0
+
+export function useState<T>(initial: T): [T, Dispatch<T>] {
+  const index = _index++
+  if (_rootHooks[index] === undefined) {
+    _rootHooks[index] = { state: initial }
+  }
+  // ...
+}
+```
+
+例えば次のコードは **動かない**:
+
+```tsx
+function App() {
+  return createElement('div', null,
+    createElement(Counter, { id: 'a' }),
+    createElement(Counter, { id: 'b' }),
+  )
+}
+
+function Counter({ id }) {
+  const [count, setCount] = useState(0)
+  // ...
+}
+```
+
+`Counter('a')` が呼ばれると `_index=0` で `_rootHooks[0]` を読む。
+次に `Counter('b')` が呼ばれると `_index=1` で `_rootHooks[1]` を読む。
+つまり **2 つの Counter が同じ配列を共有** していて、1 個目の hook と 2 個目の hook が混ざっています。
+
+## どう直すか（After）
+
+「**hook データを Fiber に紐付ける**」が答えです。
+
+```ts
+type Fiber = {
+  // ... existing
+  hooks: Hook[]  // この fiber 専用の hook 配列
+}
+```
+
+work loop が関数 fiber を処理する直前に **「これからこの fiber の hooks を書き込むよ」** と useState 側に伝えれば、別の fiber の hook と混ざりません。
+
+```
+[fiber A の処理開始]
+  setWipFiber(A)  → wipFiber = A, hookIndex = 0
+  A() を呼ぶ
+    useState(0)  → A.hooks[0] を読み書き
+    useState('') → A.hooks[1] を読み書き
+[fiber B の処理開始]
+  setWipFiber(B)  → wipFiber = B, hookIndex = 0
+  B() を呼ぶ
+    useState(0)  → B.hooks[0] を読み書き
+```
+
+A と B はそれぞれ独立した hooks 配列を持つので、混線しません。
+
+## 実装
+
+### Step 1: Fiber に `hooks` を足す
+
+```ts
+// fiber.ts
+export type Hook<T = unknown> = { state: T }
+
+export type Fiber = {
+  // ... existing
+  hooks: Hook[]
+}
+```
+
+`createFiber` のデフォルトを `hooks: []` に。
+
+### Step 2: hooks-state.ts を per-fiber に
+
+```ts
+// hooks-state.ts (refactored)
+import type { Fiber, Hook } from './fiber'
+
+let wipFiber: Fiber | null = null
+let hookIndex = 0
+let _rerender: (() => void) | null = null
+let _scheduled = false
+
+export function useState<T>(initial: T): [T, Dispatch<T>] {
+  if (wipFiber === null) {
+    throw new Error('useState can only be called inside a function component')
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  if (fiber.hooks[index] === undefined) {
+    fiber.hooks[index] = { state: initial } as Hook
+  }
+  const hook = fiber.hooks[index] as Hook<T>
+
+  const setState: Dispatch<T> = (action) => {
+    const next = typeof action === 'function'
+      ? (action as (prev: T) => T)(hook.state)
+      : action
+    if (Object.is(hook.state, next)) return
+    hook.state = next
+    _scheduleRerender()
+  }
+
+  return [hook.state, setState]
+}
+
+export function setWipFiber(fiber: Fiber): void {
+  wipFiber = fiber
+  hookIndex = 0
+}
+```
+
+ポイント:
+- `_rootHooks` が無くなった。代わりに **fiber.hooks** を使う
+- `setWipFiber` で「いまどの fiber を render 中か」を伝える
+- バッチング (`_scheduleRerender`) は Part 1.10 のままで動く
+
+### Step 3: work-loop.ts を 1 行追加
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  if (typeof fiber.type === 'function') {
+    // 再 render の場合、alternate.hooks を浅くコピーして引き継ぐ
+    fiber.hooks = fiber.alternate ? [...fiber.alternate.hooks] : []
+    setWipFiber(fiber)
+
+    // ... 関数を呼ぶ
+  }
+  // ...
+}
+```
+
+**「`fiber.hooks = [...fiber.alternate.hooks]`」** がキモ。
+- 配列は **新しい配列** だが
+- 中の Hook オブジェクトは **共有** している
+
+つまり Hook 自体は使い回されるので、setState の `hook.state = next` という mutation が次の render でも見えます。
+
+## 浅いコピーで足りる理由
+
+```ts
+// 1 回目 render
+fiber1.hooks = []
+useState(0) → fiber1.hooks[0] = { state: 0 }   // ← Hook オブジェクト H
+
+// setState(1)
+H.state = 1  // ← mutation
+
+// 2 回目 render (alternate = fiber1)
+fiber2.hooks = [...fiber1.hooks]  // [H]   ← 同じ H を参照
+useState(0) → fiber2.hooks[0] が既にあるので、H.state を返す
+            → H.state は 1 (setState で変わった)
+```
+
+「**配列は新しい、Hook 自体は共有**」が成立すれば、setState の値が次回 render に伝わります。
+
+> 補足: 本家 React は per-Hook で linked list を構築しますが、本書では配列で十分。実装の見通しが圧倒的に良くなる。
+
+## テストで動作確認
+
+2 つの Counter が独立であることを直接検証:
+
+```ts
+it('2 つの Counter が独立した state を持つ', async () => {
+  const Counter = ({ id }: { id: string }) => {
+    const [count, setCount] = useState(0)
+    return createElement('button',
+      { onClick: () => setCount(count + 1) },
+      `${id}:${count}`,
+    )
+  }
+
+  const App = () => createElement('div', null,
+    createElement(Counter as Function, { id: 'a' }),
+    createElement(Counter as Function, { id: 'b' }),
+  )
+
+  const root = createRoot(container)
+  root.render(createElement(App, null))
+
+  // A だけ押す
+  buttonA.click()
+  await flushMicrotasks()
+  expect(buttonA.textContent).toBe('a:1')
+  expect(buttonB.textContent).toBe('b:0')   // ★ B は変わらない！
+})
+```
+
+```
+ ✓ tests/hooks-per-fiber.test.ts (4 tests)
+ Test Files  17 passed (17)
+      Tests  132 passed (132)
+```
+
+Part 1.9 のときはここが壊れていました。今は **4 個全部緑**。
+
+## エラー: render 外で useState を呼ぶと throw
+
+副産物として、**render の外で useState を呼ぶ** と明示的に死ぬようになりました:
+
+```ts
+expect(() => useState(0)).toThrow(/render/)
+```
+
+Part 1.9 ではモジュール状態に書き込み、何事もなく動いてしまっていました。
+今は `wipFiber === null` をチェックして throw するので、開発時のミスを早期発見できます。
+
+## ちょっと深掘り
+
+### 本家 React は配列ではなく linked list
+
+本家 React の Fiber は **`memoizedState` という linked list** で hook を持ちます:
+
+```js
+fiber.memoizedState → Hook(useState) → Hook(useEffect) → Hook(useState) → null
+```
+
+各 Hook は `memoizedState` (現在値) と `next` (次の Hook) を持つ。
+linked list の利点:
+- 順序操作が高速 (push: O(1))
+- 中間挿入・削除が ... まあ Hooks のルール上ないが
+
+本書では配列で十分。違いは「内部表現」だけで、**API も振る舞いも同じ**です。
+
+### dispatch (setState) の最新状態問題
+
+setState はクロージャに古い hook を掴むので、`hook.state` を直接 mutate できる設計は **シンプル** です:
+
+```ts
+const setState = (action) => {
+  const next = typeof action === 'function' 
+    ? action(hook.state)  // ← 最新の hook.state が見える
+    : action
+  hook.state = next
+}
+```
+
+ですが本家 React は **キュー** で update を貯めて batch する設計のため、`useState` が `[state, dispatch]` を返すときの dispatch は **「次の値の指示」を queue に入れるだけ** です。本書 chibireact は単純化のため queue を持っていません。
+
+### React Forget による Rules 軽減の話
+
+Part 3.1 でも触れましたが、React Compiler (旧 React Forget) は useMemo / useCallback を自動挿入します。
+useState の **「順序ベースの呼び出し」** ルール自体は変わりません。
+順序が必要な根拠が「fiber.hooks 配列のインデックス」 なので、ここを変えるには大手術が必要です。
+
+## まとめ
+
+- `Fiber.hooks: Hook[]` を追加し、useState を fiber 単位に
+- `setWipFiber` で work loop と useState を繋ぐ
+- `fiber.hooks = [...alternate.hooks]` の浅いコピーで setState 値を引き継ぐ
+- 複数の関数コンポーネントが独立した state を持てるようになった
+- render 外で useState を呼ぶと throw
+
+## 次の章へ
+
+[useReducer の実装](./030-use-reducer) で、useState の上位互換となる useReducer を作ります。useState を内部的に useReducer で再実装する手も学びます。

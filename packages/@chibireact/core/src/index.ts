@@ -1,13 +1,35 @@
 export { createRoot } from './create-root'
 export { createElement } from './create-element'
 export { render } from './render'
-export { useState } from './hooks-state'
+export {
+  useState,
+  useReducer,
+  useEffect,
+  useLayoutEffect,
+  useContext,
+  useMemo,
+  useCallback,
+  useRef,
+} from './hooks-state'
+export { createContext } from './context'
+export type { Context, ContextProvider } from './context'
 export { buildFiberTree, createFiber, TEXT_ELEMENT } from './fiber'
-export { runFiberRoot } from './work-loop'
+export { runFiberRoot, scheduleFiberRoot } from './work-loop'
+export { requestIdleWork } from './scheduler'
+export type { IdleDeadline, IdleWorkCallback } from './scheduler'
 export type { ChibireactElement, ChibireactNode } from './types'
 export type { Root } from './create-root'
-export type { Dispatch, SetStateAction } from './hooks-state'
-export type { Fiber, FiberType } from './fiber'
+export type { Dispatch, SetStateAction, Reducer } from './hooks-state'
+export type {
+  Fiber,
+  FiberType,
+  EffectTag,
+  Hook,
+  StateHook,
+  EffectHook,
+  MemoHook,
+  RefHook,
+} from './fiber'
 export type {
   FunctionComponent,
   FC,

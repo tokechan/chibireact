@@ -1,0 +1,281 @@
+---
+title: カスタムフックとロジック再利用
+description: Part 3 で作った hooks を組み合わせて再利用可能なロジックを作る方法。Part 3 の総まとめ
+---
+
+# カスタムフックとロジック再利用
+
+Part 3 では useState / useReducer / useEffect / useLayoutEffect / useContext / useMemo / useCallback / useRef という 8 つの基本 hooks を作りました。
+
+最後の章は **コードを 1 行も追加しません**。
+これらを組み合わせるだけで **「再利用可能なロジック」** が書ける、という Hooks の最大の魅力を確認します。
+
+## この章のゴール
+
+- カスタムフックの定義とルール (`use` で始まる関数 + 内部で hook を呼ぶ) を理解する
+- よくある custom hook パターンを 4 種類実装できる
+- カスタムフックがどう DRY と関心分離をもたらすかを言える
+- Part 3 までで chibireact がどこまで到達したかを振り返れる
+
+> 章末に動くもの: 2 つの custom hook (`useToggle`, `usePrevious`) のテスト。累計 **177/177**。
+
+前章: [useRef — ミュータブルな箱](./080-use-ref)
+
+## カスタムフックとは
+
+> **`use` で始まる名前の関数で、内部で他の hook を呼ぶもの**
+
+それ以上でも以下でもありません。React の特別な仕組みではなく、**ただの関数** です:
+
+```ts
+function useCounter(initial = 0) {
+  const [count, setCount] = useState(initial)
+  const inc = useCallback(() => setCount(c => c + 1), [])
+  const dec = useCallback(() => setCount(c => c - 1), [])
+  const reset = useCallback(() => setCount(initial), [initial])
+  return { count, inc, dec, reset }
+}
+
+// 使う側
+const { count, inc, dec } = useCounter(10)
+```
+
+複数の hook を呼ぶロジックを 1 つの関数にまとめただけ。
+**`use` で始める**規約に従うことで:
+- ESLint plugin が「これは hook ルールが適用される関数」と認識
+- 他の開発者が「これはコンポーネントから呼ぶ専用」と認識
+- 開発者が hook ルール違反を防げる
+
+## 典型的な custom hooks
+
+### useToggle
+
+最頻出。on/off の状態とトグル関数:
+
+```ts
+function useToggle(initial = false): [boolean, () => void] {
+  const [value, setValue] = useState(initial)
+  const toggle = () => setValue(v => !v)
+  return [value, toggle]
+}
+```
+
+使い方:
+
+```tsx
+function Modal() {
+  const [open, toggle] = useToggle()
+  return (
+    <button onClick={toggle}>
+      {open ? 'close' : 'open'}
+    </button>
+  )
+}
+```
+
+### usePrevious
+
+useEffect + useRef の組み合わせで、前回 render の値を覚える:
+
+```ts
+function usePrevious<T>(value: T): T | undefined {
+  const ref = useRef<T | undefined>(undefined)
+  const prev = ref.current
+  useEffect(() => {
+    ref.current = value  // commit 後に更新 → 次回 render で「前回値」になる
+  })
+  return prev
+}
+```
+
+使い方:
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0)
+  const prevCount = usePrevious(count)
+  return <div>now: {count}, prev: {prevCount}</div>
+}
+```
+
+### useFetch (擬似コード)
+
+```ts
+function useFetch<T>(url: string) {
+  const [data, setData] = useState<T | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<Error | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    fetch(url)
+      .then(r => r.json())
+      .then(json => { if (!cancelled) { setData(json); setLoading(false) } })
+      .catch(e => { if (!cancelled) { setError(e); setLoading(false) } })
+    return () => { cancelled = true }
+  }, [url])
+
+  return { data, loading, error }
+}
+```
+
+使い方:
+
+```tsx
+function Profile({ userId }) {
+  const { data, loading, error } = useFetch(`/api/users/${userId}`)
+  if (loading) return <div>...</div>
+  if (error) return <div>{error.message}</div>
+  return <div>{data.name}</div>
+}
+```
+
+> 本物の useFetch は SWR / TanStack Query のようなライブラリを使うべきですが、概念実証としてはこのくらいシンプル。
+
+### useLocalStorage
+
+state と localStorage を同期:
+
+```ts
+function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
+  const [value, setValue] = useState<T>(() => {
+    const stored = localStorage.getItem(key)
+    return stored ? JSON.parse(stored) : initial
+  })
+  const set = (v: T) => {
+    setValue(v)
+    localStorage.setItem(key, JSON.stringify(v))
+  }
+  return [value, set]
+}
+```
+
+ブラウザを閉じても残る state。
+
+## テストで動かす
+
+`useToggle`:
+
+```ts
+it('複数の useToggle が独立して動く', async () => {
+  const App = () => {
+    const [a, toggleA] = useToggle(false)
+    const [b, toggleB] = useToggle(true)
+    // ... 別々にトグル可能
+  }
+})
+```
+
+`usePrevious`:
+
+```ts
+it('更新後は前回値が読める', async () => {
+  // count: 0 → 1 → 2
+  // 表示: 'undefined/0' → '0/1' → '1/2'
+})
+```
+
+両方とも独立した「再利用可能ロジック」として正しく動きます。
+
+## ちょっと深掘り
+
+### Custom hook はインスタンス化されるわけではない
+
+カスタムフックを 2 箇所で呼んでも、**state が共有されることはありません**:
+
+```tsx
+function App() {
+  const a = useCounter()  // 独立した state
+  const b = useCounter()  // 独立した state
+}
+```
+
+なぜなら hook は **呼び出し fiber に紐付く**（Part 3.2 で実装）から。
+useCounter を呼ぶたびに、wipFiber.hooks の **次のインデックス** に状態が入ります。
+2 つの useCounter は、同じ App fiber の異なるインデックス位置を使っているので独立。
+
+### カスタムフックの命名は重要
+
+```ts
+// ❌ NG: 'use' で始まらない
+function counter() {
+  return useState(0)  // hook を呼んでるのに 'use' なし
+}
+
+// ✅ OK
+function useCounter() {
+  return useState(0)
+}
+```
+
+ESLint plugin の `react-hooks/rules-of-hooks` は **`use` で始まる関数だけ** を hook 扱いします。
+`use` を付け忘れると lint で見落とされ、誤った場所で呼ぶリスクが上がります。
+
+### Custom hook は「ライブラリ」になる
+
+公開された人気の custom hook:
+- [react-use](https://github.com/streamich/react-use) - 200+ の実用 hook 集
+- [usehooks-ts](https://usehooks-ts.com/) - TypeScript 対応の hook 集
+
+実プロダクトでは「自前で書く前にライブラリを探す」のが効率的なケースが多い。
+
+### Custom hooks の「合成」が React の最大の発明
+
+クラスコンポ時代は **継承 (HOC, render props)** で再利用していましたが:
+- HOC: ラップが多重になり「component soup」になる
+- render props: ネストが深くなる
+- mixins (deprecated): 名前衝突しやすい
+
+カスタムフックは **関数の合成** で済むので:
+- ネストが深くならない
+- 名前衝突は普通の関数と同じレベルで解消できる
+- TypeScript の型推論が綺麗に通る
+
+「**hook の合成**」が **2018 年以降の React の主流** になった理由です。
+
+## Part 3 の振り返り
+
+| 章 | 何が動くようになったか |
+|---|---|
+| 3.1 | Hook ルールの根拠を理解 |
+| 3.2 | useState を fiber 単位に → 複数コンポ独立 |
+| 3.3 | useReducer で状態遷移を集約 |
+| 3.4 | useEffect で commit 後の副作用 |
+| 3.5 | useLayoutEffect で sync な副作用 |
+| 3.6 | useContext で prop drilling 回避 |
+| 3.7 | useMemo / useCallback でメモ化 |
+| 3.8 | useRef でミュータブルな箱 |
+| **3.9** | **カスタムフックでロジック再利用** |
+
+chibireact が **「動く React の主要部分」** を持つに至りました。
+Counter / Form / Toggle / Fetch / Theme などの典型コードはほぼ書けます。
+
+## chibireact の現在地（Part 3 完走時点）
+
+```
+Part 0: Getting Started ✓
+Part 1: Minimum Example (Stack reconciler) ✓
+Part 2: Fiber Reconciler ✓
+Part 3: Hooks ✓ ← ここ
+```
+
+残りの本書 Part:
+- Part 4: JSX とビルドツール (5 章)
+- Part 5: Concurrent Rendering と Suspense (6 章)
+- Part 6: Web Application Essentials (5 章)
+- Part 7: 付録 (4 章)
+
+「ここまでで止めても十分動く React」になりました。
+Part 4 以降は **応用・周辺** になります。
+
+## まとめ
+
+- カスタムフック = `use` で始まる関数 + 内部で hook を呼ぶ
+- 4 つの典型パターン: useToggle / usePrevious / useFetch / useLocalStorage
+- 呼び出し fiber に紐付くので **2 箇所で呼んでも独立**
+- 合成可能性が React のクラス時代を超えた決定打
+
+## 次の Part へ
+
+[Part 4: JSX とビルドツール](../40-jsx/010-jsx-intro)（執筆中）で、JSX という DSL の正体と、Babel/SWC が裏で何をしているかを実装します。React の中で **最も「魔法に見えて魔法じゃない」** 部分です。

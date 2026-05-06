@@ -1,0 +1,272 @@
+---
+title: requestIdleCallback と最小スケジューラ
+description: work loop をブラウザのアイドル時間に合わせて中断・再開できる形に進化させます
+---
+
+# requestIdleCallback と最小スケジューラ
+
+[work loop と作業の単位化](./040-work-loop) で `nextUnitOfWork` ポインタによる while ループを作りました。
+この while は **同期的** に最後まで回ります。1 万要素のツリーなら数百 ms 固まります。
+
+本章では同じ while を **「deadline で抜けて、次のアイドル時間に再開する」** 形に書き換えます。Fiber アーキテクチャの中で **「中断・再開」が初めて目に見える** 章です。
+
+## この章のゴール
+
+- `requestIdleCallback` (RIC) の役割と `deadline.timeRemaining()` の意味が言える
+- RIC が無い環境への **setTimeout フォールバック** が書ける
+- `scheduleFiberRoot(element, container)` で「重い tree でも UI が固まらない描画」が動く
+- 同期版 (`runFiberRoot`) と並列に共存させ、API として 2 種類提供する判断ができる
+
+> 章末に動くもの: スケジューラ + 非同期版 work loop。テスト 9 個追加で累計 **112/112**。
+>
+> Part 1 の `render` も Part 2.4 の `runFiberRoot` も従来通り動く。`scheduleFiberRoot` は **第 3 の API** として追加。
+
+前章: [work loop と作業の単位化](./040-work-loop)
+
+## requestIdleCallback とは
+
+ブラウザは **「いま余裕があるかどうか」** を JavaScript に教えてくれます:
+
+```ts
+requestIdleCallback((deadline) => {
+  console.log(deadline.timeRemaining())  // 次フレームまでの残り ms
+  console.log(deadline.didTimeout)       // タイムアウトで強制実行されたか
+})
+```
+
+`deadline.timeRemaining()` がゼロに近づいたら、ブラウザに制御を返すべきタイミング。
+返すと、ブラウザは描画やイベント処理を済ませて、また余裕ができたら callback を呼びます。
+
+```
+[アイドル時間] [余裕5ms] [余裕3ms] [余裕10ms] ...
+   ↓             ↓        ↓        ↓
+   work          work     yield    work
+   1 unit        2 units  時間切れ  3 units 完走
+```
+
+## 最小スケジューラを作る
+
+`packages/@chibireact/core/src/scheduler.ts`:
+
+```ts
+export type IdleDeadline = {
+  timeRemaining: () => number
+  didTimeout: boolean
+}
+
+export type IdleWorkCallback = (deadline: IdleDeadline) => void
+
+export function requestIdleWork(callback: IdleWorkCallback): void {
+  const ric = (globalThis as { requestIdleCallback?: unknown })
+    .requestIdleCallback
+  if (typeof ric === 'function') {
+    ;(ric as (cb: IdleWorkCallback) => number)(callback)
+    return
+  }
+  // フォールバック: setTimeout で「16ms 全部使える」体の deadline を作る。
+  setTimeout(() => {
+    const start = performance.now()
+    callback({
+      timeRemaining: () => Math.max(0, 16 - (performance.now() - start)),
+      didTimeout: false,
+    })
+  }, 0)
+}
+```
+
+ポイント:
+- **グローバル `requestIdleCallback` を都度確認** することで、Safari やテスト環境にも対応
+- フォールバックは `setTimeout` で 16ms 体の deadline を生成 → 「中断する仕組み自体は動く」教育目的に十分
+- `globalThis as { requestIdleCallback?: unknown }` は TypeScript で標準 lib に型がない場合の最小トリック
+
+## work loop に組み込む
+
+`work-loop.ts` に `scheduleFiberRoot` を追加します（既存の `runFiberRoot` はそのまま温存）。
+
+```ts
+import { requestIdleWork, type IdleDeadline } from './scheduler'
+
+let isScheduled = false
+
+export function scheduleFiberRoot(
+  element: ChibireactNode,
+  container: HTMLElement,
+): void {
+  const root = createFiber(HOST_ROOT, {}, null)
+  root.dom = container
+  root.pendingChildren = [element]
+
+  nextUnitOfWork = root
+  if (!isScheduled) {
+    isScheduled = true
+    requestIdleWork(workLoopStep)
+  }
+}
+
+function workLoopStep(deadline: IdleDeadline): void {
+  let shouldYield = false
+  while (nextUnitOfWork !== null && !shouldYield) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+    shouldYield = deadline.timeRemaining() < 1
+  }
+  if (nextUnitOfWork !== null) {
+    requestIdleWork(workLoopStep)  // 次のアイドル時間で再開
+  } else {
+    isScheduled = false
+  }
+}
+```
+
+`performUnitOfWork` は 2.4 と全く同じものを使います。
+**変わったのは「呼び出し方」だけ**: `while (nextUnitOfWork) ...` という `runFiberRoot` の同期ループに対し、`workLoopStep` は **deadline チェック付きの中断可能ループ**。
+
+## 同期版 vs スケジューラ版
+
+| | `runFiberRoot` (2.4) | `scheduleFiberRoot` (2.5) |
+|---|---|---|
+| ループ方式 | 同期 while | RIC + 中断可能 while |
+| 実行タイミング | 呼び出し直後に最後まで | アイドル時間に少しずつ |
+| 大きい tree への耐性 | UI が固まる | UI が固まらない |
+| テスト | 同期で完結 | microtask / setTimeout を flush |
+| 適した用途 | 教育 / 単純なケース | 本番想定 |
+
+両方残しておくのは pedagogical な理由から:
+- 「同期版があるから比較できる」
+- 「同じ `performUnitOfWork` を使う = 中断可能性が後付けで足せた」と分かる
+
+## テストを書く（TDD）
+
+jsdom には `requestIdleCallback` がないので、テストでは **polyfill を仕込んで** RIC 経由分岐を通します。これで deadline を完全にテスト側で支配できます。
+
+```ts
+// 「いつでも 50ms 余裕がある」体の polyfill
+function installRicWithUnlimitedTime(): void {
+  globalThis.requestIdleCallback = (cb) => {
+    queueMicrotask(() =>
+      cb({ timeRemaining: () => 50, didTimeout: false }),
+    )
+    return 0
+  }
+}
+```
+
+```ts
+it('単純な要素が描画される', async () => {
+  installRicWithUnlimitedTime()
+  scheduleFiberRoot(createElement('h1', null, 'Hello'), container)
+
+  expect(container.firstChild).toBeNull()  // 非同期なので即時には描画されない
+  await flushScheduledWork()
+
+  expect(container.firstChild?.textContent).toBe('Hello')
+})
+```
+
+「**呼び出し直後は空、microtask が流れた後に描画される**」のが同期版との最大の違いです。
+
+中断挙動も検証:
+
+```ts
+function installRicYieldingEvery(unitsPerCallback: number) {
+  let callCount = 0
+  globalThis.requestIdleCallback = (cb) => {
+    callCount++
+    queueMicrotask(() => {
+      let remaining = unitsPerCallback
+      cb({
+        timeRemaining: () => (remaining-- > 0 ? 10 : 0),
+        didTimeout: false,
+      })
+    })
+    return 0
+  }
+  return { ricCallCount: () => callCount }
+}
+
+it('deadline が切れると複数回 RIC が呼ばれる', async () => {
+  const { ricCallCount } = installRicYieldingEvery(1)  // 1 unit ごとに yield
+  scheduleFiberRoot(<3 個の li を持つ ul>, container)
+  await flushScheduledWork()
+
+  expect(ricCallCount()).toBeGreaterThan(1)  // 連鎖的に複数回呼ばれる
+})
+```
+
+## テストを通す
+
+```
+ ✓ tests/scheduler.test.ts (3 tests)
+ ✓ tests/work-loop-scheduler.test.ts (6 tests)
+ Test Files  14 passed (14)
+      Tests  112 passed (112)
+```
+
+9 テスト追加して全部緑。
+
+## まだやっていないこと
+
+| 機能 | 状態 |
+|---|---|
+| 前回ツリーとの diff (reconciliation) | ❌（次章 2.6: 二重バッファ） |
+| commit phase 分離 | ❌（2.7: 副作用フラグと一気 append） |
+| 優先度付き更新 (lane) | ❌（Part 5: Concurrent Rendering） |
+| 入力中の高優先度割り込み | ❌（同上） |
+
+今のスケジューラは **「アイドル時間に少しずつ」** だけで、優先度の概念がありません。
+本家 React 18 は **lane** という優先度付きの仕組みで「ユーザー入力 > Suspense > startTransition」のような順序付けを実現しています。
+
+## ちょっと深掘り
+
+### `requestIdleCallback` を Safari は使えない
+
+2026 年現在も Safari は RIC を実装していません。本家 React も同じ問題に直面し、**`MessageChannel` をベースにした独自スケジューラ** (Scheduler パッケージ) を採用しています。
+
+`MessageChannel` を使うとマクロタスク粒度で yield できるので、setTimeout より精度が高い。本書 chibireact は教育目的のため最小化し、ブラウザ差は setTimeout フォールバックで吸収します。
+
+> 興味があれば本家の [`packages/scheduler/src/forks/SchedulerDOM.js`](https://github.com/facebook/react/blob/main/packages/scheduler/src/forks/SchedulerDOM.js) を読んでください。**500 行近い独自スケジューラ** が本気の実装の規模感です。
+
+### なぜ「16ms 余裕」と決め打ちするのか
+
+setTimeout フォールバックは「16ms 全部使える」体の deadline を返します。これはブラウザのフレーム予算 (60fps の 1/60 秒 ≈ 16.67ms) を雑に近似したもの。
+
+本物の RIC は「次のフレームまでの残り時間」を正確に返しますが、フォールバックではその情報がないので、楽観的に 16ms と決め打ちします。**過大評価** することで、ブラウザに余計な yield をさせずに済む側に倒しています。
+
+### `isScheduled` フラグの意味
+
+`scheduleFiberRoot` を連続で呼ばれると RIC が **複数並列** に走り、同じ tree を 2 回処理してしまう恐れがあります。それを防ぐために:
+
+```ts
+if (!isScheduled) {
+  isScheduled = true
+  requestIdleWork(workLoopStep)
+}
+```
+
+すでに走っている場合、`nextUnitOfWork` を上書きするだけで RIC は再要求しません。
+動いている work loop が次の tick で **新しい root** を処理します。
+
+これは **2.6 で setState からの再描画** を実装するときに重要になります。
+
+### Part 1 の useState のバッチング (queueMicrotask) との関係
+
+Part 1.10 では `queueMicrotask` で setState をバッチングしました。
+2.5 のスケジューラはより一般的な仕組みで、**ユーザーコードの setState** からも **大きな描画作業** からも yield できます。
+
+Part 2.7 で `createRoot` を Fiber 版に差し替えた後は、useState の再描画もこの RIC スケジューラに乗せられます。
+
+## まとめ
+
+- `requestIdleCallback` で「ブラウザの余裕がある時だけ」work loop を進める形にした
+- `deadline.timeRemaining() < 1` を yield 条件にし、残作業があれば再 RIC
+- `scheduleFiberRoot` を `runFiberRoot` と並列で追加し、API 切り替えを段階的に
+- jsdom には RIC が無いので **テスト側で polyfill** して deadline を支配
+- まだ「diff」も「commit phase 分離」も無い。次章へ
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/20-fiber/050-scheduler.mdx site/content/20-fiber/_meta.js
+git commit -m "feat(part2): 2.5 requestIdleCallback と最小スケジューラ"
+```
+
+→ 次の章: [二重バッファ — current ツリーと workInProgress](./060-double-buffer)

@@ -59,6 +59,62 @@ export const TEXT_ELEMENT = '__TEXT_ELEMENT__' as const
 
 export type FiberType = string | Function | typeof TEXT_ELEMENT
 
+/**
+ * commit 時に何の操作を行うかを表すフラグ (Part 2.6)。
+ * - PLACEMENT: 新規 Fiber → 親 DOM に append する
+ * - UPDATE   : 前回と同じ type → DOM を再利用し、props のみ更新する
+ * - DELETION : 前回あったが今回無くなった → 親 DOM から removeChild する
+ */
+export type EffectTag = 'PLACEMENT' | 'UPDATE' | 'DELETION'
+
+/** useState 系の hook 1 つ分の箱 (Part 3.2)。 */
+export type StateHook<T = unknown> = { kind: 'state'; state: T }
+
+/**
+ * useEffect / useLayoutEffect 系の hook 1 つ分の箱 (Part 3.4 / 3.5)。
+ *
+ * `tag` で実行タイミングを区別する:
+ *   - 'layout': commit 直後に同期実行 (本家 useLayoutEffect 相当)
+ *   - 'passive': commit 後に同期実行 (本書 chibireact では sync。本家は async)
+ *
+ * 本書では両方とも sync 実行だが、tag を分けておくと:
+ *   - layout だけ走らせる / passive だけ走らせる、の選択肢が将来作れる
+ *   - 「今は同じだが概念は別」と読者に伝わる
+ */
+export type EffectTag2 = 'passive' | 'layout'
+
+export type EffectHook = {
+  kind: 'effect'
+  tag: EffectTag2
+  /** 副作用本体。返値が cleanup 関数。 */
+  effect: () => void | (() => void)
+  /** 前回 effect が返した cleanup。次回 effect の前と削除時に呼ぶ。 */
+  cleanup?: () => void
+  /** 依存配列。undefined なら毎 commit 後に走る。 */
+  deps?: readonly unknown[]
+  /** 次の commit phase 後に effect を走らせるべきかのフラグ。 */
+  pendingCommit: boolean
+}
+
+/** useMemo / useCallback 系の hook 1 つ分の箱 (Part 3.7)。 */
+export type MemoHook = {
+  kind: 'memo'
+  /** 直近の factory 実行結果。useCallback の場合は関数そのもの。 */
+  value: unknown
+  /** 依存配列。undefined なら毎 render で factory を再実行。 */
+  deps?: readonly unknown[]
+}
+
+/** useRef 系の hook 1 つ分の箱 (Part 3.8)。 */
+export type RefHook<T = unknown> = {
+  kind: 'ref'
+  /** 中身を mutate しても再 render しない安定した箱。 */
+  ref: { current: T }
+}
+
+/** Fiber.hooks に入る discriminated union (Part 3.2 / 3.4 / 3.7 / 3.8)。 */
+export type Hook = StateHook | EffectHook | MemoHook | RefHook
+
 export type Fiber = {
   type: FiberType
   /** TEXT_ELEMENT の場合、{ nodeValue: string } を持つ */
@@ -83,6 +139,24 @@ export type Fiber = {
    *   - root fiber: [rootElement]
    */
   pendingChildren: readonly ChibireactNode[]
+  /**
+   * 二重バッファ: 前回 commit 済ツリーで対応する Fiber (Part 2.6)。
+   * - 初回 render では null
+   * - 再 render では reconcile 時にセットされ、UPDATE 判定や DOM 再利用に使う
+   */
+  alternate: Fiber | null
+  /**
+   * commit 時に行う操作のフラグ (Part 2.6)。
+   * 未設定なら commit 対象外（root sentinel など）。
+   */
+  effectTag?: EffectTag
+  /**
+   * この fiber に紐付いた hook の配列 (Part 3.2)。
+   * - 関数コンポーネント fiber のみ意味を持つ
+   * - 順序は useState の呼び出し順（Rules of Hooks の根拠）
+   * - 再 render 時は alternate.hooks を浅くコピーしてここに入れる
+   */
+  hooks: Hook[]
 }
 
 /**
@@ -102,6 +176,8 @@ export function createFiber(
     sibling: null,
     dom: null,
     pendingChildren: [],
+    alternate: null,
+    hooks: [],
   }
 }
 

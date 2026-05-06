@@ -1,0 +1,242 @@
+---
+title: useMemo / useCallback とメモ化
+description: 計算結果や関数の参照を再 render 間で保持する仕組みを作ります。子コンポーネントへの不要な再描画を防ぐ実利を得る章
+---
+
+# useMemo / useCallback とメモ化
+
+ここまでの hooks (useState / useReducer / useEffect / useLayoutEffect / useContext) は **動的なデータ管理** が主でした。
+本章は **「同じ計算を 2 回しないため」** のメモ化 hook を作ります。
+
+`useMemo` は値、`useCallback` は関数を再 render 間でキャッシュします。
+内部では useEffect で使った `depsChanged` をそのまま流用するので、実装は短い。
+
+## この章のゴール
+
+- `useMemo(factory, deps)` の API と挙動を説明できる
+- `useCallback(fn, deps)` が `useMemo(() => fn, deps)` の糖衣であることが分かる
+- 「参照同一性」が子コンポーネント最適化に効く理由を理解する
+- 過剰なメモ化のアンチパターンを認識する
+
+> 章末に動くもの: useMemo / useCallback。テスト 9 個追加で累計 **167/167**。
+
+前章: [useContext と Context API](./060-use-context)
+
+## 何のために要るのか
+
+### useMemo: 重い計算をスキップ
+
+```tsx
+function Filtered({ items, query }) {
+  // 毎 render で sort + filter が走る
+  const result = items.filter(i => i.includes(query)).sort()
+  return <List items={result} />
+}
+```
+
+`items` が 1 万件あったら、無関係な setState (例: 別の state 変更) でも sort+filter が走る。
+useMemo で囲うと **deps が変わらない限りスキップ**:
+
+```tsx
+const result = useMemo(
+  () => items.filter(i => i.includes(query)).sort(),
+  [items, query],
+)
+```
+
+### useCallback: 関数参照の安定化
+
+```tsx
+function Parent() {
+  const [n, setN] = useState(0)
+  const handleClick = () => doStuff()  // 毎 render で新しい関数
+
+  return <Child onClick={handleClick} />  // ← Child が毎回 re-render する
+}
+```
+
+`Child` が `React.memo` でラップされていても、`onClick` の参照が毎回違うので props 比較で「変わった」扱いになり、再描画されます。
+useCallback で囲うと参照が固定:
+
+```tsx
+const handleClick = useCallback(() => doStuff(), [])
+// 同じ関数オブジェクトが返り続けるので Child は再描画されない
+```
+
+## 実装: useMemo
+
+```ts
+type MemoHook = {
+  kind: 'memo'
+  value: unknown
+  deps?: readonly unknown[]
+}
+
+export function useMemo<T>(factory: () => T, deps?: readonly unknown[]): T {
+  if (wipFiber === null) throw new Error(...)
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  const oldHook = fiber.hooks[index] as MemoHook | undefined
+  const hasChanged =
+    !oldHook || deps === undefined || depsChanged(oldHook.deps, deps)
+
+  const value = hasChanged ? factory() : oldHook!.value
+  fiber.hooks[index] = { kind: 'memo', value, deps }
+  return value as T
+}
+```
+
+`useEffect` と全く同じ `depsChanged` 比較を流用しています。違うのは:
+- effect は **commit 後に呼ぶ**
+- memo は **render 中にその場で呼ぶ** (戻り値を返す必要があるので)
+
+## 実装: useCallback
+
+```ts
+export function useCallback<F>(fn: F, deps?: readonly unknown[]): F {
+  return useMemo(() => fn, deps)
+}
+```
+
+これだけ。本家 React も内部はほぼ同じです。
+
+## テスト
+
+deps が同じなら factory は呼ばれない:
+
+```ts
+it('factory は初回のみ呼ばれ、deps が同じなら再実行されない', async () => {
+  const factory = vi.fn(() => 100)
+  const App = () => {
+    const [, setOther] = useState(0)
+    const value = useMemo(factory, [])
+    return createElement(
+      'button',
+      { onClick: () => setOther((n) => n + 1) },
+      `${value}`,
+    )
+  }
+
+  // ... click 2 回しても factory は 1 回しか呼ばれない
+  expect(factory).toHaveBeenCalledTimes(1)
+})
+```
+
+参照同一性の確認:
+
+```ts
+it('deps が同じなら同じオブジェクト参照を返す', async () => {
+  const seen: object[] = []
+  const App = () => {
+    const obj = useMemo(() => ({ x: 1 }), [])
+    seen.push(obj)
+    // ...
+  }
+  // 2 回 render → seen[1] === seen[0]
+})
+```
+
+useCallback で関数参照が安定:
+
+```ts
+it('deps が同じなら同じ関数参照を返す', async () => {
+  const seen: Function[] = []
+  const App = () => {
+    const fn = useCallback(() => 'hello', [])
+    seen.push(fn)
+    // ...
+  }
+  // seen[1] === seen[0] === seen[2]
+})
+```
+
+クロージャが正しく更新される:
+
+```ts
+it('deps が変わると新しい関数参照を返す', async () => {
+  const App = () => {
+    const [count, setCount] = useState(0)
+    const fn = useCallback(() => count, [count])
+    // count が変わると fn も新しくなる
+  }
+})
+```
+
+## ちょっと深掘り
+
+### React Forget (React Compiler) との関係
+
+React 公式は **「useMemo / useCallback を手で書くのは将来的にやめてほしい」** と表明しています。
+理由: メモ化の判断は機械的に決まるので、コンパイラが自動挿入できる。**React Forget (現 React Compiler)** がそれです。
+
+将来的には:
+- 開発者は普通の関数として書く
+- ビルド時にコンパイラが必要な箇所に useMemo / useCallback 相当を自動挿入
+
+本書 chibireact では Compiler を作りませんが、「**手書きメモ化は 2 番目の選択肢**」という認識は持っておくと将来の React に備えられます。
+
+### 過剰メモ化のアンチパターン
+
+```tsx
+// ❌ プリミティブのメモ化は無意味
+const x = useMemo(() => count + 1, [count])  // count + 1 は安い
+
+// ❌ 短期実行の関数の useCallback は逆にオーバーヘッド
+const log = useCallback(() => console.log('a'), [])  // 関数生成より useMemo 内部処理の方が重い
+```
+
+メモ化は **本当に重い計算 / 子の React.memo と組み合わせ** のときだけ価値があります。
+雑にどこにでも使うと:
+- メモ化のオーバーヘッド (deps 比較・hook 配列の伸長) が積み重なる
+- コードの読み解きが難しくなる
+- React Forget が来ると不要になる
+
+### `Object.is` の deps 比較は浅い
+
+```tsx
+const obj = { count: 1 }
+useMemo(() => f(obj), [obj])  // obj の参照が同じなら deps 同じ扱い
+```
+
+deps 内のオブジェクトは **参照** で比較されます。中身が同じでも別オブジェクトなら "変わった" 扱い。
+これが原因で「useMemo を入れたのに毎回再計算」になることがあります。
+解決策: deps に入れるオブジェクトもメモ化、またはプリミティブな値で表現する。
+
+### useState との関係
+
+useState の `setState(prev => fn(prev))` 関数型更新は useCallback と相性が良い:
+
+```tsx
+const App = () => {
+  const [n, setN] = useState(0)
+  // setN は React の保証で参照が安定 (本書も保証はしないが事実上安定)
+  // useCallback の中で setN を使うとき deps に入れる必要がない
+  const inc = useCallback(() => setN(prev => prev + 1), [])
+  return ...
+}
+```
+
+setState 関数の参照安定性は本家 React の重要な保証です。本書 chibireact では現在 setState は毎 render で新規生成しているので、厳密には保証されていません。
+
+### useMemo は「render 中に副作用を起こす場所ではない」
+
+```tsx
+// ❌ render 中に外部とやり取りしない
+const data = useMemo(() => fetchSync(url), [url])  // fetch を render 中に呼ぶのは NG
+```
+
+useMemo の factory は **pure function** であるべき。副作用は useEffect / useLayoutEffect。
+このルール違反は本書では検出しませんが、気をつけてください。
+
+## まとめ
+
+- `useMemo(factory, deps)` で計算結果を deps ベースでキャッシュ
+- `useCallback(fn, deps)` は `useMemo(() => fn, deps)` の糖衣
+- 実装は depsChanged の比較とキャッシュ取り出しだけ、共に短い
+- 用途: 重い計算 / 子コンポへの参照固定
+- アンチパターン: プリミティブのメモ化、短期実行関数の useCallback
+
+## 次の章へ
+
+[useRef — ミュータブルな箱](./080-use-ref) で、再 render 間で「参照」を持ち続ける `useRef` を実装します。DOM ノードへのアクセスや、render に影響しない値の保持に使う hook です。

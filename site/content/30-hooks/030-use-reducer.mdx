@@ -1,0 +1,229 @@
+---
+title: useReducer の実装
+description: 状態遷移ロジックを reducer 関数として外出しできる useState の親戚。dispatch(action) で意図を表現します
+---
+
+# useReducer の実装
+
+[useState を fiber に紐付け直す](./020-use-state-per-fiber) で hook の基盤が整いました。
+本章では同じ基盤の上に **`useReducer`** を作ります。
+
+useState の上位互換として **複雑な状態遷移を reducer 関数で表現** したいときに使う hook です。Redux の reducer と同じ発想で、`(state, action) => newState` のシグネチャでロジックを集約できます。
+
+## この章のゴール
+
+- `useReducer(reducer, initial)` の API が書ける
+- useState との違いと使い分けの目安が分かる
+- 同じ fiber-hooks 基盤で実装できることを確認する
+- useState と useReducer を併用できる
+
+> 章末に動くもの: useReducer による Counter (inc/dec) が動く。テスト 5 個追加で累計 **137/137**。
+
+前章: [useState を fiber に紐付け直す](./020-use-state-per-fiber)
+
+## API
+
+```ts
+const [state, dispatch] = useReducer(reducer, initial)
+
+dispatch(action)  // state = reducer(state, action)
+```
+
+例:
+
+```tsx
+type Action = { type: 'inc' } | { type: 'dec' }
+const reducer = (s: number, a: Action) =>
+  a.type === 'inc' ? s + 1 : s - 1
+
+function Counter() {
+  const [count, dispatch] = useReducer(reducer, 0)
+  return (
+    <div>
+      <span>{count}</span>
+      <button onClick={() => dispatch({ type: 'inc' })}>+</button>
+      <button onClick={() => dispatch({ type: 'dec' })}>-</button>
+    </div>
+  )
+}
+```
+
+## useState との違い
+
+|  | `useState` | `useReducer` |
+|---|---|---|
+| 状態更新の表現 | 値を直接渡す or `prev => next` | action を渡し、reducer が解釈 |
+| ロジックの場所 | コンポーネント内に散在しがち | reducer 関数に集約 |
+| 適した用途 | プリミティブ・単純なオブジェクト | 状態遷移が複雑、複数 action がある |
+| typescript との相性 | `T` 1 つ | discriminated union が映える |
+| テスト | コンポーネント単位 | reducer 単体で純関数テスト可能 |
+
+> ベストプラクティス: 「state の取り得る変化が 4 種類超えたら useReducer」「親から子への dispatch を渡したくなったら useReducer」が目安。
+
+## 実装
+
+useState の per-fiber 実装をそのまま流用できます:
+
+```ts
+export type Reducer<S, A> = (state: S, action: A) => S
+
+export function useReducer<S, A>(
+  reducer: Reducer<S, A>,
+  initial: S,
+): [S, (action: A) => void] {
+  if (wipFiber === null) {
+    throw new Error('useReducer can only be called inside a function component')
+  }
+  const fiber = wipFiber
+  const index = hookIndex++
+
+  if (fiber.hooks[index] === undefined) {
+    fiber.hooks[index] = { state: initial }
+  }
+  const hook = fiber.hooks[index] as Hook<S>
+
+  const dispatch = (action: A): void => {
+    const next = reducer(hook.state, action)
+    if (Object.is(hook.state, next)) return
+    hook.state = next
+    _scheduleRerender()
+  }
+
+  return [hook.state, dispatch]
+}
+```
+
+`useState` との違いは **「次の状態の計算を reducer に委譲する」** だけです:
+
+```ts
+// useState
+const next = typeof action === 'function'
+  ? (action as (p: T) => T)(hook.state)
+  : action
+
+// useReducer
+const next = reducer(hook.state, action)
+```
+
+`Object.is(hook.state, next)` の早期 return で同値時の再描画スキップは同じ。
+
+## テスト
+
+useState と併用しても hook index がズレないこと:
+
+```ts
+it('useState と useReducer を同じコンポーネントで併用できる', async () => {
+  const reducer = (s: number, _a: { type: 'inc' }) => s + 1
+
+  const App = () => {
+    const [name, setName] = useState('alice')        // hook[0]
+    const [count, dispatch] = useReducer(reducer, 0) // hook[1]
+    return createElement(
+      'div',
+      {
+        onClick: () => {
+          setName('bob')
+          dispatch({ type: 'inc' })
+        },
+      },
+      `${name}:${count}`,
+    )
+  }
+
+  // ... click → 'bob:1' に変わる
+})
+```
+
+複数の useReducer も独立:
+
+```ts
+it('複数の useReducer を同じコンポーネントで使える', async () => {
+  const reducerA = (s: number, _: { type: 'a' }) => s + 10
+  const reducerB = (s: number, _: { type: 'b' }) => s - 1
+
+  const App = () => {
+    const [a, dispatchA] = useReducer(reducerA, 0)   // hook[0]
+    const [b, dispatchB] = useReducer(reducerB, 100) // hook[1]
+    // ...
+  }
+})
+```
+
+5 テスト全部緑になります。
+
+## ちょっと深掘り
+
+### useState を useReducer で再定義できる
+
+実は useState は useReducer の特殊形と見なせます:
+
+```ts
+// 仮想コード
+function useState<T>(initial: T): [T, Dispatch<T>] {
+  return useReducer(
+    (prev: T, action: SetStateAction<T>): T =>
+      typeof action === 'function'
+        ? (action as (p: T) => T)(prev)
+        : action,
+    initial,
+  )
+}
+```
+
+本書 chibireact では並列に実装しましたが、本家 React は内部的に統一しています（`useState` は `useReducer` を呼ぶ）。
+
+「**useReducer の方が低レベル**」と覚えると、両者の関係がスッキリします。
+
+### dispatch の参照は安定か
+
+本書の dispatch は毎回 render で再生成されます:
+
+```ts
+const dispatch = (action: A) => { /* ... */ }
+return [hook.state, dispatch]
+```
+
+本家 React の dispatch は **render 間で同じ参照** を保つ最適化があります:
+- useEffect の依存配列に dispatch を入れても再実行されない
+- 子コンポーネントへ props として渡しても無駄な再描画を起こさない
+
+本書では Part 3.7 (useMemo / useCallback) で同様の安定化を学べます。今は割り切って毎回新規生成。
+
+### Redux との関係
+
+Redux を知っていれば useReducer はそのまま「コンポーネントローカルな store」と見なせます:
+
+```ts
+// Redux
+store.dispatch(action) → reducer → newState
+
+// useReducer
+dispatch(action) → reducer → newState
+```
+
+違いは **store のスコープ**:
+- Redux: アプリ全体で 1 つの store
+- useReducer: コンポーネントごとに独立
+
+「アプリ全体の状態を 1 箇所に集めたい」なら Redux / Zustand。
+「あるコンポーネントの中だけで状態遷移を整理したい」なら useReducer。
+
+### 「`use` で始まる名前」の意味
+
+React の hook は **`use`** で始まる規約があります。これは:
+- ESLint plugin (`eslint-plugin-react-hooks`) が hook を識別する手がかり
+- 開発者が「これは hook ルールが適用される」と即座に分かる
+
+useState / useReducer / useEffect / useMemo / useCallback / useRef / useContext / 自作の use… 全部この規約。
+
+## まとめ
+
+- `useReducer(reducer, initial)` が `[state, dispatch]` を返す API
+- useState の per-fiber 基盤をそのまま流用、違いは reducer 委譲だけ
+- useState との使い分け: 複雑な状態遷移は useReducer
+- 5 テストで併用パターンも検証
+
+## 次の章へ
+
+[useEffect の実装](./040-use-effect) で、commit 後に副作用を走らせる仕組みを作ります。
+依存配列・cleanup 関数・実行タイミングがテーマです。

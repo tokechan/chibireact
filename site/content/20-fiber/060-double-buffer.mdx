@@ -1,0 +1,369 @@
+---
+title: 二重バッファ — current ツリーと workInProgress
+description: 前回ツリーと比較して最小限の DOM 操作だけを反映する仕組みを作ります。再レンダリングが「速くて壊れない」核心
+---
+
+# 二重バッファ — current ツリーと workInProgress
+
+ここまでで「Fiber を使った初回描画」と「中断・再開」が動きました。
+ですがまだ **再レンダリング** には何の利点もありません。`scheduleFiberRoot` を 2 度目に呼ぶたびに、前回作った DOM をすべて捨てて作り直すだけです。
+
+本章で **二重バッファ** を導入し、Fiber アーキテクチャ最大のご褒美を回収します:
+
+- 同じ type の DOM ノードは **再利用される**
+- 入力 `<input>` の focus / cursor が消えない
+- 子要素の追加・削除が局所的に DOM へ反映される
+
+## この章のゴール
+
+- `current` (前回 commit 済) と `workInProgress` (構築中) の **2 つの Fiber ツリー** の役割が言える
+- `alternate` で 2 ツリーを行き来できる
+- effect tag (`PLACEMENT` / `UPDATE` / `DELETION`) と commit phase の関係が分かる
+- **render phase で DOM を触らない** という規律の意味が分かる
+- 再レンダリングで DOM identity が保たれる動作を確認できる
+
+> 章末に動くもの: 同じ container に `runFiberRoot` を 2 度目以降呼ぶと、type が同じ DOM は再利用される。テスト 9 個追加で累計 **121/121**。
+
+前章: [requestIdleCallback と最小スケジューラ](./050-scheduler)
+
+## なぜ二重バッファなのか
+
+ゲーム機の描画と同じ発想です:
+- **front buffer** (画面に映っている) と **back buffer** (これから描く) の 2 枚を持つ
+- back buffer に絵を描き終えたら、**ぱっと front と入れ替える**
+- 描画途中の半端な絵がユーザーに見えない
+
+React の Fiber も同じ:
+
+```
+[初回 render]
+  wipRoot を作る
+    ↓ render phase: Fiber tree を組む (DOM は触らない)
+    ↓ commit phase: DOM へ一気に反映
+  currentRoot ← wipRoot
+
+[2 回目 render]
+  wipRoot を作り、alternate に currentRoot をリンク
+    ↓ render phase: alternate と比較しながら Fiber tree を組む
+                    type が同じなら DOM 再利用 (UPDATE)
+                    違えば新規 (PLACEMENT)、消えた fiber は DELETION
+    ↓ commit phase: effect tag に従って DOM を最小操作
+  currentRoot ← wipRoot (前の currentRoot は捨てられる)
+```
+
+## render phase と commit phase
+
+これまでの `performUnitOfWork` は **「Fiber を作る」と「DOM に append」を一緒** にやっていました。
+2.6 ではこれを **明確に分離** します:
+
+| Phase | やること | 中断 |
+|---|---|---|
+| **render phase** | Fiber tree を組む、effect tag を付ける | OK (RIC で yield) |
+| **commit phase** | effect tag に従って DOM を変更 | NO (一気にやる) |
+
+> commit phase は中断できません。途中で止まると DOM が半端になります。逆に **render phase は何度中断しても OK** で、最後に commit でまとめて反映する設計です。
+
+## Fiber 型を拡張する
+
+`alternate` と `effectTag` を追加します:
+
+```ts
+export type EffectTag = 'PLACEMENT' | 'UPDATE' | 'DELETION'
+
+export type Fiber = {
+  // ... existing
+  alternate: Fiber | null  // 前回 commit 済ツリーの対応 fiber
+  effectTag?: EffectTag    // commit 時に何をするか
+}
+```
+
+`createFiber` のデフォルトは `alternate: null`、`effectTag` は未設定。
+
+## 実装する: render phase
+
+`work-loop.ts` のモジュール状態を増やします:
+
+```ts
+let nextUnitOfWork: Fiber | null = null
+let wipRoot: Fiber | null = null     // 構築中のツリー
+let currentRoot: Fiber | null = null // 前回 commit 済ツリー
+let deletions: Fiber[] = []          // 今回の commit で削除する fiber
+let isScheduled = false
+```
+
+エントリポイントは `prepareWipRoot` で共通化:
+
+```ts
+function prepareWipRoot(element: ChibireactNode, container: HTMLElement): void {
+  wipRoot = createFiber(HOST_ROOT, {}, null)
+  wipRoot.dom = container
+  wipRoot.pendingChildren = [element]
+  // 同じ container への 2 度目の render なら alternate を引き継ぐ
+  wipRoot.alternate = currentRoot?.dom === container ? currentRoot : null
+  deletions = []
+  nextUnitOfWork = wipRoot
+}
+```
+
+ポイント: **container が変わったら alternate を null にする**。
+別の DOM ツリーに対して diff しても意味がないので、新規ツリーとして扱います。
+
+`performUnitOfWork` から DOM の append を削除:
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  if (typeof fiber.type === 'function') {
+    const componentProps = { ...fiber.props, children: fiber.pendingChildren }
+    const result = (fiber.type as Function)(componentProps)
+    fiber.pendingChildren = [result]
+  }
+
+  // PLACEMENT 用に DOM を作る (まだ append しない)
+  if (fiber.dom === null && fiber.type !== HOST_ROOT && typeof fiber.type !== 'function') {
+    fiber.dom = createDomFromFiber(fiber)
+  }
+
+  // ★ DOM の append は削除！
+  reconcileChildren(fiber, fiber.pendingChildren)
+  return findNextUnit(fiber)
+}
+```
+
+## 実装する: reconcile (alternate 比較)
+
+`reconcileChildren` で alternate.child と新 children を **インデックス順で並走比較** します:
+
+```ts
+function reconcileChildren(wipFiber: Fiber, newChildren: readonly ChibireactNode[]): void {
+  let oldFiber = wipFiber.alternate?.child ?? null
+  let prevSibling: Fiber | null = null
+  let i = 0
+
+  for (const childNode of flatten(newChildren)) {
+    if (skip(childNode)) continue
+
+    const newFiber = reconcileSingleChild(wipFiber, oldFiber, childNode)
+
+    // 旧 fiber は存在するが type 不一致 → DELETION
+    if (oldFiber !== null && newFiber !== null && newFiber.alternate === null) {
+      oldFiber.effectTag = 'DELETION'
+      deletions.push(oldFiber)
+    }
+
+    if (newFiber !== null) {
+      newFiber.parent = wipFiber
+      if (i === 0) wipFiber.child = newFiber
+      else if (prevSibling !== null) prevSibling.sibling = newFiber
+      prevSibling = newFiber
+      i++
+    }
+
+    if (oldFiber !== null) oldFiber = oldFiber.sibling
+  }
+
+  // 余った旧 fiber は全て DELETION
+  while (oldFiber !== null) {
+    oldFiber.effectTag = 'DELETION'
+    deletions.push(oldFiber)
+    oldFiber = oldFiber.sibling
+  }
+}
+```
+
+`reconcileSingleChild` は **type が同じか** で `UPDATE` / `PLACEMENT` を振り分けます:
+
+```ts
+function reconcileSingleChild(_wipFiber, oldFiber, childNode) {
+  // ... text や null は省略
+
+  const sameType = oldFiber !== null && oldFiber.type === childNode.type
+  if (sameType && oldFiber !== null) {
+    const fiber = createFiber(childNode.type, childNode.props, childNode.key ?? null)
+    fiber.dom = oldFiber.dom              // ★ DOM 再利用
+    fiber.alternate = oldFiber
+    fiber.effectTag = 'UPDATE'
+    fiber.pendingChildren = childNode.children
+    return fiber
+  }
+  // 新規
+  const fiber = createFiber(childNode.type, childNode.props, childNode.key ?? null)
+  fiber.effectTag = 'PLACEMENT'
+  fiber.pendingChildren = childNode.children
+  return fiber
+}
+```
+
+> 制限 (2.7 で改善): key を見ない index ベース比較なので、リストの並び替えは効率が悪い。
+
+## 実装する: commit phase
+
+```ts
+function commitRoot(): void {
+  if (wipRoot === null) return
+  // 1. 削除を先に
+  for (const d of deletions) commitDeletion(d)
+  // 2. wipRoot を walk して effect 適用
+  if (wipRoot.child !== null) commitWork(wipRoot.child)
+  // 3. 入れ替え
+  currentRoot = wipRoot
+  wipRoot = null
+  deletions = []
+}
+
+function commitWork(fiber: Fiber | null): void {
+  if (fiber === null) return
+  const domParent = findClosestDomAncestor(fiber)
+  if (fiber.effectTag === 'PLACEMENT' && fiber.dom !== null && domParent !== null) {
+    domParent.appendChild(fiber.dom)
+  } else if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
+    updateDom(fiber.dom, fiber.alternate?.props ?? {}, fiber.props)
+  }
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
+}
+```
+
+`updateDom` は **古いリスナを消して新 props を再適用** する単純戦略:
+
+```ts
+function updateDom(dom, oldProps, newProps) {
+  if (dom.nodeType === Node.TEXT_NODE) {
+    if (oldProps.nodeValue !== newProps.nodeValue) {
+      dom.nodeValue = String(newProps.nodeValue ?? '')
+    }
+    return
+  }
+  // 古いイベントリスナを除去 (多重登録防止)
+  for (const [key, value] of Object.entries(oldProps)) {
+    if (isEventProp(key) && typeof value === 'function') {
+      dom.removeEventListener(getEventName(key), value as EventListener)
+    }
+  }
+  applyProps(dom, newProps)
+}
+```
+
+> 2.7 で **「変わった prop だけ更新」** に最適化します。今は全 prop 再適用。
+
+## テストで動作確認
+
+DOM 識別の保存:
+
+```ts
+it('同じ type の root で再 render すると DOM identity が保たれる', () => {
+  runFiberRoot(createElement('div', { className: 'a' }), container)
+  const first = container.firstChild as HTMLElement
+
+  runFiberRoot(createElement('div', { className: 'b' }), container)
+  const second = container.firstChild as HTMLElement
+
+  expect(second).toBe(first)         // 同じノード
+  expect(second.className).toBe('b') // 中身は更新されている
+})
+```
+
+子の削除:
+
+```ts
+it('子の削除: 余った子は DOM から消える', () => {
+  runFiberRoot(<ul>{['A', 'B', 'C'].map(...)}</ul>, container)
+  expect(ul.children.length).toBe(3)
+
+  runFiberRoot(<ul><li>A</li></ul>, container)
+  expect(ul.children.length).toBe(1)
+})
+```
+
+イベントリスナ多重登録防止:
+
+```ts
+it('イベントハンドラの差し替えで多重登録されない', () => {
+  const first = vi.fn()
+  runFiberRoot(<button onClick={first}>click</button>, container)
+  button.click()
+  expect(first).toHaveBeenCalledTimes(1)
+
+  const second = vi.fn()
+  runFiberRoot(<button onClick={second}>click</button>, container)
+  button.click()
+  expect(first).toHaveBeenCalledTimes(1)  // 増えていない
+  expect(second).toHaveBeenCalledTimes(1)
+})
+```
+
+実行:
+
+```
+ ✓ tests/double-buffer.test.ts (9 tests)
+ Test Files  15 passed (15)
+      Tests  121 passed (121)
+```
+
+## まだやっていないこと（次章 2.7）
+
+| 機能 | 状態 |
+|---|---|
+| 変わった prop だけ更新する最小差分 | ❌（now: 全 prop 再適用）|
+| 古い属性 (key in old, not in new) の削除 | ❌ |
+| key を使ったリスト並び替え対応 | ❌（now: index 比較）|
+| `createRoot` (useState 連動) を Fiber 版に差し替え | ❌（2.7 で）|
+
+## ちょっと深掘り
+
+### 「2 ツリーを行き来する」の絵
+
+```
+   currentRoot          wipRoot
+       │                    │
+       └──── alternate ─────┘
+       │                    │
+      div ←── alternate ──→ div
+       │                    │
+      h1  ←── alternate ──→ h1
+       │                    │
+      "old" ─ alternate ──→ "new"
+```
+
+各 fiber が **左右の対応物を直接ポイント** します。
+これにより「前回はどうだったっけ？」を **O(1) で** 取りに行けます。
+
+### なぜ render phase で DOM を触らないのか
+
+中断可能だからです:
+- render phase の途中で yield → ブラウザが他の仕事をする
+- もし render phase 中に DOM を触っていたら、**半端な状態の DOM がユーザーに見える**
+- React 18 の Concurrent Rendering もこの規律の上に成り立つ
+
+「**Fiber tree を最後まで組み立ててから一気に commit**」が現代 React の出発点。
+
+### key 比較の話 (2.7 への布石)
+
+今回の reconcile は index 比較なので、たとえば `[A, B, C]` → `[C, A, B]` のような並び替えは:
+- index 0: A vs C → type 違う？同じ`<li>`なら sameType=true で UPDATE
+- 結果: 全部 UPDATE 扱い、props だけ書き換え (中身入れ替え)
+
+これは「動くが効率が悪い」最たる例。`key` で同一要素を識別すれば moveBefore 一発で済む。
+本家 React も Part 1.11 の `element.key` の昇格でここに備えています。
+
+### `currentRoot?.dom === container` ガードの意味
+
+複数の container に `runFiberRoot` を呼んだ場合、currentRoot が「別の container 用」だと alternate にしたくありません。
+このガードで「**同じ container への連続レンダのみ diff、別 container は新規扱い**」を実現しています。1 root 前提の最小実装ゆえの暫定処理。本格的な multi-root は 2.7 以降で。
+
+## まとめ
+
+- `wipRoot` (構築中) と `currentRoot` (前回 commit 済) の二重バッファ
+- 各 fiber は `alternate` で **対応物を行き来できる**
+- effect tag (`PLACEMENT` / `UPDATE` / `DELETION`) で commit 時の操作を決める
+- render phase は中断可能だが DOM を触らない、commit phase は一気
+- **DOM identity が保たれる** → focus / scroll / アニメが消えない
+- 子の追加・削除も局所的に反映される
+
+## コミットして次へ
+
+```bash
+git add packages/@chibireact site/content/20-fiber/060-double-buffer.mdx site/content/20-fiber/_meta.js
+git commit -m "feat(part2): 2.6 二重バッファ - current/workInProgress と effect tag"
+```
+
+→ 次の章: [Commit phase の最適化と createRoot の Fiber 統合](./070-commit)
