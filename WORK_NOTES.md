@@ -1,71 +1,66 @@
 # WORK_NOTES: 自律作業ログ
 
-最新更新: 2026-05-06（ラウンド 12: Part 3 完走 ★）
+最新更新: 2026-05-06（ラウンド 13: Part 4 完走 ★）
 実行者: Claude (Opus 4.7)
-ブランチ:
-- `feat/part0-content-and-prep` — Part 2 完走（Part 2.3-2.7、push 済み・PR 済み）
-- `feat/part3-hooks` — Part 3 完走（Part 3.1-3.9、未 push）
+ブランチ: `feat/part4-jsx` (Part 4.1-4.5 を載せた状態、未 push)
 
 ---
 
 ## ⚠️ レビュー時の優先確認事項
 
-1. **Part 3 全 9 章完走**: useState (per-fiber) / useReducer / useEffect / useLayoutEffect / useContext / useMemo / useCallback / useRef + custom hooks
-2. **Hook 型を 4 つの discriminated union に拡張**: StateHook / EffectHook / MemoHook / RefHook。リファクタは段階的（3.4 で union 導入、3.7 で MemoHook 追加、3.8 で RefHook 追加）
-3. **177 テスト全緑**: Part 1 の 84 → Part 2 完走時 128 → Part 3 完走時 177
-4. **未着手で残るもの**: Part 4 (JSX), Part 5 (Concurrent), Part 6 (Web App Essentials), Part 7 (付録)
-5. **Part 3 ブランチは未 push**: ユーザー帰還後に push + Part 2 PR マージ後に rebase 推奨
+1. **Part 4 全 5 章完走**: JSX 概念 → classic runtime → automatic runtime → 自前 tagged template `h` 実装 → TypeScript 型
+2. **`h` 関数 (htm-lite)** が新規実装: 約 200 行の再帰下降パーサで JSX 風 tagged template literal を解釈
+3. **190 → 190 テスト**: Part 4 では 4.4 で `h` 用 13 テスト追加、累計 25 ファイル / 190 テスト
+4. **コード追加箇所**: `packages/@chibireact/core/src/h.ts` のみ。他は本文のみの章
+5. **ブランチ運用**: メモリのルール通り Part 4 用に `feat/part4-jsx` を main から派生
 
 ---
 
-## このセッションでやったこと（ラウンド 12, Part 3 後半）
+## このセッションでやったこと（ラウンド 13）
 
-### Part 3.5 useLayoutEffect — sync な副作用（NEW）
-- `EffectHook` に `tag: 'passive' | 'layout'` を追加
-- `useLayoutEffect` を追加（useEffect とほぼ同形、tag のみ違い）
-- work-loop の commit phase で `runEffects(tag)` を 2 段呼び (layout → passive)
-- 6 テスト pass: mount sync 実行 / deps 再実行 / 順序 / cleanup / unmount / throw
-- 050-use-layout-effect.mdx 執筆
-- 本書では layout / passive 両方とも sync。本家 React の async 差は Part 5 で扱う方針
+### Part 4.1 JSX とは何か（NEW、概念章）
+- JSX = JavaScript 式（HTML 文字列ではない）の説明
+- 大文字始まり (=変数参照) と小文字始まり (=HTML タグ) の使い分け
+- `{...}` 内に JS 式が書けるルール / `{}` の中は文ではなく式
+- ビルド時に Babel/SWC/TSC が createElement に変換する全体像
+- Vue/chibivue のテンプレート方式との比較
 
-### Part 3.6 useContext と Context API（NEW）
-- `context.ts`: `createContext` + `Context` 型 + `Provider` 関数コンポーネント
-  - Provider は children を素通りさせるだけ
-  - 値は fiber.props.value に乗り、useContext がそれを取りに行く
-- `useContext` を hooks-state.ts に追加
-  - wipFiber.parent を遡り、type === context.Provider な祖先を探す
-  - 見つかれば props.value、無ければ defaultValue
-- 7 テスト pass: default / Provider / 深いネスト / 内側優先 / 複数 Context / value 変化伝播 / throw
-- 060-use-context.mdx 執筆
-- bailout 最適化なし（Provider value 変化で子孫全部 re-render する単純実装）
+### Part 4.2 classic runtime — JSX → createElement 変換（NEW、概念章）
+- 6 つの変換ルールを入力 → 出力で対応:
+  - HTML タグ / 関数コンポーネント / 中括弧展開 / 入れ子 / spread props / Fragment
+- なぜ React 16 まで `import React` が必要だったか
+- 練習問題: Counter コンポを手動で createElement に展開
 
-### Part 3.7 useMemo / useCallback とメモ化（NEW）
-- Hook 型に `MemoHook` を追加
-- `useMemo<T>(factory, deps?)` を実装：deps 不変ならキャッシュ、変化したら factory 再実行
-- `useCallback<F>(fn, deps?)` は `useMemo(() => fn, deps)` の糖衣
-- 9 テスト pass: useMemo 5 (caching / deps 変化 / deps 省略 / 参照同一性 / throw) + useCallback 3 (関数参照安定 / 更新 / closure 正常)
-- 070-use-memo-callback.mdx 執筆 (用途解説 / 過剰メモ化アンチパターン / React Forget の話)
+### Part 4.3 automatic runtime — React 17+ の jsx() 変換（NEW、概念章）
+- classic との 4 つの違い: 変換先関数 / children を props 内 / 単一/複数で関数分離 (`jsx`/`jsxs`) / key 独立引数
+- なぜ `import React` が要らなくなったか (コンパイラが自動 import 挿入)
+- TypeScript 設定 `"jsx": "react-jsx"` の意味
+- 本書 chibireact は classic 互換で進める方針を表明
 
-### Part 3.8 useRef — ミュータブルな箱（NEW）
-- Hook 型に `RefHook` を追加
-- `useRef<T>(initial)` を実装：初回 render で `{ current }` を作り、以降同参照
-- `.current` の mutation は再 render を起こさない（setState 呼ばない）
-- 6 テスト pass: 参照同一性 / mutation 保持 / 再 render 起こさない / 複数 useRef / useEffect 内更新 / throw
-- 080-use-ref.mdx 執筆 (DOM ref との違い / 用途表 / forwardRef は本書スコープ外)
-- chibireact の createElement は ref props 自動配線をしないという制限を明示
+### Part 4.4 簡単な JSX トランスフォーマを実装する（NEW、実装章）
+- `packages/@chibireact/core/src/h.ts` 新規実装:
+  - tagged template literal `h\`<div>${val}</div>\`` 形式
+  - 再帰下降パーサで src 文字列を AST 化 → createElement 呼び出しに展開
+  - 値補間に NUL マーカー (``) を使用、values 配列で復元
+  - 対応: HTML タグ / 静的属性 / 補間属性 / 文字列内補間 / 子の補間 / コンポーネント補間 (`<${Foo}>`) / 自閉じ / ネスト
+  - 未対応 (本書スコープ外): spread props / boolean shorthand / Fragment / HTML エンティティ
+- 13 テスト pass (h.test.ts):
+  - HTML タグ基本 (空 / テキスト / 自閉じ / ネスト)
+  - 属性 (静的 / 補間 / 文字列内補間 / 関数)
+  - 子要素補間 (数値 / テキスト混在 / 複数)
+  - コンポーネント補間 (関数型 / props + children 渡し)
+- 040-jsx-transformer.mdx 執筆 (実装解説 / 制限表 / Babel との違い / `h` 命名の歴史)
+- index.ts から `h` を export
 
-### Part 3.9 カスタムフックとロジック再利用（NEW、概念章）
-- 「`use` で始まる名前の関数 + 内部で hook を呼ぶ」というルール解説
-- 典型 custom hook 4 種類:
-  - `useToggle` (useState ベース)
-  - `usePrevious` (useRef + useEffect)
-  - `useFetch` (useState + useEffect、概念実証)
-  - `useLocalStorage` (useState + side effect)
-- デモテストで `useToggle` / `usePrevious` を実装し動作確認 (4 テスト)
-- 090-custom-hooks.mdx 執筆 (Part 3 振り返り + 後続 Part への展望)
-- chibireact の現在地: Part 0-3 完了、Part 4-7 が残り
+### Part 4.5 JSX の TypeScript 型（NEW、概念章）
+- `JSX.Element` / `JSX.IntrinsicElements` / `ElementChildrenAttribute` の役割
+- 大文字 vs 小文字タグでの型推論の違い
+- 本書 jsx-types.ts (Part 1.12 で実装済) の解読
+- カスタムタグ (Web Components) の追加方法
+- `tsconfig.json` の `jsx` オプション解説
+- chibireact で本物の JSX を使う手順 (将来課題)
 
-→ **Part 3 全 9 章完走 (累計 177 テスト)**
+→ **Part 4 全 5 章完走 (累計 25 ファイル / 190 テスト)**
 
 ---
 
@@ -74,56 +69,46 @@
 | 項目 | 結果 |
 |---|---|
 | dev server | 稼働中 (http://localhost:3030) |
-| Part 3 全章 (010, 020, 030, 040, 050, 060, 070, 080, 090) | HTTP 200 |
-| Vitest テスト | **177/177 pass** (24 ファイル) |
+| Part 4 全章 (010 〜 050) | HTTP 200 |
+| Vitest テスト | **190/190 pass** (25 ファイル) |
 | TS typecheck | render.ts の pre-existing エラー 7 件は据え置き、それ以外は緑 |
-| pre-commit hook | 通過済み（メールチェックのみ） |
+| pre-commit hook | 通過予定（メールチェックのみ） |
 
-## コミット履歴
+## コミット履歴 (Part 4 ブランチ、未 push)
 
-### feat/part0-content-and-prep ブランチ (Part 2 完走、push 済)
-push 済み、PR #4 マージ済み
-
-### feat/part3-hooks ブランチ (Part 3 完走、未 push)
 ```
-(latest)
-docs: WORK_NOTES.md ラウンド 12 (Part 3 完走) で更新
-feat(part3): 3.9 カスタムフックとロジック再利用
-feat(part3): 3.8 useRef — ミュータブルな箱
-feat(part3): 3.7 useMemo / useCallback とメモ化
-feat(part3): 3.6 useContext と Context API
-feat(part3): 3.5 useLayoutEffect — sync な副作用
-docs: WORK_NOTES.md ラウンド 11 (Part 2 完走 + Part 3.1-3.4 着手) で更新
-feat(part3): 3.4 useEffect — commit 後の副作用
-feat(part3): 3.3 useReducer の実装
-feat(part3): 3.2 useState を fiber に紐付け直す
-docs(part3): 3.1 Hook の前提知識 (なぜルールが必要か)
+docs: WORK_NOTES.md ラウンド 13 (Part 4 完走) で更新
+docs(part4): 4.5 JSX の TypeScript 型 (Part 4 完走)
+feat(part4): 4.4 簡単な JSX トランスフォーマを実装する
+docs(part4): 4.3 automatic runtime — React 17+ の jsx() 変換
+docs(part4): 4.2 classic runtime — JSX → createElement 変換
+docs(part4): 4.1 JSX とは何か (シンタックスシュガーの正体)
 ```
 
-未 push。ユーザー帰還後に push + Part 2 マージ完了後に main にリベース推奨。
+(これからまとめてコミット予定)
 
 ---
 
-## 累計成果物（Part 3 完走時点）
+## 累計成果物（Part 4 完走時点）
 
 ### コード (`packages/@chibireact/core/`)
 ```
 src/
 ├── types.ts
-├── create-root.ts        (Fiber 版 runFiberRoot 経由)
+├── create-root.ts
 ├── create-element.ts
-├── render.ts             (Part 1 互換のため温存)
-├── hooks-state.ts        (per-fiber, 8 hooks: state/reducer/effect/layoutEffect/context/memo/callback/ref)
-├── jsx-types.ts
-├── fiber.ts              (Hook = StateHook | EffectHook | MemoHook | RefHook)
-├── work-loop.ts          (commit phase 分離 + runEffects(tag))
+├── render.ts
+├── hooks-state.ts
+├── jsx-types.ts          (Part 1.12 から既存)
+├── fiber.ts
+├── work-loop.ts
 ├── scheduler.ts
-├── context.ts            (createContext + Provider)
-└── index.ts              (Hook API + Context を一通り export)
+├── context.ts
+├── h.ts                  (NEW: tagged template literal パーサ)
+└── index.ts              (h を追加 export)
 
-tests/  (24 ファイル / 177 テスト)
-[既存 23 ファイル省略]
-└── custom-hooks.test.ts       (4)  Part 3.9  NEW
+tests/  (25 ファイル / 190 テスト)
+[既存 24 + h.test.ts (13)]
 ```
 
 ### 本文
@@ -131,44 +116,36 @@ tests/  (24 ファイル / 177 テスト)
 00-introduction/  (Part 0: 4 章, 完了)
 10-minimum/       (Part 1: 13 章, 完了)
 20-fiber/         (Part 2: 7 章, 完了)
-30-hooks/         (Part 3: 9 章, 完了 ★)
-  010 Hook の前提知識: なぜルールが必要か
-  020 useState を fiber に紐付け直す
-  030 useReducer の実装
-  040 useEffect — commit 後の副作用
-  050 useLayoutEffect — sync な副作用                NEW (this round)
-  060 useContext と Context API                     NEW
-  070 useMemo / useCallback とメモ化                NEW
-  080 useRef — ミュータブルな箱                       NEW
-  090 カスタムフックとロジック再利用                 NEW
+30-hooks/         (Part 3: 9 章, 完了)
+40-jsx/           (Part 4: 5 章, 完了 ★)
+  010 JSX とは何か（シンタックスシュガーの正体）        NEW
+  020 classic runtime — JSX → createElement 変換   NEW
+  030 automatic runtime — React 17+ の jsx() 変換   NEW
+  040 簡単な JSX トランスフォーマを実装する             NEW
+  050 JSX の TypeScript 型                          NEW
 ```
 
 ---
 
-## Part 3 全体のレビュー観点
+## レビューしてほしいポイント
 
-### A. 学習曲線として綺麗に積み上がっているか
-- 3.1: 概念
-- 3.2: 基盤刷新 (per-fiber)
-- 3.3: useState の上位互換 (useReducer)
-- 3.4-3.5: 副作用 (effect / layout)
-- 3.6: 横断的 (context)
-- 3.7-3.8: 最適化 / 逃げ道 (memo / ref)
-- 3.9: 合成 (custom hook)
+### A. 概念章 3 連 (4.1/4.2/4.3) は実装軽め
+Part 2/3 と違い、コード変更を伴わない概念章が連続。読者が飽きないように:
+- 4.1: 全体像
+- 4.2: classic の具体ルール 6 種
+- 4.3: automatic との比較
+という流れで段差を作った。連続でテンポが落ちないか。
 
-### B. 制限の明示
-本書 chibireact が本家 React と違う点を各章で明示:
-- useEffect は sync (本家は async)
-- Context bailout なし (本家は最適化あり)
-- ref props 自動配線なし (本家は forwardRef あり)
-- key reconciliation なし (本家はあり、本書 Part 5 候補)
-- 複数 root 並存制限あり
+### B. 自前 `h` 関数のスコープ
+htm の教育用ミニ版として実装。約 200 行で Babel と等価ではないが「JSX の本質」は伝わる。
+本物より大幅に劣る点（spread, fragment, エラー回復）を本文で明示してあるが、過小評価に見えないか。
 
-これらが「足りないと不誠実」ではなく「学習目的のための割り切り」として読めるか。
+### C. Part 4.5 で実装ゼロは妥当か
+TypeScript 型は Part 1.12 で既に実装済（jsx-types.ts）なので、4.5 は「読み解き」章。
+本書スコープでは妥当だが、他のパートのバランス上、実装が無いのは寂しいかもしれない。
 
-### C. テスト網羅性
-177 テスト中 Part 3 分は 49 テスト (hooks-per-fiber 4 + use-reducer 5 + use-effect 9 + use-layout-effect 6 + use-context 7 + use-memo-callback 9 + use-ref 6 + custom-hooks 4 + hooks-state 既存 5)。
-本物の React 仕様の主要部分はカバー済。
+### D. Part 5 への布石
+4.5 章末で Part 5 (Concurrent Rendering) に予告。Part 2 の Fiber + scheduler が下地として活きる旨を強調。
 
 ---
 
@@ -176,18 +153,15 @@ tests/  (24 ファイル / 177 テスト)
 
 | # | 内容 | 工数 |
 |---|---|---|
-| **a** | Part 3 ブランチを push、PR 作成 | 1 分 |
-| **b** | Part 4「JSX とビルドツール」(5 章) | 8-15 時間 |
-| **c** | Part 5「Concurrent Rendering と Suspense」(6 章) | 12-20 時間 |
-| **d** | Part 6「Web Application Essentials」(5 章) | 8-12 時間 |
-| **e** | Part 7「付録」(4 章) | 4-8 時間 |
-| **f** | render.ts の TS narrowing 修正 (pre-existing) | 30 分 |
-| **g** | examples/ ディレクトリで動くサンプル整備 | 1-2 時間 |
+| **a** | Part 4 ブランチを push、PR 作成 | 1 分 |
+| **b** | Part 5「Concurrent Rendering と Suspense」(6 章) | 12-20 時間 (本書最難関) |
+| **c** | Part 6「Web Application Essentials」(5 章) | 8-12 時間 |
+| **d** | Part 7「付録」(4 章) | 4-8 時間 |
+| **e** | render.ts の TS narrowing 修正 (pre-existing) | 30 分 |
+| **f** | examples/ ディレクトリで動くサンプル整備 | 1-2 時間 |
 
-**個人的推奨**:
-1. ユーザー帰還後にまず Part 3 ブランチを push
-2. Part 2 PR の状態を確認（マージ済みなら Part 3 を main に rebase）
-3. 一度 push と PR 作成で中間レビュー → 次の Part 4 か examples 整備か判断
+**個人的推奨**: a (push と PR) で中間レビュー → b (Part 5) に着手。
+Part 5 は本書最難関なので、入る前に Part 1-4 の基盤を確実に main に取り込んでおきたい。
 
 ---
 

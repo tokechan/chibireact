@@ -1,0 +1,279 @@
+---
+title: 簡単な JSX トランスフォーマを実装する
+description: tagged template literal でランタイムに JSX 風記法を解釈する `h\`...\`` を作ります。Babel 不要、ビルド不要で動く JSX 風 DSL
+---
+
+# 簡単な JSX トランスフォーマを実装する
+
+[automatic runtime](./030-automatic-runtime) で「コンパイラが JSX を関数呼び出しに変換する」ことを概念で学びました。
+
+本章では **コンパイラを書く代わりに**、**ランタイムで** JSX 風の記法を解釈する `h` 関数を作ります。
+JavaScript の **tagged template literal** を使えば、ビルドツール無しでも JSX 風の DSL が書けます。
+
+```ts
+import { h, createRoot } from '@chibireact/core'
+
+const App = () => h`<div className="box">Hello, ${name}!</div>`
+createRoot(container).render(h`<${App} />`)
+```
+
+これは [`htm`](https://github.com/developit/htm) というライブラリのアイデアそのもの。本章ではその **教育用ミニ版** を実装します。
+
+## この章のゴール
+
+- tagged template literal の基本を理解する
+- JSX 風の文字列を parser で `createElement` 呼び出しに展開できる
+- 13 テストでパース正しさを検証
+- 「Babel が裏でやっていることが、こんなに小さく書けるのか」を実感する
+
+> 章末に動くもの: `h` 関数。テスト 13 個追加で累計 **190/190**。
+
+前章: [automatic runtime — React 17+ の jsx() 変換](./030-automatic-runtime)
+
+## tagged template literal とは
+
+```ts
+function tag(strings, ...values) {
+  // strings: TemplateStringsArray
+  // values:  補間値の配列
+}
+
+const name = 'world'
+tag`Hello, ${name}!`
+// 呼び出し時の引数:
+//   strings = ['Hello, ', '!']
+//   values  = ['world']
+```
+
+`tag\`...\`` の形で関数を呼ぶと、`strings` (静的な文字列の配列) と `values` (補間値) に分解されて渡されます。
+これを使って:
+- `strings` を 1 本の "ソース文字列" に結合
+- 補間位置に **マーカー** を残しておく
+- マーカー位置を `values` で復元
+
+という流れで JSX 風記法をパースできます。
+
+## 設計
+
+```ts
+h`<div className=${cls}>${child}</div>`
+
+// 内部処理:
+// 1. strings と values をマーカー込みで結合:
+//    '<div className=0>1</div>'
+//    ↑  は補間マーカー (NUL の代わりに非印字制御文字)
+// 2. パーサが <div ...></div> 構造を読み取る
+// 3. マーカー N を見つけたら values[N] で置換
+// 4. createElement('div', { className: cls }, child) を返す
+```
+
+## 実装
+
+`packages/@chibireact/core/src/h.ts`:
+
+```ts
+const PLACEHOLDER = ''
+
+export function h(
+  strings: TemplateStringsArray,
+  ...values: unknown[]
+): ChibireactElement {
+  // 1. strings と values をマーカー込みで結合
+  let source = ''
+  for (let i = 0; i < strings.length; i++) {
+    source += strings[i]
+    if (i < values.length) {
+      source += `${PLACEHOLDER}${i}${PLACEHOLDER}`
+    }
+  }
+  // 2. パース
+  const { node } = parseElement(source, 0, values)
+  return node
+}
+```
+
+`parseElement` は **再帰下降パーサ**:
+
+```ts
+function parseElement(src, start, values) {
+  // skip whitespace, expect '<'
+  // read tag name (英数字 or PLACEHOLDER で始まる場合はコンポーネント補間)
+  // resolve type: string or values[N]
+  // read attributes until '>' or '/'
+  // if self-closing → return
+  // else: read children until '</...'
+  //   children = テキスト | 補間値 | 入れ子要素
+  // return createElement(type, props, ...children)
+}
+```
+
+属性の読み取り:
+
+```ts
+function readAttribute(src, start, values) {
+  // identifier の文字を読んで key を作る
+  // '=' を消費
+  // 値: "string" or ${PLACEHOLDER}N${PLACEHOLDER}
+  //   "string" の中に PLACEHOLDER があれば補間して文字列結合
+  //   単独の PLACEHOLDER は値そのもの (型を保つ)
+  return { key, value, end }
+}
+```
+
+完全な実装は実コード [packages/@chibireact/core/src/h.ts](https://github.com/tokechan/chibireact/blob/main/packages/%40chibireact/core/src/h.ts) を参照。約 200 行で抑えています。
+
+## 使い方
+
+### HTML タグ
+
+```ts
+const el = h`<h1 className="title">Hello</h1>`
+// → createElement('h1', { className: 'title' }, 'Hello')
+```
+
+### 値の補間
+
+```ts
+const name = 'world'
+const el = h`<p>Hello, ${name}!</p>`
+// children: ['Hello, ', 'world', '!']
+```
+
+### コンポーネント
+
+```ts
+const Greet = (props) => h`<span>hi, ${props.name}</span>`
+const el = h`<${Greet} name="alice" />`
+// → createElement(Greet, { name: 'alice' })
+```
+
+タグ名の代わりに **`${変数}`** を置くと、その変数が type になります。`<` と `${...}` の間にスペース不要。
+閉じタグも `</${Greet}>` か、もしくは省略して `<${Greet} />` (自閉じ)。
+
+### 入れ子
+
+```ts
+const el = h`
+  <ul>
+    <li>A</li>
+    <li>B</li>
+  </ul>
+`
+```
+
+改行・インデントは whitespace として扱われ、空白だけのテキスト child は無視されます。
+
+## テスト
+
+```ts
+it('テキストと補間の混在', () => {
+  const name = 'world'
+  const el = h`<p>Hello, ${name}!</p>`
+  expect(el.children).toEqual(['Hello, ', 'world', '!'])
+})
+
+it('関数を属性に渡せる (onClick)', () => {
+  const handler = () => 'clicked'
+  const el = h`<button onClick=${handler}>click</button>`
+  expect(el.props.onClick).toBe(handler)
+})
+
+it('コンポーネントに props と children を渡せる', () => {
+  const Wrap = (props) => h`<div>${props.name}: ${props.children}</div>`
+  const el = h`<${Wrap} name="title">contents</${Wrap}>`
+  expect(el.type).toBe(Wrap)
+  expect(el.props.name).toBe('title')
+})
+```
+
+13 テスト全部緑。
+
+## 制限と本物との差
+
+本書の `h` は **教育用ミニ実装** で、以下を割愛しています:
+
+| 機能 | 本書 | 本物の Babel/htm |
+|---|---|---|
+| boolean shorthand `<input disabled />` | 未対応 (true 扱い) | 対応 |
+| spread props `<input ...${props} />` | 未対応 | 対応 |
+| Fragment `<>...</>` | 未対応 | 対応 |
+| HTML エンティティ `&amp;` | 未対応 | 対応 |
+| エラー回復 / 良いエラーメッセージ | 最小限 | 詳細 |
+| 静的最適化 | 無し | あり (Babel は build 時にできる) |
+
+**production で使うなら** [`htm`](https://github.com/developit/htm) (約 600 byte gzip) を使うのがおすすめ。
+本書の `h` は **「中身を理解するための学習用」** と割り切ってください。
+
+## ちょっと深掘り
+
+### Babel プラグインだとどうなるか
+
+本書の `h` は **ランタイム** parser ですが、Babel プラグインは **AST レベル** で動きます:
+
+```ts
+// Babel plugin の skeleton
+export default function ({ types: t }) {
+  return {
+    visitor: {
+      JSXElement(path) {
+        const { openingElement, children } = path.node
+        const name = openingElement.name.name
+        const props = openingElement.attributes.map(...)
+        const newCall = t.callExpression(
+          t.identifier('createElement'),
+          [t.stringLiteral(name), props, ...children],
+        )
+        path.replaceWith(newCall)
+      },
+    },
+  }
+}
+```
+
+ポイント:
+- 入力は **JSXElement という AST ノード**
+- 出力は **CallExpression (関数呼び出しの AST)**
+- 文字列パース不要 (Babel が JSX を AST にしてくれる)
+
+詳細は [Babel handbook](https://github.com/jamiebuilds/babel-handbook) や [astexplorer.net](https://astexplorer.net) で AST を直接見るのが分かりやすいです。
+
+### tagged template literal vs Babel — どっちが優れる？
+
+| 観点 | runtime (`h`) | compile-time (Babel) |
+|---|---|---|
+| ビルド設定 | 不要 | 必要 |
+| 起動時間 | パース分のオーバーヘッド | ゼロ |
+| 静的型 (TS) | string 内なので推論不可 | 完全 |
+| エディタ補完 | なし (string 扱い) | あり |
+| エラーメッセージ | runtime | compile time |
+
+実プロジェクトでは **Babel が圧倒的に優位**。runtime 版は:
+- ビルド設定を持ちたくない小さなデモ
+- 動的に JSX 文字列を生成する必要があるレアケース
+- 教育目的（本書）
+
+### `h` という名前の由来
+
+`h` は [Hyperscript](https://github.com/hyperhype/hyperscript) (2011) という古いライブラリから来ています。
+Hyperscript の API:
+
+```js
+h('div.box', 'Hello')  // <div class="box">Hello</div>
+```
+
+CSS セレクタ風記法が特徴。`h` は "hyperscript" の頭文字。
+React の創始者 Jordan Walke も Hyperscript の影響を受けたと言われており、Vue の virtual DOM ライブラリ `snabbdom` でも `h` が使われています。
+
+つまり `h` は **JS 仮想 DOM 全般の伝統的な名前**。本書 chibireact もそれに倣いました。
+
+## まとめ
+
+- tagged template literal で **ビルドツール無し** に JSX 風記法を実現できる
+- 約 200 行のパーサで 6 ルール (タグ・属性・子・補間・コンポーネント・自閉じ) をカバー
+- production には `htm` ライブラリがある
+- Babel プラグインは AST レベルなので **静的型推論** など利点が大きい
+
+## 次の章へ
+
+[JSX の TypeScript 型](./050-jsx-types) で、JSX が TypeScript と協調する仕組みを見ます。
+`JSX.IntrinsicElements` / `JSX.Element` などの型定義の正体です。

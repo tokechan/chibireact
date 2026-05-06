@@ -1,0 +1,290 @@
+---
+title: JSX の TypeScript 型
+description: TypeScript が JSX を理解する仕組みを解明します。`JSX.IntrinsicElements` / `JSX.Element` / `FC` の正体
+---
+
+# JSX の TypeScript 型
+
+[Part 4.4](./040-jsx-transformer) でランタイムの `h` 関数を作りました。
+本章は **TypeScript が JSX を理解する仕組み** に焦点を当てます。
+
+`<div>` がどうして TypeScript で型エラーにならないのか、`<MyComp />` がどう関数コンポと結びつくのか、`JSX.IntrinsicElements` とは何か。
+本書 chibireact の `jsx-types.ts` ([packages/@chibireact/core/src/jsx-types.ts](https://github.com/tokechan/chibireact/blob/main/packages/%40chibireact/core/src/jsx-types.ts)) を題材に解説します。
+
+## この章のゴール
+
+- TypeScript が `<div>` を OK にしている根拠 (`JSX.IntrinsicElements`) が言える
+- `<MyComp />` の型推論が **`FC<Props>`** を経由する仕組みが分かる
+- `JSX.Element` が「JSX が evaluate された結果の型」であることを理解する
+- 自分のライブラリで JSX 型サポートを足す方法が分かる
+
+> 章末に動くもの: jsx-types.ts (Part 1.12 で既に実装済) の解読。Part 4 完走で累計 **190/190 (新規テストなし)**。
+
+前章: [簡単な JSX トランスフォーマを実装する](./040-jsx-transformer)
+
+## TypeScript が JSX を読むための 3 つの型
+
+TypeScript は **`JSX` というグローバル名前空間** を見て JSX の型を判定します:
+
+```ts
+declare global {
+  namespace JSX {
+    type Element = ...               // JSX 式の評価結果の型
+    interface IntrinsicElements { ... }  // 小文字始まりタグの型
+    interface ElementChildrenAttribute { ... }  // children attribute の名前
+  }
+}
+```
+
+### 1. `JSX.Element`
+
+`<div />` という JSX 式の **評価結果の型**。
+
+```ts
+const x: JSX.Element = <div />  // ← 右辺の型が JSX.Element
+```
+
+本書 chibireact では:
+
+```ts
+type Element = ChibireactElement
+```
+
+つまり「JSX が evaluate されると `ChibireactElement` (= createElement の戻り値) になる」と TypeScript に教えます。
+
+### 2. `JSX.IntrinsicElements`
+
+**小文字始まりタグの props 型** をプロパティ名で引く辞書:
+
+```ts
+interface IntrinsicElements {
+  div: CommonHTMLProps
+  input: CommonHTMLProps & { type?: string; value?: string }
+  // ...
+}
+```
+
+これが定義されているおかげで:
+
+```tsx
+<div className="x">  // OK ('div' が IntrinsicElements にある)
+<foobar />            // ❌ 'foobar' は IntrinsicElements に無い
+<input type="text">   // OK (type は input の props にある)
+<input typo="text">   // ❌ typo は input の props に無い
+```
+
+TypeScript は **`JSX.IntrinsicElements[タグ名]`** を引いて、その型を props として要求します。
+
+### 3. `ElementChildrenAttribute` (省略可)
+
+```ts
+interface ElementChildrenAttribute {
+  children: {}
+}
+```
+
+「children という名前の props にどんな子要素も入る」を宣言。
+本書 chibireact では設定していませんが、デフォルトの挙動で十分動きます。
+
+## 大文字始まりタグの型推論
+
+```tsx
+const Counter: FC<{ initial: number }> = (props) => h`<div>${props.initial}</div>`
+
+<Counter initial={0} />  // OK
+<Counter />              // ❌ initial が必須
+<Counter initial="x" />  // ❌ initial は number
+```
+
+大文字始まりは **変数参照** なので、その変数の型 (`FC<Props>`) を見て:
+- props の必須/任意を判定
+- 不正な props を弾く
+
+`FC<Props>` の定義:
+
+```ts
+export type FC<P = Record<string, never>> = (
+  props: P & { children?: ChibireactNode | ChibireactNode[] },
+) => ChibireactNode
+```
+
+つまり「**Props を受け取って ChibireactNode を返す関数**」。chibireact では `FunctionComponent` のエイリアス。
+
+## 本書 jsx-types.ts を読む
+
+実コード [packages/@chibireact/core/src/jsx-types.ts](https://github.com/tokechan/chibireact/blob/main/packages/%40chibireact/core/src/jsx-types.ts) は約 100 行。順に見ていきます。
+
+### `CommonHTMLProps`
+
+```ts
+export type CommonHTMLProps = {
+  id?: string
+  className?: string
+  style?: Partial<CSSStyleDeclaration> | Record<string, string | number>
+  title?: string
+  // イベント
+  onClick?: (event: MouseEvent) => void
+  onChange?: (event: Event) => void
+  // ARIA / data
+  [key: `data-${string}`]: string | number | boolean | undefined
+  [key: `aria-${string}`]: string | number | boolean | undefined
+  // chibireact 固有
+  key?: string | number | null
+}
+```
+
+ポイント:
+- すべての HTML 要素に共通する props (id / className / style / 一般イベント)
+- **template literal type** で `data-*` `aria-*` 属性を一括許容
+
+```tsx
+<div data-testid="foo" />     // OK
+<div data-anything="x" />      // OK
+<div random-attribute="y" />   // ❌ data- / aria- 以外はエラー
+```
+
+### `IntrinsicElements`
+
+```ts
+declare global {
+  namespace JSX {
+    type Element = ChibireactElement
+    interface IntrinsicElements {
+      h1: CommonHTMLProps
+      div: CommonHTMLProps
+      input: CommonHTMLProps & {
+        type?: string
+        value?: string | number
+        placeholder?: string
+        disabled?: boolean
+      }
+      // ... 他のタグ
+    }
+  }
+}
+```
+
+各 HTML 要素に **個別 props** を加えるのは intersection (`&`) で:
+- 共通: `CommonHTMLProps`
+- input 固有: `type` / `value` / `placeholder` / `disabled`
+
+これにより:
+
+```tsx
+<input type="email" placeholder="email" />   // OK
+<input src="x.png" />                          // ❌ src は input には無い
+<img src="x.png" alt="img" />                  // OK (img の固有 props)
+```
+
+### `declare global` の意味
+
+```ts
+declare global {
+  namespace JSX { ... }
+}
+```
+
+`declare global` は **「このブロックの型をグローバルに公開する」** という TypeScript の構文です。
+本書 chibireact では `index.ts` で `import './jsx-types'` (副作用 import) するだけで、JSX 名前空間がプロジェクト全体に有効になります。
+
+## カスタムタグを許す方法
+
+「Web Components のような独自タグを使いたい」なら:
+
+```ts
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      'my-element': CommonHTMLProps & { customProp?: string }
+    }
+  }
+}
+
+// 使う側
+<my-element customProp="x" />  // OK
+```
+
+`IntrinsicElements` に追加するだけ。逆に「**未知のタグを全部許す**」とゆるくしたい場合:
+
+```ts
+interface IntrinsicElements {
+  [tagName: string]: any  // 何でも許可 (型安全性は犠牲)
+}
+```
+
+## ちょっと深掘り
+
+### React 18 の `JSX.LibraryManagedAttributes`
+
+最新 React の jsx 型はもっと多機能で、`LibraryManagedAttributes` という型で **defaultProps の解釈** や **propTypes の解釈** をします。
+古いクラスコンポでは:
+
+```tsx
+class Counter extends React.Component {
+  static defaultProps = { initial: 0 }
+}
+
+<Counter />  // initial が省略可能になる
+```
+
+これを TypeScript の型で表現するための仕掛け。本書 chibireact では実装していません。
+
+### `JSX` 名前空間と React 17 以降の `react/jsx-runtime`
+
+automatic runtime (4.3) では import が `react/jsx-runtime` になりますが、**型は同じ `JSX.IntrinsicElements`** を見ます。
+つまりランタイムが変わっても、TypeScript の判定ロジックは変わりません。
+
+ただし React 19 以降は **`React.JSX`** という名前空間に移行する流れもあり、グローバルとの併用がややこしくなっています。詳細は [React TypeScript Cheatsheet](https://react-typescript-cheatsheet.netlify.app/) や React 公式ドキュメントを参照。
+
+### `tsconfig.json` の `jsx` オプション
+
+```json
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",       // automatic runtime
+    // "jsx": "react",        // classic runtime
+    // "jsx": "preserve",     // 変換しない (Babel に任せる)
+    // "jsx": "react-native", // RN 用
+    "jsxImportSource": "@chibireact/core"  // automatic 時のソース
+  }
+}
+```
+
+`jsxImportSource` を `@chibireact/core` にすれば、本書ライブラリ用の `jsx-runtime` を作って **本物の JSX が使える** ようになります。これは付録で扱える課題です。
+
+### 実例: chibireact で本物の JSX を使う
+
+将来 chibireact で `<div />` 形式を使うには:
+
+1. `tsconfig.json` で `"jsx": "preserve"` にし、Babel/SWC に任せる (classic 想定なら `"jsx": "react"`)
+2. Vite なら `defineConfig({ esbuild: { jsxFactory: 'createElement', jsxFragment: 'Fragment' } })`
+3. ファイル先頭で `import { createElement } from '@chibireact/core'`
+4. 書く: `<div className="x">Hello</div>`
+
+これで **本物の JSX が chibireact 上で動く** ようになります。本書スコープでは `h` 関数で代用していますが、興味があればトライしてみてください。
+
+## まとめ
+
+- TypeScript は `JSX` グローバル名前空間で JSX 型を判定する
+- `JSX.IntrinsicElements` で **小文字タグの props 型** を定義
+- `JSX.Element` で **JSX 式の評価結果型** を定義
+- 大文字始まりは変数参照、その変数の型 (`FC<Props>`) で判定
+- 本書 chibireact の `jsx-types.ts` は最小限だが本物と同じ仕組み
+
+## Part 4 完走
+
+**Part 4 全 5 章** を踏破しました:
+
+| 章 | 内容 |
+|---|---|
+| 4.1 | JSX とは何か (シンタックスシュガーの正体) |
+| 4.2 | classic runtime — JSX → createElement |
+| 4.3 | automatic runtime — React 17+ の jsx() |
+| 4.4 | tagged template literal で `h` を実装 |
+| 4.5 | TypeScript の JSX 型 |
+
+JSX という **「最も魔法に見えて魔法じゃない」** 部分が解明できました。
+
+## 次の Part へ
+
+[Part 5: Concurrent Rendering と Suspense](../50-concurrent/010-concurrent-intro)（執筆中）で、React 18 の主要機能 startTransition / useDeferredValue / Suspense / Error Boundary / Portal を実装します。Part 2 で作った Fiber + scheduler が下地として活躍する大きな Part です。
