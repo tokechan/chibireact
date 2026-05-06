@@ -1,27 +1,26 @@
+import type { Fiber, Hook } from './fiber'
+
 /**
- * useState の最小実装（Part 1.9）+ バッチング（Part 1.10）。
+ * useState の per-fiber 実装 (Part 3.2)。
  *
- * 設計（暫定）:
- * - **ルートごとに 1 配列の hooks**（_rootHooks）をモジュール状態で持つ
- * - 各 render 開始前に index を 0 にリセット
- * - useState 呼び出しごとに index++ し、対応する箱から状態を読む
- * - setState は新値を保存して、**queueMicrotask で再レンダをバッチング**
+ * 進化の歴史:
+ *   - Part 1.9 : モジュール状態 1 配列に全 hook を詰めていた → 複数の関数コンポで混線
+ *   - Part 1.10: queueMicrotask によるバッチング追加 (これは流用)
+ *   - Part 3.2 : hook を **Fiber 単位** に紐付け、混線を解消
  *
- * バッチング (Part 1.10):
- * - 同じ tick 内で複数 setState を呼んでも、再レンダは 1 回だけ
- * - React 18 の automatic batching 相当の最小実装
+ * 設計:
+ *   - work loop が関数 fiber を処理する直前に `setWipFiber(fiber)` を呼ぶ
+ *   - useState は wipFiber.hooks[hookIndex] を読み書きする
+ *   - 再 render 時は work-loop 側で `fiber.hooks = [...fiber.alternate.hooks]` 済
+ *     → 同じ Hook オブジェクトを共有しているので setState の mutation が次回 render に伝わる
  *
- * 制限:
- * - 複数の関数コンポーネントが配列を共有
- *   → Part 2 (Fiber) で per-fiber に修正
- * - 1 ルート前提
- * - Hooks のルールに依存
+ * Rules of Hooks の根拠 (3.1 で説明):
+ *   - useState の呼び出し順序 = hook 配列のインデックス
+ *   - 条件分岐の中で呼ぶとインデックスがズレて状態が混ざる
  */
 
-type Hook<T = unknown> = { state: T }
-
-let _rootHooks: Hook[] = []
-let _index = 0
+let wipFiber: Fiber | null = null
+let hookIndex = 0
 let _rerender: (() => void) | null = null
 let _scheduled = false
 
@@ -30,9 +29,6 @@ export type Dispatch<T> = (action: SetStateAction<T>) => void
 
 /**
  * 状態を持てる関数を提供します。React の useState と同じ API です。
- *
- * @param initial 初回レンダ時の初期値
- * @returns [現在の状態, 状態を更新する関数]
  *
  * @example
  *   const Counter = () => {
@@ -44,20 +40,25 @@ export type Dispatch<T> = (action: SetStateAction<T>) => void
  *   }
  */
 export function useState<T>(initial: T): [T, Dispatch<T>] {
-  const index = _index++
-
-  if (_rootHooks[index] === undefined) {
-    _rootHooks[index] = { state: initial }
+  if (wipFiber === null) {
+    throw new Error(
+      'useState can only be called inside a function component (during render).',
+    )
   }
+  const fiber = wipFiber
+  const index = hookIndex++
 
-  const hook = _rootHooks[index] as Hook<T>
+  if (fiber.hooks[index] === undefined) {
+    fiber.hooks[index] = { state: initial } as Hook
+  }
+  const hook = fiber.hooks[index] as Hook<T>
 
   const setState: Dispatch<T> = (action) => {
     const next =
       typeof action === 'function'
         ? (action as (prev: T) => T)(hook.state)
         : action
-    if (Object.is(hook.state, next)) return // 同じ値ならスキップ
+    if (Object.is(hook.state, next)) return
     hook.state = next
     _scheduleRerender()
   }
@@ -67,7 +68,6 @@ export function useState<T>(initial: T): [T, Dispatch<T>] {
 
 /**
  * 同じ tick の複数 setState を 1 回の再レンダにまとめます (Part 1.10)。
- * React 18 の automatic batching 相当の最小実装。
  */
 function _scheduleRerender(): void {
   if (_scheduled) return
@@ -80,22 +80,30 @@ function _scheduleRerender(): void {
 
 /**
  * @internal
- * createRoot から呼ばれる。各 render の前に hook index をリセットし、
- * setState 時の再レンダ関数を保持する。
+ * work-loop から呼ばれる: 「これから処理する関数 fiber」を伝える。
+ * useState はこの fiber.hooks に対して読み書きする。
  */
-export function _resetHooks(rerender: () => void): void {
-  _index = 0
-  _rerender = rerender
+export function setWipFiber(fiber: Fiber): void {
+  wipFiber = fiber
+  hookIndex = 0
 }
 
 /**
  * @internal
- * テスト用: 全 hooks 状態をクリアする。
- * 通常コードからは呼ばない。
+ * createRoot から呼ばれる: setState 時に呼ぶ rerender 関数を保持する。
+ */
+export function _resetHooks(rerender: () => void): void {
+  _rerender = rerender
+  // wipFiber / hookIndex は work-loop が fiber ごとに setWipFiber でリセットする
+}
+
+/**
+ * @internal
+ * テスト用: 全 dispatcher 状態をクリア。Fiber 上の hooks は別途リセットが必要。
  */
 export function _clearHooksForTesting(): void {
-  _rootHooks = []
-  _index = 0
+  wipFiber = null
+  hookIndex = 0
   _rerender = null
   _scheduled = false
 }

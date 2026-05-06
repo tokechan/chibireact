@@ -7,6 +7,7 @@ import {
   type FiberType,
 } from './fiber'
 import { requestIdleWork, type IdleDeadline } from './scheduler'
+import { setWipFiber } from './hooks-state'
 
 /**
  * Part 2.4: work loop と作業の単位化。
@@ -139,6 +140,12 @@ function workLoopStep(deadline: IdleDeadline): void {
  */
 function performUnitOfWork(fiber: Fiber): Fiber | null {
   if (typeof fiber.type === 'function') {
+    // Part 3.2: hook を fiber に紐付ける。
+    // alternate (前回の同じ fiber) があれば hooks 配列を引き継ぐ。
+    // 浅いコピーなので Hook オブジェクト自体は共有 → setState の mutation が次回も見える。
+    fiber.hooks = fiber.alternate ? [...fiber.alternate.hooks] : []
+    setWipFiber(fiber)
+
     const componentProps = {
       ...fiber.props,
       children: fiber.pendingChildren,

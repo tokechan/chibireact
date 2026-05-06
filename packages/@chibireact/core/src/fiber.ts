@@ -67,6 +67,9 @@ export type FiberType = string | Function | typeof TEXT_ELEMENT
  */
 export type EffectTag = 'PLACEMENT' | 'UPDATE' | 'DELETION'
 
+/** useState などの hook 1 つ分の状態を入れる箱 (Part 3.2)。 */
+export type Hook<T = unknown> = { state: T }
+
 export type Fiber = {
   type: FiberType
   /** TEXT_ELEMENT の場合、{ nodeValue: string } を持つ */
@@ -102,6 +105,13 @@ export type Fiber = {
    * 未設定なら commit 対象外（root sentinel など）。
    */
   effectTag?: EffectTag
+  /**
+   * この fiber に紐付いた hook の配列 (Part 3.2)。
+   * - 関数コンポーネント fiber のみ意味を持つ
+   * - 順序は useState の呼び出し順（Rules of Hooks の根拠）
+   * - 再 render 時は alternate.hooks を浅くコピーしてここに入れる
+   */
+  hooks: Hook[]
 }
 
 /**
@@ -122,6 +132,7 @@ export function createFiber(
     dom: null,
     pendingChildren: [],
     alternate: null,
+    hooks: [],
   }
 }
 
