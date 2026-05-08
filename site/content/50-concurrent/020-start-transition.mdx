@@ -1,0 +1,285 @@
+---
+title: startTransition と低優先度更新
+description: 重要じゃない setState を「後回し」にする仕組み。urgent (microtask) と transition (setTimeout) の 2 段階優先度を作ります
+---
+
+# startTransition と低優先度更新
+
+[Concurrent Rendering の前提知識](./010-concurrent-intro) で「**lane** で複数の優先度を扱う」考え方を見ました。
+本章ではその最も基本的な API、`startTransition` と `useTransition` を実装します。
+
+本書 chibireact では本家の 31 lane モデルではなく、**2 段階の優先度** で同じ感覚を伝えます:
+- **urgent**: 通常の setState (`queueMicrotask` でスケジュール、即時)
+- **transition**: `startTransition(fn)` 内の setState (`setTimeout(0)` でスケジュール、遅延)
+
+## この章のゴール
+
+- `startTransition(fn)` の API と挙動が言える
+- `useTransition()` が `[isPending, startTransition]` を返す仕組みが分かる
+- 「urgent 後 transition」というキューの並び方を実装で確認できる
+- 本書実装の **限界** (値の分離が見えない理由) を理解する
+
+> 章末に動くもの: startTransition / useTransition。テスト 6 個追加で累計 **196/196**。
+
+前章: [Concurrent Rendering の前提知識](./010-concurrent-intro)
+
+## API
+
+```ts
+import { startTransition, useTransition } from '@chibireact/core'
+
+// 関数として呼ぶ
+startTransition(() => {
+  setHeavyState(newValue)
+})
+
+// hook として
+const [isPending, startTransition] = useTransition()
+startTransition(() => {
+  setHeavyState(newValue)
+})
+```
+
+`startTransition(fn)` は **fn を即時実行** しますが、**fn 内で起きた setState** が低優先度キューに乗ります。
+
+## 実装: モジュールフラグ + 分岐スケジュール
+
+`hooks-state.ts` を 2 段階優先度に拡張:
+
+```ts
+let _isInTransition = false
+let _scheduled = false
+let _transitionScheduled = false
+
+function _scheduleRerender(): void {
+  if (_isInTransition) {
+    if (_transitionScheduled) return
+    _transitionScheduled = true
+    setTimeout(() => {
+      _transitionScheduled = false
+      _rerender?.()
+    }, 0)
+    return
+  }
+  if (_scheduled) return
+  _scheduled = true
+  queueMicrotask(() => {
+    _scheduled = false
+    _rerender?.()
+  })
+}
+
+export function startTransition(fn: () => void): void {
+  const prev = _isInTransition
+  _isInTransition = true
+  try {
+    fn()
+  } finally {
+    _isInTransition = prev  // ネスト復元のため prev に戻す
+  }
+}
+```
+
+ポイント:
+- `_isInTransition` を **true にして fn を呼ぶ** → fn 内の setState が transition 経路に乗る
+- finally で **prev に戻す** (ネストした startTransition でも正しく動く)
+- 同 tick で urgent と transition 両方来ても、microtask が setTimeout より先に走るので urgent 優先
+
+## なぜ「microtask vs setTimeout」で優先度を表せるか
+
+JavaScript のイベントループ:
+
+```
+[同期処理]
+  ↓
+[microtask キュー] ← queueMicrotask, Promise.then
+  ↓
+[macrotask キュー] ← setTimeout, setInterval, MessageChannel
+  ↓
+[ブラウザ描画]
+```
+
+同 tick で来た:
+- queueMicrotask → microtask フェーズで実行
+- setTimeout(0) → 次の macrotask フェーズで実行
+
+microtask は「現在の同期処理が終わった直後」に走り、setTimeout は「次の tick」に走るので、microtask が先。
+
+これを優先度として使うと:
+- urgent setState (microtask) → ボタンクリック直後すぐ反映
+- transition setState (setTimeout) → ブラウザの描画チャンスを 1 回挟んでから反映
+
+実用面でも、setTimeout の前にブラウザがペイントできるので、「重い処理を後回しにしたい」狙いに合致します。
+
+## useTransition の実装
+
+```ts
+export function useTransition(): [boolean, (fn: () => void) => void] {
+  const [isPending, setPending] = useState(false)
+
+  const start = (fn: () => void): void => {
+    setPending(true)  // urgent
+    queueMicrotask(() => {
+      startTransition(fn)  // transition
+      setTimeout(() => setPending(false), 0)  // transition の後で
+    })
+  }
+
+  return [isPending, start]
+}
+```
+
+タイムライン:
+
+```
+[0ms 同期]
+  setPending(true) スケジュール (microtask)
+[microtask 1]
+  setPending(true) コミット → render with isPending=true
+  queueMicrotask 内のコールバック実行
+    startTransition(fn) → fn 内の setState が transition 経路に
+    setTimeout(setPending(false), 0) スケジュール
+[setTimeout 1: transition setState]
+  値の更新コミット → render with isPending=true (まだ) + new value
+[setTimeout 2: setPending(false)]
+  isPending=false コミット → render with isPending=false + new value
+```
+
+**isPending=true の期間** にユーザーは Spinner や opacity を変えるなどして「処理中」を見せられます。
+
+## テストで動作確認
+
+startTransition の遅延スケジュール:
+
+```ts
+it('startTransition のみの setState は microtask だけでは commit されず setTimeout で commit', async () => {
+  const renders: string[] = []
+  const App = () => {
+    const [v, setV] = useState('initial')
+    renders.push(v)
+    return createElement('button',
+      { onClick: () => startTransition(() => setV('updated')) },
+      v,
+    )
+  }
+
+  // クリック直後の microtask フラッシュでは反映されない
+  ;(container.firstChild as HTMLButtonElement).click()
+  await flushMicrotasks()
+  expect(renders).toEqual(['initial'])
+
+  // setTimeout フラッシュで反映される
+  await new Promise(r => setTimeout(r, 0))
+  await flushMicrotasks()
+  expect(renders[renders.length - 1]).toBe('updated')
+})
+```
+
+useTransition の isPending:
+
+```ts
+it('isPending が transition 中 true → 完了後 false に戻る', async () => {
+  // ボタンクリック後の各タイミングで:
+  //   render 1: 'true/initial'    (urgent setPending(true) のみ反映)
+  //   render 2: 'true/updated'    (transition setV 反映、isPending まだ true)
+  //   render 3: 'false/updated'   (setPending(false) 反映)
+})
+```
+
+## 本書実装の限界
+
+### 値の分離が見えない
+
+本物の React では、urgent setState による render と transition setState による render は **別パス** で処理されます。urgent パスの render では transition の値はまだ未反映、transition パスの render で初めて反映、というように **同じ render 内で値が分離** します。
+
+本書の chibireact では setState が `hook.state` を **即時 mutate** する設計のため、urgent の rerender が走るときには transition setState の値も反映済の状態で見えてしまいます。
+
+```tsx
+// 本家 React 18:
+//   render 1 (urgent): { input: '新値', results: 古い結果 }  ← input だけ即時反映
+//   render 2 (transition): { input: '新値', results: 新結果 }
+//
+// chibireact (本書):
+//   render 1 (urgent): { input: '新値', results: 新結果 }  ← 両方反映 (mutation のため)
+//   render 2 (transition): スキップ or 同じ値で再 render
+```
+
+教育目的としては「優先度キューを切り替える」感覚は伝わりますが、**フリッカー対策** としての真の効用は本書の最小実装では出ません。
+
+### 中断と再開がない
+
+本家 React 18 では transition 中の render が **中断** されて urgent に切り替わります。本書 chibireact の `runFiberRoot` (createRoot 経由) は同期 work loop なので中断不可。
+
+中断対応するには Part 2.5 の `scheduleFiberRoot` (RIC ベース) を createRoot に統合する必要があります。これは本書スコープ外。
+
+## ちょっと深掘り
+
+### 本家 React の lane 実装
+
+React 18 の優先度 lane は **31 ビットのビットマスク**:
+
+```js
+const SyncLane           = 0b0000000000000000000000000000001
+const InputContinuousLane = 0b0000000000000000000000000000100
+const DefaultLane        = 0b0000000000000000000000000010000
+const TransitionLane1    = 0b0000000000000000000000010000000
+// ...
+```
+
+Fiber に「pending lanes」(処理待ちの lane bitmap) と「rendered lanes」(処理済 lane bitmap) を持ち、bitwise OR/AND で判定:
+
+```js
+// 「より優先度の高い lane が pending」を判定
+function getNextLanes(root) {
+  const pending = root.pendingLanes
+  // 一番下のビット (= 一番優先度の高い lane) を取る
+  return pending & -pending
+}
+```
+
+複雑だが、本質は **「優先度を 1 つの整数で表現し、ビット演算で高速処理」**。本書の `_isInTransition` フラグはその縮約版。
+
+### `flushSync` という反対方向の API
+
+`startTransition` が「**遅延**」なら、`flushSync` は「**即時強制 commit**」。
+
+```tsx
+import { flushSync } from 'react-dom'
+
+flushSync(() => {
+  setState(newValue)
+})
+// flushSync を抜けた瞬間に DOM 更新済
+```
+
+普段の setState はバッチング (本書では microtask) で遅延しますが、**スクロール位置の制御** などで「コードが進む前に DOM を確定させたい」ケースに使います。
+
+本書 chibireact では未実装ですが、`runFiberRoot` を即座に呼ぶラッパで実現可能です。
+
+### useDeferredValue との関係
+
+次章 5.3 の `useDeferredValue` は **value 版の startTransition** とも言えます:
+
+```tsx
+// startTransition: 動作を遅延
+startTransition(() => setQuery(input))
+
+// useDeferredValue: 値を遅延
+const deferredQuery = useDeferredValue(query)
+```
+
+両者の使い分け:
+- 既存の state を持っているコンポ → `useDeferredValue`
+- props で受け取る側を遅延したい → `startTransition` (親側)
+
+## まとめ
+
+- `startTransition(fn)` で fn 内の setState を **transition (低優先度)** に
+- 本書実装は urgent=microtask, transition=setTimeout の 2 段階
+- `useTransition()` で `[isPending, start]` を取得
+- 限界: 値の分離が見えない、中断不可
+- それでも「優先度キューを切り替える」感覚は伝わる
+
+## 次の章へ
+
+[useDeferredValue](./030-use-deferred-value) で、startTransition の **value 版** にあたる遅延値 hook を実装します。

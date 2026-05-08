@@ -10,12 +10,19 @@ export {
   useMemo,
   useCallback,
   useRef,
+  useTransition,
+  startTransition,
+  useDeferredValue,
 } from './hooks-state'
 export { createContext } from './context'
 export type { Context, ContextProvider } from './context'
 export { buildFiberTree, createFiber, TEXT_ELEMENT } from './fiber'
 export { runFiberRoot, scheduleFiberRoot } from './work-loop'
 export { h } from './h'
+export { Suspense } from './suspense'
+export { ErrorBoundary } from './error-boundary'
+export type { ErrorBoundaryProps } from './error-boundary'
+export { createPortal, PORTAL } from './portal'
 export { requestIdleWork } from './scheduler'
 export type { IdleDeadline, IdleWorkCallback } from './scheduler'
 export type { ChibireactElement, ChibireactNode } from './types'

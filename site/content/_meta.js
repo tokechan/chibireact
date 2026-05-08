@@ -5,4 +5,5 @@ export default {
   '20-fiber': 'Reconciler の改良: Fiber へ',
   '30-hooks': 'Hooks の実装',
   '40-jsx': 'JSX とビルドツール',
+  '50-concurrent': 'Concurrent Rendering と Suspense',
 }

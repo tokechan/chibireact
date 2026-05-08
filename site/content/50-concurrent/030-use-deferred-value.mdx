@@ -1,0 +1,265 @@
+---
+title: useDeferredValue
+description: 値を「遅延コピー」する hook。startTransition の value 版で、入力中の検索フィルタなどに使います
+---
+
+# useDeferredValue
+
+[startTransition と低優先度更新](./020-start-transition) で「動作」を遅らせる API を作りました。
+本章では同じ発想を **「値」** に適用する `useDeferredValue` を実装します。
+
+## この章のゴール
+
+- `useDeferredValue(value)` の API と挙動が言える
+- 内部実装が **`useState + useEffect + startTransition`** の組み合わせだけで成立することが分かる
+- startTransition との使い分け基準が分かる
+
+> 章末に動くもの: useDeferredValue。テスト 4 個追加で累計 **200/200**。
+
+前章: [startTransition と低優先度更新](./020-start-transition)
+
+## API
+
+```ts
+const deferred = useDeferredValue(value)
+```
+
+`value` の **遅延コピー** を返します。
+- 初回 render: `deferred === value`
+- value が変わったとき:
+  - **直後の urgent rerender**: deferred は **古い値** のまま
+  - **その後の transition rerender**: deferred が **新しい値** に追従
+
+つまり 「**遅れて来る value**」。
+
+## 何のために要るのか
+
+検索フィルタの典型ケース:
+
+```tsx
+function Search({ query }) {
+  // query は入力中の最新値
+  // deferredQuery は遅れて到着する値
+  const deferredQuery = useDeferredValue(query)
+
+  return (
+    <>
+      <Input value={query} />              {/* 即時表示で快適 */}
+      <Results query={deferredQuery} />    {/* 重い結果リストは遅れて更新 */}
+    </>
+  )
+}
+```
+
+入力欄は **常に最新** で表示が滑らか、検索結果は **遅れて来る** ので連打しても重くならない。
+
+## 実装
+
+驚くほど短く書けます:
+
+```ts
+export function useDeferredValue<T>(value: T): T {
+  const [deferred, setDeferred] = useState(value)
+
+  useEffect(() => {
+    startTransition(() => {
+      setDeferred(value)
+    })
+  }, [value])
+
+  return deferred
+}
+```
+
+これだけ。3 つの hook を組み合わせるだけで成立します:
+
+1. `useState(value)`: 内部で deferred を保持
+2. `useEffect([value])`: value が変わるたびに発火
+3. `startTransition(setDeferred(value))`: deferred 更新を **transition で** 遅延スケジュール
+
+## タイムライン
+
+```
+[初回 render]
+  value='a'
+  useState → deferred='a'
+  return 'a'
+  commit
+  useEffect (deps=['a']): 初回なので発火
+    startTransition(setDeferred('a')) → setTimeout
+  setTimeout: setDeferred('a') (同じ値なのでスキップ)
+
+[value='b' に変わって再 render]
+  value='b'
+  deferred は古い 'a'
+  return 'a'                        ← deferred はまだ 'a'
+  commit
+  useEffect (deps=['b']): 変化したので発火
+    startTransition(setDeferred('b')) → setTimeout
+  
+[setTimeout 発火]
+  setDeferred('b')
+  hook.state='b' (mutate)
+  transition rerender スケジュール
+  
+[transition rerender]
+  value='b' (props のまま)
+  deferred='b' (mutated)
+  return 'b'                        ← ここで追従
+```
+
+## テストで動作確認
+
+初回:
+
+```ts
+it('初回 render では deferred = value', () => {
+  const App = (props) => {
+    const d = useDeferredValue(props.value)
+    return createElement('span', null, `${props.value}/${d}`)
+  }
+  root.render(createElement(App, { value: 'a' }))
+  expect(container.firstChild?.textContent).toBe('a/a')
+})
+```
+
+遅延の確認:
+
+```ts
+it('value が変わると deferred は最終的に追従する', async () => {
+  // 初期: 'a/a'
+  root.render(createElement(App, { value: 'a' }))
+
+  // value='b' に変更直後 (urgent rerender)
+  root.render(createElement(App, { value: 'b' }))
+  expect(renders[renders.length - 1]).toBe('b/a')  // ← deferred はまだ 'a'
+
+  // setTimeout 待ち → transition rerender
+  await flushTimers()
+  expect(renders[renders.length - 1]).toBe('b/b')  // ← deferred 追従
+})
+```
+
+連続変化の収束:
+
+```ts
+it('value が連続して変わっても最終値に収束', async () => {
+  root.render(createElement(App, { value: 0 }))
+  root.render(createElement(App, { value: 1 }))
+  root.render(createElement(App, { value: 2 }))
+  root.render(createElement(App, { value: 3 }))
+
+  await flushTimers()
+  expect(renders[renders.length - 1]).toBe('3/3')
+})
+```
+
+## startTransition との使い分け
+
+| 状況 | API |
+|---|---|
+| 自分で setState する | `startTransition(() => setX(...))` |
+| props で受け取る値を遅延したい | `useDeferredValue(value)` |
+| 重い計算結果の表示を遅らせたい | `useMemo(() => heavy(deferred), [deferred])` と組み合わせ |
+
+実例:
+
+```tsx
+// 親
+function Parent() {
+  const [query, setQuery] = useState('')
+  return (
+    <>
+      <input value={query} onChange={e => setQuery(e.target.value)} />
+      <Results query={query} />
+    </>
+  )
+}
+
+// 子: useDeferredValue で遅延フィルタ
+function Results({ query }) {
+  const deferredQuery = useDeferredValue(query)
+  const filtered = useMemo(
+    () => items.filter(i => i.includes(deferredQuery)),
+    [deferredQuery],
+  )
+  return <List items={filtered} />
+}
+```
+
+入力中は `query` が即時更新され input は滑らか。`Results` は遅れて再描画されるので、重い filter / 大量 DOM 操作も体感を損なわない。
+
+## ちょっと深掘り
+
+### React 18 の本実装との違い
+
+本家 React は `useDeferredValue` を **lane ベース** で実装:
+- value が変わると、新しい render を transition lane で開始
+- 中の `useDeferredValue` は「現在 transition lane で進行中の render なら新値、urgent lane なら古値」を返す
+
+本書 chibireact は lane が無いので、**「useEffect 経由で setDeferred を transition」** という外形だけ揃える実装。
+内部メカニズムは違いますが、**観察できる挙動は同じ**:
+- 値が遅れて到着する
+- 連打しても最終値に収束
+
+### `useDeferredValue` と `memo` の組み合わせが鍵
+
+`useDeferredValue` 単体では大した最適化になりません。**子コンポーネントが `memo()` でラップ** されて初めて効きます:
+
+```tsx
+const Results = memo(({ query }) => {
+  // query が変わらない限り再 render しない
+  return ...
+})
+```
+
+deferredQuery が古い値の間は `<Results query={deferredQuery} />` の props が変わらないので、Results は再描画スキップ。
+本書 chibireact では `memo` 未実装ですが、Part 3.7 の `useMemo` を内部で使えば近い挙動が作れます。
+
+### `useTransition` と `useDeferredValue` の選択
+
+```tsx
+// イベントハンドラの中なら useTransition
+function Search() {
+  const [query, setQuery] = useState('')
+  const [isPending, startTransition] = useTransition()
+
+  return (
+    <input onChange={e => {
+      const next = e.target.value
+      setQuery(next)
+      startTransition(() => setSearchValue(next))
+    }} />
+  )
+}
+
+// props を受け取る側なら useDeferredValue
+function Search({ query }) {
+  const deferred = useDeferredValue(query)
+  return <Results query={deferred} />
+}
+```
+
+「**コントローラ側 → useTransition**, **観測側 → useDeferredValue**」と覚えると分かりやすい。
+
+### initialValue オプション (React 19)
+
+React 19 で `useDeferredValue(value, initialValue)` のシグネチャが拡張されました:
+
+```tsx
+const deferred = useDeferredValue(value, '初期表示')
+```
+
+初回 render で deferred が `initialValue` から始まり、setTimeout 後に `value` に追従。
+本書 chibireact では未実装ですが、内部の useState 初期値を変えるだけなのですぐ拡張できます。
+
+## まとめ
+
+- `useDeferredValue(value)` は value の遅延コピーを返す
+- 内部は `useState + useEffect + startTransition` の組み合わせだけ
+- props で受け取る値を遅延したいときに使う
+- 子コンポの `memo` と組み合わせて初めて最適化として機能する
+
+## 次の章へ
+
+[Suspense — 「読み込み中」の一般化](./040-suspense)（執筆中）で、データ取得・コード分割・遅延処理を **境界 (boundary)** として表現する仕組みを実装します。Concurrent Rendering のもう 1 つの主役機能です。

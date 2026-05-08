@@ -344,15 +344,119 @@ export function useRef<T>(initial: T): { current: T } {
 }
 
 /**
- * 同じ tick の複数 setState を 1 回の再レンダにまとめます (Part 1.10)。
+ * Part 5.2: transition (低優先度) 中かどうかを示すモジュールフラグ。
+ * `startTransition(fn)` 内で setState が呼ばれると、urgent (microtask) ではなく
+ * setTimeout で遅延スケジュールされる。
+ */
+let _isInTransition = false
+let _transitionScheduled = false
+
+/**
+ * 同じ tick の複数 setState を 1 回の再レンダにまとめる (Part 1.10)。
+ * Part 5.2 で urgent / transition の 2 段階優先度に拡張:
+ *   - urgent     : queueMicrotask で即時 (現在の sync 処理直後)
+ *   - transition : setTimeout(0) で遅延 (urgent の後で)
+ *
+ * 同 tick で urgent と transition 両方が来ても、microtask が setTimeout より
+ * 先に走るため urgent 側が優先される。
  */
 function _scheduleRerender(): void {
+  if (_isInTransition) {
+    if (_transitionScheduled) return
+    _transitionScheduled = true
+    setTimeout(() => {
+      _transitionScheduled = false
+      _rerender?.()
+    }, 0)
+    return
+  }
   if (_scheduled) return
   _scheduled = true
   queueMicrotask(() => {
     _scheduled = false
     _rerender?.()
   })
+}
+
+/**
+ * 重要じゃない更新を低優先度キューに乗せる (Part 5.2)。
+ *
+ * `fn` 内で呼ばれた setState は、microtask ではなく setTimeout で遅延スケジュール
+ * されるため、同 tick で来た urgent setState が **先に commit** される。
+ *
+ * 例: 入力中の状態を即時更新 (urgent) しつつ、重い検索結果は後回し (transition):
+ *   const handleChange = (q) => {
+ *     setQuery(q)               // urgent → 即 commit
+ *     startTransition(() => {
+ *       setSearchResults(filter(items, q))  // transition → 後で commit
+ *     })
+ *   }
+ *
+ * 制限: 本書 chibireact は 2 段階のみ。本家 React 18 の lane (31 ビット優先度) や
+ * 中断・再開は実装しない。「優先度がある」感覚を伝える最小実装。
+ */
+export function startTransition(fn: () => void): void {
+  const prev = _isInTransition
+  _isInTransition = true
+  try {
+    fn()
+  } finally {
+    _isInTransition = prev
+  }
+}
+
+/**
+ * 値の "遅延コピー" を返す hook (Part 5.3)。
+ *
+ * 仕組み:
+ *   1. 内部に `deferred` という useState を持ち、初期値は value
+ *   2. value が変わるたび useEffect で `startTransition(setDeferred(value))`
+ *   3. urgent rerender では deferred はまだ古い → 古い値を返す
+ *   4. setTimeout 後の transition rerender で deferred が新値に → 新値を返す
+ *
+ * 用途: 入力中の検索ボックスで input は即時表示、結果リストは遅延描画
+ *   const Search = ({ query }) => {
+ *     const dq = useDeferredValue(query)
+ *     return <Results query={dq} />  // dq は遅れて更新
+ *   }
+ *
+ * 制限 (本書): 中断や bailout が無いので、結局すべての rerender が走る。
+ * 値が「遅れて来る」感覚は伝わるが、本家のような「重い再計算をスキップ」効果は出ない。
+ */
+export function useDeferredValue<T>(value: T): T {
+  const [deferred, setDeferred] = useState(value)
+
+  useEffect(() => {
+    startTransition(() => {
+      setDeferred(value)
+    })
+  }, [value])
+
+  return deferred
+}
+
+/**
+ * `[isPending, startTransition]` を返す hook (Part 5.2)。
+ * isPending は transition 中 true、commit 後に false に戻る。
+ *
+ * 内部実装は **isPending 用の useState + startTransition の薄いラップ**。
+ * 本家 React の lane ベース isPending とは挙動が違うが、API は揃えてある。
+ */
+export function useTransition(): [boolean, (fn: () => void) => void] {
+  const [isPending, setPending] = useState(false)
+
+  const start = (fn: () => void): void => {
+    setPending(true)
+    // urgent: setPending(true) を 1 度コミット → fn を transition で実行
+    queueMicrotask(() => {
+      startTransition(fn)
+      // transition の commit が走った後で setPending(false)
+      // 同じ setTimeout キューなので transition の rerender の後に並ぶ
+      setTimeout(() => setPending(false), 0)
+    })
+  }
+
+  return [isPending, start]
 }
 
 /**
@@ -376,6 +480,15 @@ export function _resetHooks(rerender: () => void): void {
 
 /**
  * @internal
+ * Part 5.4 (Suspense) で使用: 外部から再 render を予約する。
+ * Promise resolve 後の自動再描画など、setState 経由でない rerender トリガに使う。
+ */
+export function _triggerRerender(): void {
+  _scheduleRerender()
+}
+
+/**
+ * @internal
  * テスト用: 全 dispatcher 状態をクリア。Fiber 上の hooks は別途リセットが必要。
  */
 export function _clearHooksForTesting(): void {
@@ -383,4 +496,6 @@ export function _clearHooksForTesting(): void {
   hookIndex = 0
   _rerender = null
   _scheduled = false
+  _isInTransition = false
+  _transitionScheduled = false
 }

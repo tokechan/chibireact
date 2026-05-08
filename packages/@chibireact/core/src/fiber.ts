@@ -151,6 +151,22 @@ export type Fiber = {
    */
   effectTag?: EffectTag
   /**
+   * Suspense 用 (Part 5.4): 子孫が Promise を throw した状態。
+   * true の間は children ではなく fallback を表示。
+   */
+  suspended?: boolean
+  /**
+   * Suspense 用 (Part 5.4): 子孫が throw した Promise。
+   * commit 後に .then で resolve を待ち、自動再 render する。
+   */
+  thrownPromise?: Promise<unknown> | null
+  /**
+   * Error Boundary 用 (Part 5.5): 子孫が throw した Error。
+   * セット中は fallback を表示。次の reconcile で props.children が変わった (=回復試行) なら null に戻す想定。
+   */
+  error?: unknown
+
+  /**
    * この fiber に紐付いた hook の配列 (Part 3.2)。
    * - 関数コンポーネント fiber のみ意味を持つ
    * - 順序は useState の呼び出し順（Rules of Hooks の根拠）

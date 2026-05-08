@@ -1,0 +1,265 @@
+---
+title: Suspense — 「読み込み中」の一般化
+description: 子孫が Promise を throw すると fallback を表示。データ取得・コード分割の境界を統一インターフェースで扱う仕組みを実装します
+---
+
+# Suspense — 「読み込み中」の一般化
+
+[useDeferredValue](./030-use-deferred-value) で **値** を遅延しました。
+本章では **コンポーネント自体が "未準備"** な状態を表現する **Suspense** を実装します。
+
+```tsx
+<Suspense fallback={<Spinner />}>
+  <SlowComponent />
+</Suspense>
+```
+
+`<SlowComponent />` がデータ取得中なら `<Spinner />` を表示。データが揃ったら自動で本物に切り替わる。
+**読み込み中の表現を 1 箇所で管理できる** のが Suspense のご褒美です。
+
+## この章のゴール
+
+- Suspense が **`Promise を throw する`** 仕組みで動くことが理解できる
+- 子孫の throw を最寄り Suspense が **キャッチ** して fallback を表示する流れが書ける
+- Promise resolve 後に **自動再 render** される仕組みを実装できる
+- ネストした Suspense で「最も近い境界が勝つ」ことを確認する
+
+> 章末に動くもの: Suspense + Promise throw 機構。テスト 6 個追加で累計 **206/206**。
+
+前章: [useDeferredValue](./030-use-deferred-value)
+
+## 「Promise を throw」とはどういうことか
+
+Suspense の中核アイデアは **エラーハンドリングの転用**:
+
+```tsx
+function SlowComponent() {
+  if (!data) throw fetchData()  // ← Promise を throw する
+  return <div>{data}</div>
+}
+```
+
+エラーじゃない値を `throw` するのは奇妙ですが、JavaScript の throw は **任意の値** を投げられます。
+React はこれを **「未準備状態のシグナル」** として転用しました:
+
+1. SlowComponent の render で Promise を throw
+2. work-loop が catch し、最寄り Suspense 祖先を探す
+3. Suspense は children の代わりに **fallback** を表示
+4. throw された Promise の `.then` で resolve を待ち、resolve したら自動再 render
+5. 再 render で SlowComponent が再実行され、今度は data がある → 通常表示
+
+## 実装: Suspense コンポーネント
+
+```ts
+// suspense.ts
+export function Suspense(props: { fallback: ChibireactNode; children?: unknown }) {
+  return (props.children ?? null) as ChibireactNode
+}
+```
+
+驚くほどシンプル。**Suspense 自体は children を素通りさせるだけ**。値も状態も持ちません。
+重要なのは **work-loop 側の処理** です。
+
+## 実装: work-loop 側の Promise キャッチ
+
+`performUnitOfWork` の関数コンポーネント分岐に try/catch:
+
+```ts
+if (typeof fiber.type === 'function') {
+  fiber.hooks = fiber.alternate ? [...fiber.alternate.hooks] : []
+  setWipFiber(fiber)
+
+  // Suspense fiber が suspended 状態 → fallback を返す
+  if (fiber.type === Suspense && fiber.suspended) {
+    fiber.pendingChildren = [fiber.props.fallback as ChibireactNode]
+  } else {
+    try {
+      const result = fiber.type({ ...fiber.props, children: fiber.pendingChildren })
+      fiber.pendingChildren = [result]
+    } catch (thrown) {
+      // Promise が throw されたら最寄り Suspense を探す
+      if (thrown && typeof thrown.then === 'function') {
+        let cursor = fiber.parent
+        while (cursor !== null) {
+          if (cursor.type === Suspense) {
+            cursor.suspended = true
+            cursor.thrownPromise = thrown
+            cursor.child = null  // 既存の子 fiber を捨てる
+            return cursor  // Suspense から再開
+          }
+          cursor = cursor.parent
+        }
+        throw thrown  // Suspense が無い → 上位に伝播
+      }
+      throw thrown  // 通常のエラー (Error Boundary 5.5 で扱う)
+    }
+  }
+}
+```
+
+ポイント:
+- `cursor.child = null` で **既存の子 fiber を捨てる** (suspending した木は不要)
+- `return cursor` で **work loop を Suspense から再起動**
+- 次の iteration では Suspense が `suspended === true` なので fallback を pendingChildren にする
+
+## Fiber 型の拡張
+
+```ts
+export type Fiber = {
+  // ... existing
+  suspended?: boolean
+  thrownPromise?: Promise<unknown> | null
+}
+```
+
+reconcile 時に alternate から引き継ぐ:
+
+```ts
+if (sameType && oldFiber !== null && oldFiber.type === Suspense) {
+  fiber.suspended = oldFiber.suspended
+  fiber.thrownPromise = oldFiber.thrownPromise
+}
+```
+
+## 実装: Promise resolve 後の自動再 render
+
+commit phase の最後に Suspense を walk し、`thrownPromise.then(rerender)` を登録:
+
+```ts
+function commitRoot() {
+  // ... DOM commit, effects
+  if (committedRoot.child !== null) {
+    registerSuspensePromises(committedRoot.child)
+  }
+}
+
+function registerSuspensePromises(fiber: Fiber | null): void {
+  if (fiber === null) return
+  if (fiber.type === Suspense && fiber.thrownPromise) {
+    fiber.thrownPromise.then(() => {
+      fiber.suspended = false
+      fiber.thrownPromise = null
+      _triggerRerender()  // hooks-state 経由で再 render
+    })
+  }
+  registerSuspensePromises(fiber.child)
+  registerSuspensePromises(fiber.sibling)
+}
+```
+
+`_triggerRerender` は `hooks-state.ts` で `_scheduleRerender` を呼ぶ薄いラッパ。
+これにより **setState 経由でなく** 再 render を予約できます (createRoot の rerender が走る)。
+
+## テストで動作確認
+
+基本: throw → fallback 表示
+
+```ts
+it('子が Promise を throw すると fallback が表示される', () => {
+  const promise = new Promise<void>(() => {})  // never resolves
+  const SuspendedComp = () => { throw promise }
+
+  const App = () => createElement(Suspense,
+    { fallback: createElement('span', null, 'loading') },
+    createElement(SuspendedComp, null),
+  )
+
+  root.render(createElement(App, null))
+  expect(container.firstChild?.textContent).toBe('loading')
+})
+```
+
+resolve → children に切り替わる:
+
+```ts
+it('Promise が resolve すると children が表示される', async () => {
+  let resolver
+  const promise = new Promise(r => { resolver = r })
+  let isResolved = false
+
+  const SlowComp = () => {
+    if (!isResolved) throw promise
+    return createElement('span', null, 'loaded')
+  }
+
+  // 初期: loading
+  // resolver() を呼ぶ → 自動再 render → 'loaded'
+})
+```
+
+ネストした Suspense:
+
+```ts
+it('ネストした Suspense では最も近いものが捕まえる', () => {
+  // <Suspense fallback="outer">
+  //   <Suspense fallback="inner">
+  //     <SuspendedComp />
+  //   </Suspense>
+  // </Suspense>
+  // → 内側 Suspense が catch → 'inner' を表示
+})
+```
+
+## ちょっと深掘り
+
+### React 18 の本実装との違い
+
+本家 React の Suspense は本書よりずっと洗練されています:
+
+| 観点 | 本書 chibireact | 本家 React 18 |
+|---|---|---|
+| 同じ Promise の重複 throw | 毎回 then 登録 | キャッシュして 1 回だけ |
+| Suspense 配下の effect | 通常通り走る | suspended 時はスキップ |
+| `useTransition` との連携 | なし | transition 中の Suspense は previous content を維持 |
+| `useDeferredValue` との連携 | なし | 同上 |
+| Server-side で Suspense | 未対応 | Streaming SSR で活用 |
+
+特に **「previous content の維持」** は重要で、再 render で Suspense 配下が再 throw しても **前回 commit したツリーを表示し続けて fallback には戻らない** という設計があります。これがあるおかげで、ボタンクリック → 再取得中も画面が真っ白にならない UX が実現します。
+
+本書 chibireact では **シンプルさ優先** で、suspended 状態が立てば毎回 fallback を表示します。
+
+### `use(promise)` API (React 19)
+
+React 19 では `use(promise)` という新 API が追加され、`use` で Promise を渡すと内部で throw してくれます:
+
+```tsx
+function Profile({ userPromise }) {
+  const user = use(userPromise)  // 内部で throw する
+  return <div>{user.name}</div>
+}
+```
+
+throw を直接書かなくて良くなり、ライブラリ作者にも開発者にも優しくなりました。本書では `use` は実装しませんが、内部実装は **「promise を throw する関数」** であり、本書の Suspense と同じメカニズムです。
+
+### Suspense とデータ取得ライブラリ
+
+実プロダクトでは Suspense 対応のデータ取得ライブラリを使うのが一般的:
+- [SWR](https://swr.vercel.app/) — `useSWR(url)` で suspense オプション
+- [TanStack Query](https://tanstack.com/query) — `useSuspenseQuery`
+- [Relay](https://relay.dev/) — GraphQL クライアント、Suspense 標準サポート
+- [React Server Components](https://react.dev/reference/rsc) — フレームワークレベルで統合
+
+これらが内部で Promise throw + キャッシュをやってくれるので、開発者は `use` や `useSuspenseQuery` を呼ぶだけで OK。
+
+### Error Boundary との関係 (次章へ)
+
+Promise の throw は Suspense が捕まえますが、**通常の Error は素通りして上位で死にます**。
+それを防ぐのが次章 5.5 の **Error Boundary**:
+
+- Promise を throw → Suspense が catch
+- Error を throw → Error Boundary が catch
+
+両者は異なる境界として共存できます。
+
+## まとめ
+
+- Suspense は「Promise を throw する」エラーハンドリング転用で動く
+- 本書では fiber.suspended フラグ + work-loop の try/catch で実装
+- Promise resolve 後に自動再 render するため `.then` で `_triggerRerender`
+- ネストした Suspense は最寄りが勝つ
+- 本家との差: 重複 throw キャッシュ / previous content 維持 / SSR streaming
+
+## 次の章へ
+
+[Error Boundary](./050-error-boundary)（執筆中）で、render 中のエラーを境界で捕まえる仕組みを実装します。
+Suspense の Promise キャッチと並列に動くもう一つの **境界 (boundary)** です。

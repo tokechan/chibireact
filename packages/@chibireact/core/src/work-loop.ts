@@ -7,7 +7,10 @@ import {
   type FiberType,
 } from './fiber'
 import { requestIdleWork, type IdleDeadline } from './scheduler'
-import { setWipFiber } from './hooks-state'
+import { setWipFiber, _triggerRerender } from './hooks-state'
+import { Suspense } from './suspense'
+import { ErrorBoundary } from './error-boundary'
+import { PORTAL } from './portal'
 
 /**
  * Part 2.4: work loop と作業の単位化。
@@ -141,19 +144,69 @@ function workLoopStep(deadline: IdleDeadline): void {
 function performUnitOfWork(fiber: Fiber): Fiber | null {
   if (typeof fiber.type === 'function') {
     // Part 3.2: hook を fiber に紐付ける。
-    // alternate (前回の同じ fiber) があれば hooks 配列を引き継ぐ。
-    // 浅いコピーなので Hook オブジェクト自体は共有 → setState の mutation が次回も見える。
     fiber.hooks = fiber.alternate ? [...fiber.alternate.hooks] : []
     setWipFiber(fiber)
 
-    const componentProps = {
-      ...fiber.props,
-      children: fiber.pendingChildren,
+    // Part 5.4: Suspense fiber が suspended 状態なら fallback を返す。
+    if (fiber.type === Suspense && fiber.suspended) {
+      fiber.pendingChildren = [fiber.props.fallback as ChibireactNode]
+    } else if (fiber.type === ErrorBoundary && fiber.error !== undefined) {
+      // Part 5.5: ErrorBoundary が error を持っていれば fallback を表示
+      const fb = fiber.props.fallback
+      const node = typeof fb === 'function'
+        ? (fb as (e: unknown) => ChibireactNode)(fiber.error)
+        : (fb as ChibireactNode)
+      fiber.pendingChildren = [node]
+    } else {
+      const componentProps = {
+        ...fiber.props,
+        children: fiber.pendingChildren,
+      }
+      try {
+        const result = (
+          fiber.type as (p: Record<string, unknown>) => ChibireactNode
+        )(componentProps)
+        fiber.pendingChildren = [result]
+      } catch (thrown) {
+        // Part 5.4: Promise が throw されたら最寄り Suspense を探して fallback に
+        if (
+          thrown !== null &&
+          typeof thrown === 'object' &&
+          typeof (thrown as { then?: unknown }).then === 'function'
+        ) {
+          let cursor: Fiber | null = fiber.parent
+          while (cursor !== null) {
+            if (cursor.type === Suspense) {
+              cursor.suspended = true
+              cursor.thrownPromise = thrown as Promise<unknown>
+              // Suspense 配下を捨てて再構築させる
+              cursor.child = null
+              return cursor
+            }
+            cursor = cursor.parent
+          }
+          // Suspense が見つからない → 上位に伝播 (= 開発時の警告枠)
+          throw thrown
+        }
+        // Part 5.5: 通常の Error は最寄り ErrorBoundary を探す
+        let cursor: Fiber | null = fiber.parent
+        while (cursor !== null) {
+          if (cursor.type === ErrorBoundary) {
+            cursor.error = thrown
+            cursor.child = null
+            return cursor
+          }
+          cursor = cursor.parent
+        }
+        // ErrorBoundary も無い → 上位に propagate
+        throw thrown
+      }
     }
-    const result = (
-      fiber.type as (p: Record<string, unknown>) => ChibireactNode
-    )(componentProps)
-    fiber.pendingChildren = [result]
+  }
+
+  // Part 5.6: Portal fiber は dom = props.container を採用 (createDom は呼ばない)
+  if (fiber.type === PORTAL && fiber.dom === null) {
+    fiber.dom = fiber.props.container as Node
   }
 
   // PLACEMENT の Fiber は DOM ノードを作る (append しない)。UPDATE は alternate から DOM を継承済。
@@ -268,6 +321,11 @@ function reconcileSingleChild(
     fiber.alternate = oldFiber
     fiber.effectTag = 'UPDATE'
     fiber.pendingChildren = childNode.children
+    // Part 5.4: Suspense の suspended/thrownPromise を引き継ぐ
+    if (oldFiber.type === Suspense) {
+      fiber.suspended = oldFiber.suspended
+      fiber.thrownPromise = oldFiber.thrownPromise
+    }
     return fiber
   }
   // PLACEMENT
@@ -302,12 +360,46 @@ function commitRoot(): void {
   wipRoot = null
   deletions = []
   // Part 3.4 / 3.5: commit phase 後に effect を走らせる。
-  // 順序: layout effect (DOM 同期) → passive effect (本書では同 tick で続けて実行)。
   if (committedRoot.child !== null) {
     runEffects(committedRoot.child, 'layout')
     runEffects(committedRoot.child, 'passive')
   }
+
+  // Part 5.4: Suspense の thrownPromise を購読し、resolve したら再 render
+  if (committedRoot.child !== null) {
+    registerSuspensePromises(committedRoot.child)
+  }
 }
+
+/**
+ * Part 5.4: 部分木を walk し、suspended な Suspense fiber の Promise.then で
+ * 再 render を予約する。
+ */
+function registerSuspensePromises(fiber: Fiber | null): void {
+  if (fiber === null) return
+  if (fiber.type === Suspense && fiber.thrownPromise) {
+    const promise = fiber.thrownPromise
+    promise.then(
+      () => {
+        fiber.suspended = false
+        fiber.thrownPromise = null
+        // 同じ fiber は currentRoot に乗っている。次 render が走れば
+        // alternate 経由でこのフィールドが新 fiber に引き継がれない (suspended=false なので普通の path)
+        // → children を再評価。hooks-state の _triggerRerender 経由で createRoot に伝える
+        _triggerRerender()
+      },
+      () => {
+        // reject はとりあえず Suspense では処理しない (Error Boundary 5.5 の仕事)
+        fiber.suspended = false
+        fiber.thrownPromise = null
+        _triggerRerender()
+      },
+    )
+  }
+  registerSuspensePromises(fiber.child)
+  registerSuspensePromises(fiber.sibling)
+}
+
 
 /**
  * commit 後に pendingCommit が立っている useEffect / useLayoutEffect を実行する。
@@ -353,10 +445,15 @@ function commitWork(fiber: Fiber | null): void {
   if (
     fiber.effectTag === 'PLACEMENT' &&
     fiber.dom !== null &&
-    domParent !== null
+    domParent !== null &&
+    fiber.type !== PORTAL // Part 5.6: Portal の container は parent に append しない
   ) {
     domParent.appendChild(fiber.dom)
-  } else if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
+  } else if (
+    fiber.effectTag === 'UPDATE' &&
+    fiber.dom !== null &&
+    fiber.type !== PORTAL // Portal の container には updateDom もしない
+  ) {
     updateDom(fiber.dom, fiber.alternate?.props ?? {}, fiber.props)
   }
 
@@ -367,6 +464,13 @@ function commitWork(fiber: Fiber | null): void {
 function commitDeletion(fiber: Fiber): void {
   // Part 3.4: 部分木の effect cleanup を先に呼ぶ
   runCleanupsForDeletion(fiber)
+  // Part 5.6: Portal は container 自体を消さず、子の DOM を消す
+  if (fiber.type === PORTAL) {
+    if (fiber.child !== null) {
+      commitDeletion(fiber.child)
+    }
+    return
+  }
   if (fiber.dom !== null) {
     const parentDom = findClosestDomAncestor(fiber)
     if (parentDom !== null && fiber.dom.parentNode === parentDom) {
@@ -384,6 +488,7 @@ function commitDeletion(fiber: Fiber): void {
 
 function createDomFromFiber(fiber: Fiber): Node | null {
   if (fiber.type === HOST_ROOT) return null
+  if (fiber.type === PORTAL) return null // dom は props.container を別途設定
   if (typeof fiber.type === 'function') return null
   if (fiber.type === TEXT_ELEMENT) {
     return document.createTextNode(String(fiber.props.nodeValue))
