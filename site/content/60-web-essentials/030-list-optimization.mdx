@@ -1,0 +1,222 @@
+---
+title: リスト最適化 — key と virtualization
+description: 大量リストを高速に描画する戦略を整理。key の本質的な役割と、画面外を描画しない virtualization の発想
+---
+
+# リスト最適化 — key と virtualization
+
+[フォーム](./020-forms) で入力管理を扱いました。
+本章は **大量リスト** を扱うときの最適化戦略を整理します。
+
+10 件のリストなら何も考える必要はありません。1,000 件、10,000 件になると話が変わります。
+**key の正しい使い方** と **virtualization (windowing)** の 2 本柱で対処します。
+
+## この章のゴール
+
+- key の役割と「indexはダメ」の理由を理解する
+- key 衝突・key 不在のバグパターンが言える
+- virtualization の発想と、なぜ DOM ノード数を減らすのが効くか分かる
+- 自前で簡易 virtualization を作る発想を理解する
+
+> 章末に動くもの: なし（パターン解説）。コード変更ゼロ。
+
+前章: [フォーム — controlled vs uncontrolled](./020-forms)
+
+## key の役割を改めて
+
+Part 1.11 と Part 2.6 で `key` を扱いました。改めて整理:
+
+> key = **同じ親の中で、子要素を再 render 間で識別するための ID**
+
+```tsx
+{items.map(item => <li key={item.id}>{item.name}</li>)}
+```
+
+reconciler は新旧の children を **key で対応付ける** ことで:
+- 同じ key → 既存 fiber を再利用 (DOM identity 保存)
+- 違う key → 新規 fiber を作る (PLACEMENT)
+- 古い fiber に対応する key が無い → 削除 (DELETION)
+
+並び替えだけなら DOM ノードを動かすだけで済む。**入力フォーカス・スクロール位置・アニメーション** が壊れない。
+
+## index を key に使うバグ
+
+```tsx
+{items.map((item, i) => <li key={i}>{item.name}</li>)}  // ❌
+```
+
+これでも動きますが、**並び替え・追加・削除で挙動がおかしくなる**:
+
+```
+初期: [a, b, c]    key: 0,1,2
+削除後: [b, c]     key: 0,1
+
+reconciler の見方:
+  key=0: 中身 'a' → 'b' に変わった (UPDATE)
+  key=1: 中身 'b' → 'c' に変わった (UPDATE)
+  key=2: 削除
+```
+
+実際は **'a' を削除しただけ** なのに、 reconciler から見ると「全部書き換え + 1 個削除」。
+- input にフォーカスがあったら消える
+- アニメーションが乱れる
+- パフォーマンスも落ちる
+
+正しい key:
+
+```tsx
+{items.map(item => <li key={item.id}>{item.name}</li>)}  // ✓
+```
+
+`item.id` を使えば:
+- key='a' は無くなった → 削除 (DELETION)
+- key='b' / key='c' は残る → DOM 再利用
+
+## key を使ってはいけないケース
+
+- **ランダム値**: `key={Math.random()}` → 毎 render で違う key になり、全部 DELETION + PLACEMENT
+- **オブジェクト参照**: `key={item}` → toString で `[object Object]` になり全部同じ key 扱い
+
+ID がない場合は **コンテンツのハッシュ** か **インデックス + 並び替えなし保証** で代用。
+
+## virtualization (windowing) とは
+
+10,000 件の `<li>` を全部 DOM に出すと:
+- 初期描画: 数百 ms ブロック
+- メモリ: 数百 MB
+- スクロール: ガクガク
+
+実は **画面に映ってるのは 20 件** くらい。残り 9,980 件は無駄。
+**画面に映る分だけ描画** するのが virtualization:
+
+```
+リスト全体: 10,000 件
+画面の高さ: 20 件分
+
+[──── 9,980 件は描画しない ────]
+[画面: 20 件描画]
+[──── 残り描画しない ────]
+
+スクロール → 描画範囲をスライド
+```
+
+## 簡易実装の発想
+
+```tsx
+function VirtualList({ items, itemHeight, height }) {
+  const [scrollTop, setScrollTop] = useState(0)
+
+  const visibleStart = Math.floor(scrollTop / itemHeight)
+  const visibleEnd = visibleStart + Math.ceil(height / itemHeight) + 1
+  const visible = items.slice(visibleStart, visibleEnd)
+
+  return (
+    <div
+      onScroll={e => setScrollTop(e.currentTarget.scrollTop)}
+      style={{ height, overflow: 'auto', position: 'relative' }}
+    >
+      {/* 全体の高さを保つためのダミー */}
+      <div style={{ height: items.length * itemHeight }}>
+        {visible.map((item, i) => (
+          <div
+            key={item.id}
+            style={{
+              position: 'absolute',
+              top: (visibleStart + i) * itemHeight,
+              height: itemHeight,
+            }}
+          >
+            {item.name}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+```
+
+ポイント:
+- 外側の `<div>` は **全リストの高さ** を持つ → スクロールバー位置が正しい
+- 内側で **可視範囲のアイテムだけ** を `position: absolute` で配置
+- スクロールするたび `visibleStart` が変わり再 render
+
+これで 10,000 件でも 20 件分の DOM しか作らない。
+
+## 実プロジェクトのライブラリ
+
+自前実装は微妙な細部 (動的高さ、スクロール慣性、横方向...) が地獄。実プロダクションでは:
+
+- **react-window** (旧 react-virtualized の軽量版): デファクト
+- **TanStack Virtual** (旧 react-virtual): フレームワーク非依存
+- **react-cool-virtual**: 軽量・hooks ベース
+
+選ぶ基準:
+- 固定高さリスト → react-window
+- 可変高さ・複雑なレイアウト → TanStack Virtual
+- 軽量で十分 → react-cool-virtual
+
+## ちょっと深掘り
+
+### `key` を頻繁に変えて強制リセットするテクニック
+
+通常 key は固定すべきですが、**意図的に変える** ことで「コンポーネントを完全に作り直す」テクニックがあります:
+
+```tsx
+<ResetableForm key={resetCount} />
+<button onClick={() => setResetCount(c => c + 1)}>Reset</button>
+```
+
+`resetCount` が変わると key が変わる → 古い ResetableForm fiber は DELETION → 新しい fiber が PLACEMENT。
+**state がすべてリセット** されます。
+
+「props 経由で reset を伝える」より乱暴ですが、シンプル。
+
+### `children` の並び替えと `<Fragment key>`
+
+複数要素を返したいが Fragment を使う場合の key:
+
+```tsx
+{items.map(item => (
+  <React.Fragment key={item.id}>
+    <dt>{item.term}</dt>
+    <dd>{item.def}</dd>
+  </React.Fragment>
+))}
+```
+
+Fragment にも key を付けられます。`<>...</>` は key が付けられないので、明示的に `<React.Fragment key=...>` と書く必要があります。
+
+本書 chibireact では Fragment 未対応 (Part 5.6 で言及)。
+
+### virtualization と SSR の相性
+
+サーバ描画 (SSR) では DOM サイズの計測ができないので、初期描画分だけ全部 render するのが普通:
+
+```tsx
+{items.slice(0, INITIAL_RENDER_COUNT).map(...)}
+{/* スクロールしたら追加読み込み */}
+```
+
+これは virtualization というより「**初期表示の絞り込み**」。SSR + virtualization の組み合わせは難しいので、CSR (client-side rendering) パートだけ virtualize するのが普通。
+
+### ピン留め (sticky) の罠
+
+`position: sticky` の要素は virtualization と相性が悪い:
+- 全体の DOM が「画面外も含む」前提
+- virtualization で消えた DOM の sticky が機能しない
+
+回避策:
+- sticky 要素は virtualization の外に配置
+- または常に描画する固定セクションとして分離
+
+## まとめ
+
+- key は **同じ親の中で再 render 間に子を識別** する ID
+- index を key に使うと並び替え時に壊れる
+- virtualization で DOM ノード数を減らす → 大量リストで劇的な改善
+- 自前実装は細部が辛い、ライブラリ (react-window 等) が無難
+- key の意図的な変更で強制リセットも可能 (テクニック)
+
+## 次の章へ
+
+[アクセシビリティ — ARIA / focus 管理](./040-accessibility)（執筆中）で、スクリーンリーダー対応とキーボード操作の典型パターンを整理します。
