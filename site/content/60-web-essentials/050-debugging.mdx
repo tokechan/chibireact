@@ -1,0 +1,263 @@
+---
+title: デバッグツール — fiber tree の可視化
+description: 自前 React である chibireact の fiber tree を文字列ダンプする最小ツールを作ります。Part 6 完走
+---
+
+# デバッグツール — fiber tree の可視化
+
+[アクセシビリティ](./040-accessibility) でユーザ向けの実装を整理しました。
+本章は **開発者向け** のデバッグツール作成。本書 chibireact の fiber tree を **文字列ダンプ** する最小ヘルパを実装し、Part 6 を完走します。
+
+本家 React DevTools のような GUI ではなく、`console.log(dumpFiberTree(root))` で「いま何が render されているか」を見るだけの素朴なツール。それでも **学習効率が劇的に上がる** はずです。
+
+## この章のゴール
+
+- Fiber tree を可視化することの教育的価値が分かる
+- `dumpFiberTree` で木をインデント表示できる
+- `findFiber` で部分木を検索できる
+- `fiberStats` で全体サマリーが見られる
+- React DevTools の役割と、自前で作る場合の難しさを理解する
+
+> 章末に動くもの: `dumpFiberTree` / `findFiber` / `fiberStats`。テスト 7 個追加で累計 **229/229**。**Part 6 完走** で全 53 章中 52 章 (98%) 到達。
+
+前章: [アクセシビリティ — ARIA / focus 管理](./040-accessibility)
+
+## なぜ可視化が要るか
+
+Part 1-5 でやってきたとおり、Fiber tree の構造は **概念上は分かる** ものの、**実際にどんな形になっているか** は脳内シミュレーションが大変です。
+
+```tsx
+const App = () => {
+  const [count, setCount] = useState(0)
+  return createElement(
+    'div',
+    null,
+    count > 0 && createElement('p', null, `count: ${count}`),
+    createElement(Counter, null),
+  )
+}
+```
+
+このコンポーネントの fiber tree は:
+
+```
+<App />
+  div  [PLACEMENT]
+    "0" or undefined
+    <Counter />  [PLACEMENT]
+      button  [PLACEMENT]
+        "click"
+```
+
+…と、頭の中で組み立てる必要があります。`dumpFiberTree` があれば **実物を即座に見られる** ので、特に Part 2 (Fiber)・Part 3 (Hooks)・Part 5 (Suspense/ErrorBoundary) で挙動を確認しながら学べます。
+
+## 実装: `dumpFiberTree`
+
+```ts
+function fiberToLine(fiber: Fiber): string {
+  let label: string
+  if (fiber.type === TEXT_ELEMENT) {
+    label = `"${String(fiber.props.nodeValue ?? '')}"`
+  } else if (typeof fiber.type === 'function') {
+    label = `<${fiber.type.name || 'Anonymous'} />`
+  } else if (typeof fiber.type === 'string') {
+    label = fiber.type
+  }
+
+  const tags: string[] = []
+  if (fiber.effectTag) tags.push(fiber.effectTag)
+  if (fiber.suspended) tags.push('suspended')
+  if (fiber.error !== undefined) tags.push(`error:${String(fiber.error)}`)
+  if (fiber.key !== null && fiber.key !== undefined) {
+    tags.push(`key=${JSON.stringify(fiber.key)}`)
+  }
+
+  return tags.length > 0 ? `${label}  [${tags.join(', ')}]` : label
+}
+
+export function dumpFiberTree(root: Fiber | null, indent = 0): string {
+  if (root === null) return ''
+  const lines: string[] = []
+  walk(root, indent, lines)
+  return lines.join('\n')
+}
+
+function walk(fiber: Fiber, depth: number, out: string[]): void {
+  out.push('  '.repeat(depth) + fiberToLine(fiber))
+  if (fiber.child) walk(fiber.child, depth + 1, out)
+  if (fiber.sibling) walk(fiber.sibling, depth, out)
+}
+```
+
+ポイント:
+- 文字列・関数・HTML の 3 種類で **表記を切り替え**
+- effectTag / suspended / error / key が立っていれば **タグ表示**
+- 再帰で indent を増やす ((`'  '.repeat(depth)`)
+- child は深さ +1、sibling は同じ深さ
+
+## 実装: `findFiber`
+
+```ts
+export function findFiber(
+  root: Fiber | null,
+  predicate: (f: Fiber) => boolean,
+): Fiber | null {
+  if (root === null) return null
+  if (predicate(root)) return root
+  if (root.child) {
+    const found = findFiber(root.child, predicate)
+    if (found) return found
+  }
+  if (root.sibling) {
+    const found = findFiber(root.sibling, predicate)
+    if (found) return found
+  }
+  return null
+}
+```
+
+DFS で最初にマッチする fiber を返す。
+
+```ts
+const counterFiber = findFiber(root, f => f.type === Counter)
+console.log(counterFiber?.hooks)  // Counter の useState 状態を覗く
+```
+
+## 実装: `fiberStats`
+
+```ts
+export function fiberStats(root: Fiber | null) {
+  let depth = 0, total = 0, hostElements = 0, functionComponents = 0, textNodes = 0
+
+  function walk(f: Fiber, d: number) {
+    depth = Math.max(depth, d)
+    total++
+    if (f.type === TEXT_ELEMENT) textNodes++
+    else if (typeof f.type === 'function') functionComponents++
+    else if (typeof f.type === 'string') hostElements++
+    if (f.child) walk(f.child, d + 1)
+    if (f.sibling) walk(f.sibling, d)
+  }
+
+  if (root) walk(root, 0)
+  return { depth, total, hostElements, functionComponents, textNodes }
+}
+```
+
+「このアプリの fiber tree は深さ 8 で 247 ノードある」みたいな全体像が掴める。
+
+## 使い方
+
+```ts
+import { dumpFiberTree, findFiber, fiberStats, runFiberRoot } from '@chibireact/core'
+
+// 内部の currentRoot にアクセスするには work-loop 側から export する必要がある
+// 本書では tests 内で buildFiberTree (Part 2.3) を使ってデモ:
+
+const tree = buildFiberTree(createElement('div', null,
+  createElement(Counter, null),
+  createElement('p', null, 'static'),
+))
+console.log(dumpFiberTree(tree))
+// →
+// div
+//   <Counter />
+//     button
+//       "0"
+//   p
+//     "static"
+
+console.log(fiberStats(tree))
+// → { depth: 4, total: 6, hostElements: 3, functionComponents: 1, textNodes: 2 }
+```
+
+## React DevTools との比較
+
+本物の [React DevTools](https://react.dev/learn/react-developer-tools) は:
+- ブラウザ拡張で別パネルとして動く
+- コンポーネントツリーを GUI で表示・展開
+- **props / state / hooks** を選択時に表示
+- **profiler** で render 時間を計測
+- **どの hook がどのコンポか**追跡
+
+これを実現するには:
+- React 内部から hook を **「devtools 用の名前付き形式」** で公開
+- 開発専用の `__REACT_DEVTOOLS_GLOBAL_HOOK__` を window に置く
+- 拡張が定期的にツリーをスキャンして UI 更新
+
+本書 chibireact では難しすぎるので CLI レベルで諦め、**`console.log(dumpFiberTree(root))`** で代替。
+
+## ちょっと深掘り
+
+### React DevTools が遅い問題
+
+DevTools を開いていると React が **数倍遅く** なります。理由:
+- DevTools が定期的にツリー全体をスキャン
+- 各 fiber から hook 名・props を抽出
+- 大規模アプリでは大量データを送受信
+
+「Profiler を使うときだけ DevTools を開く」運用が現実的。本書 chibireact では存在しない問題。
+
+### 自前 DevTools を作るなら
+
+簡易版でも次が要ります:
+1. `currentRoot` を window に公開する API
+2. fiber の subscribe (commit ごとに更新)
+3. UI: コンポーネント tree のレンダリング
+4. ノードクリック → props/hooks 表示
+
+UI 部分を chibireact 自身で書けば再帰的で面白い (chibireact が chibireact をデバッグ)。
+**Web Worker** に処理を逃せば本物 React DevTools の遅延問題も避けられる。これは付録 (Part 7) で深掘り候補。
+
+### `console.log` でも十分
+
+実プロジェクトでも、**コンポ内に `console.log` を仕込む** だけで多くは分かります:
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0)
+  console.log('Counter rendered', count)
+  return ...
+}
+```
+
+「何回 render したか / そのときの state」が即見える。
+DevTools が無い環境 (RN, SSR) でも有効。**手軽に勝るデバッグツールはない**。
+
+### React Compiler とデバッグ
+
+React Compiler はコンパイル時に useMemo / useCallback を自動挿入するので、開発者が書いたコードと **実際に動くコードが一致しない** 問題が出ます。
+DevTools 側で「コンパイル前の元コード」「コンパイル後のコード」を切り替えて見られるようにする UI が今後求められそう。本書スコープ外。
+
+## まとめ
+
+- `dumpFiberTree` で fiber tree をインデント文字列化
+- `findFiber` で条件マッチ fiber を検索
+- `fiberStats` で全体サマリー (深さ・ノード数・種別)
+- 本物の React DevTools は GUI / Profiler / hook 追跡まで備えるが、本書では CLI で代替
+- 結局 `console.log` も強力なデバッグ手段
+
+## Part 6 を振り返って
+
+| 章 | 内容 |
+|---|---|
+| 6.1 | ルーティング (hash router) |
+| 6.2 | フォーム (controlled / uncontrolled / useReducer) |
+| 6.3 | リスト最適化 (key の本質 / virtualization) |
+| 6.4 | アクセシビリティ (ARIA / focus 管理) |
+| **6.5** | **デバッグツール (dumpFiberTree / findFiber / fiberStats)** |
+
+実プロジェクトに必須の **「React の外側の知識」** を整理しました。
+
+## chibireact の現在地（Part 6 完走時点）
+
+```
+Part 0: ✓ Part 1: ✓ Part 2: ✓ Part 3: ✓ Part 4: ✓ Part 5: ✓ Part 6: ✓ ← ここ
+Part 7: ⏳ (付録)
+```
+
+53 章中 **52 章 (98%) 完了**。残り **付録 4 章** で全完走です。
+
+## 次の Part へ
+
+[Part 7.1 chibivue マッピング表](../70-appendix/010-chibivue-mapping)（執筆中）で、本書を chibivue 経験者が読む際の対応表を整理します。付録の最初です。
