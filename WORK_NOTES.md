@@ -1,67 +1,62 @@
 # WORK_NOTES: 自律作業ログ
 
-最新更新: 2026-05-09（ラウンド 15: Part 6 完走 ★）
+最新更新: 2026-05-09（ラウンド 16: Part 7 完走 = **本書全 53 章 100% 完走** ★★）
 実行者: Claude (Opus 4.7)
-ブランチ: `feat/part6-web-essentials` (Part 6.1-6.5 を載せた状態、未 push)
+ブランチ: `feat/part7-appendix` (Part 6 tip から派生、Part 6 と Part 7 両方含む)
 
 ---
 
 ## ⚠️ レビュー時の優先確認事項
 
-1. **Part 6 全 5 章完走**: ルーティング / フォーム / リスト最適化 / アクセシビリティ / デバッグツール
-2. **新規 src 2 個**: `router.ts` (Link/Route/Switch/useHashLocation) / `dev-tools.ts` (dumpFiberTree/findFiber/fiberStats)
-3. **229 テスト全緑**: 新規 12 (router 5 + dev-tools 7)
-4. **概念章中心**: 6.2/6.3/6.4 はコード変更ゼロ、パターン解説中心。6.1/6.5 は実装あり
-5. **53 章中 52 章 (98%) 到達**: 残りは Part 7 付録 (4 章) のみ
+1. **本書全 53 章完走**: Part 0-7 すべて執筆 + 実装 + テスト
+2. **Part 7 の特殊性**:
+   - A.1 mini-react.ts (250 行で本書 Part 1-3 を圧縮した教材)
+   - A.4 RSC (世界的に空白領域、本書のオリジナリティ強化)
+3. **246 テスト全緑**: Part 7 で新規 17 (mini-react 7 + rsc 10)
+4. **ブランチ運用**: Part 7 ブランチを Part 6 tip から派生したため、Part 6 + Part 7 が両方含まれる。Part 6 PR がマージされたら Part 7 を main に rebase 推奨
 
 ---
 
-## このセッションでやったこと（ラウンド 15: Part 6）
+## このセッションでやったこと（ラウンド 16: Part 7 = 本書完走）
 
-### Part 6.1 ルーティング — hash router の最小実装（NEW、実装章）
-- `router.ts` 新設:
-  - `useHashLocation()`: `window.location.hash` 購読 + navigate 関数
-  - `Link`: `<a href="#/...">` の薄いラッパ (修飾キー対応)
-  - `Route`: path 完全一致時のみ component を render
-  - `Switch`: 最初にマッチした Route だけ render (`'*'` で wildcard)
-- 5 テスト pass: Route 切替 / Switch wildcard / Link href / クリックで遷移 / navigate API
-- index.ts に export 追加
-- 010-routing.mdx 執筆 (hash vs History API / 70 行で本格相当 / Suspense との組合せ)
-- パスパラメータ・ネスト・History API は本書スコープ外と明示
+### Part 7.1 / A.1 30 分で React を作る (1 ファイル版)（NEW、実装章）
+- `mini-react.ts` 新設: 約 250 行で Part 1-3 の核心を圧縮
+- 含むもの: createElement / Fiber / work loop / commit / 関数コンポ / useState (per-fiber) / queueMicrotask バッチング
+- 含まないもの (本書本体で扱う): useEffect / Suspense / Concurrent / scheduler / JSX
+- 7 テスト pass: 単純描画 / 入れ子 / 関数コンポ / **Counter で setState** / 複数 Counter 独立 / 条件 / DOM identity
+- 010-thirty-min-react.mdx 執筆 (各セクションが本書 Part X.Y に対応)
 
-### Part 6.2 フォーム — controlled vs uncontrolled（NEW、概念章）
-- Controlled / Uncontrolled の特徴と使い分け
-- 複雑フォームを useReducer で整理するパターン
-- バリデーション 3 段階 (onChange / onBlur / onSubmit)
-- アクセシビリティ (label 紐付け / role="alert")
-- react-hook-form の発想と React 19 form action への布石
+### Part 7.2 / A.2 本家 React のソースコードを読む（NEW、地図章）
+- React 本家リポジトリの構造解説
+- 本書の章 ↔ 本家ファイル対応表 (Part 1-5 すべて)
+- レベル別読み順 (入り口 → Fiber → Hooks → Concurrent)
+- 検索のコツ / コメント文化 / dev/prod 差
+- 020-reading-react-source.mdx 執筆
 
-### Part 6.3 リスト最適化 — key と virtualization（NEW、概念章）
-- key の本質的役割 (再 render 間で子要素を識別)
-- index を key にするバグパターンの図解
-- virtualization (windowing) の発想と簡易実装スケッチ
-- react-window / TanStack Virtual の選択基準
-- 「key を意図的に変えて強制リセット」テクニック
-- SSR との相性問題
+### Part 7.3 / A.3 chibivue ↔ chibireact マッピング表（NEW、対比章）
+- chibivue (Vue 版) との Part 構成対比
+- Vue/React の設計思想差を章単位で整理
+- 「Reactivity vs useState」「テンプレート vs JSX」の対比
+- ubugeeei 氏 (chibivue 著者) への謝辞
+- 030-chibivue-mapping.mdx 執筆
 
-### Part 6.4 アクセシビリティ — ARIA / focus 管理（NEW、概念章）
-- セマンティック HTML が出発点 (button / nav / main / h1-h6)
-- ARIA 属性の典型 (aria-label / role / aria-live / aria-current)
-- focus 管理 3 パターン (Modal trap / Skip link / ルート切替時)
-- React 特有の落とし穴 (autoFocus / SSR / useLayoutEffect)
-- prefers-reduced-motion / 色覚多様性 / コントラスト比
+### Part 7.4 / A.4 最小 RSC 実装に挑戦する（NEW、実装章 + 本書のクライマックス）
+- `rsc.ts` 新設: 約 200 行で React Server Components のエッセンス
+- 提供 API:
+  - `renderToRSCPayload(element)`: server-side で element → payload に変換 (async 対応)
+  - `payloadToElement(payload)`: client-side で復元
+  - `markAsClientComponent(name, fn)`: Client Component 印付け
+  - `registerClientComponent(name, fn)`: client registry 登録
+- payload 型: host / client-ref / 文字列 / 数値 / null / 配列
+- async server component (await 可能) / Client Reference round-trip / JSON serialize 対応
+- 関数 props は serialize 不可なので除去 (本家も同じ)
+- 10 テスト pass:
+  - server: host element / Server Component / async / Client Reference / 関数 props 除去 / 混在 / JSON 互換
+  - client: payload → element → render / Client Reference round-trip + state 動作 / 未登録時 throw
+- 040-minimal-rsc.mdx 執筆 (本家との差 / use client / Server Action / Suspense との組み合わせ)
+- 本書全体の振り返りと「本書を読み終えたあなたへ」のメッセージ
 
-### Part 6.5 デバッグツール — fiber tree の可視化（NEW、実装章）
-- `dev-tools.ts` 新設:
-  - `dumpFiberTree(root)`: インデント付き文字列ダンプ
-  - `findFiber(root, predicate)`: DFS で条件マッチ fiber を検索
-  - `fiberStats(root)`: 深さ・ノード数・種別カウント
-- 7 テスト pass: dumpFiberTree (3) + findFiber (2) + fiberStats (2)
-- 関数コンポは `<Name />` 形式で表示、effectTag/key/suspended/error も表示
-- index.ts に export 追加
-- 050-debugging.mdx 執筆 (本物 React DevTools との比較 / 自前で作る難しさ / console.log の有用性)
-
-→ **Part 6 全 5 章完走 (累計 32 ファイル / 229 テスト)**
+→ **本書全 53 章 完走 (累計 34 ファイル / 246 テスト)**
 
 ---
 
@@ -70,25 +65,24 @@
 | 項目 | 結果 |
 |---|---|
 | dev server | 稼働中 (http://localhost:3030) |
-| Part 6 全章 (010-050) | HTTP 200 |
-| Vitest テスト | **229/229 pass** (32 ファイル) |
+| Part 7 全章 (010-040) | HTTP 200 |
+| Vitest テスト | **246/246 pass** (34 ファイル) |
 | TS typecheck | render.ts pre-existing エラー据え置き、それ以外緑 |
 | pre-commit hook | 通過予定 |
 
-## コミット履歴 (Part 6 ブランチ、未 push、これからまとめて commit)
+## コミット履歴 (Part 7 ブランチ、未 push、これからまとめて commit)
 
 ```
-feat(part6): 6.1 ルーティング — hash router の最小実装
-docs(part6): 6.2 フォーム — controlled vs uncontrolled
-docs(part6): 6.3 リスト最適化 — key と virtualization
-docs(part6): 6.4 アクセシビリティ — ARIA / focus 管理
-feat(part6): 6.5 デバッグツール — fiber tree の可視化 (Part 6 完走)
-docs: WORK_NOTES.md ラウンド 15 (Part 6 完走) で更新
+feat(part7): A.1 30 分で React を作る (1 ファイル版)
+docs(part7): A.2 本家 React のソースコードを読む
+docs(part7): A.3 chibivue ↔ chibireact マッピング表
+feat(part7): A.4 最小 RSC 実装に挑戦する (本書完走)
+docs: WORK_NOTES.md ラウンド 16 (本書全 53 章完走) で更新
 ```
 
 ---
 
-## 累計成果物（Part 6 完走時点）
+## 累計成果物（本書完走時点）
 
 ### コード (`packages/@chibireact/core/`)
 ```
@@ -96,23 +90,25 @@ src/
 ├── types.ts
 ├── create-root.ts
 ├── create-element.ts
-├── render.ts
-├── hooks-state.ts
+├── render.ts                  (Part 1 互換)
+├── hooks-state.ts             (8 hooks + transition + deferred)
 ├── jsx-types.ts
-├── fiber.ts
-├── work-loop.ts
+├── fiber.ts                   (Hook の discriminated union, suspended/error)
+├── work-loop.ts               (二重バッファ + commit phase + Suspense/ErrorBoundary/Portal)
 ├── scheduler.ts
 ├── context.ts
-├── h.ts
+├── h.ts                       (tagged template literal パーサ)
 ├── suspense.ts
 ├── error-boundary.ts
 ├── portal.ts
-├── router.ts              (NEW)
-├── dev-tools.ts           (NEW)
-└── index.ts               (router / dev-tools API を export)
+├── router.ts                  (hash router)
+├── dev-tools.ts               (fiber tree 可視化)
+├── mini-react.ts              (NEW: 1 ファイル版 React)
+├── rsc.ts                     (NEW: React Server Components)
+└── index.ts                   (全 API export)
 
-tests/  (32 ファイル / 229 テスト)
-[既存 30 + Part 6 新規 2: router / dev-tools]
+tests/  (34 ファイル / 246 テスト)
+[Part 1-6 既存 32 + Part 7 新規 2: mini-react / rsc]
 ```
 
 ### 本文
@@ -123,30 +119,48 @@ tests/  (32 ファイル / 229 テスト)
 30-hooks/         (Part 3: 9 章, 完了)
 40-jsx/           (Part 4: 5 章, 完了)
 50-concurrent/    (Part 5: 6 章, 完了)
-60-web-essentials/  (Part 6: 5 章, 完了 ★)
-  010 ルーティング — hash router の最小実装         NEW
-  020 フォーム — controlled vs uncontrolled        NEW
-  030 リスト最適化 — key と virtualization         NEW
-  040 アクセシビリティ — ARIA / focus 管理          NEW
-  050 デバッグツール — fiber tree の可視化         NEW
+60-web-essentials/  (Part 6: 5 章, 完了)
+70-appendix/        (Part 7: 4 章, 完了 ★)
+  010 A.1 30 分で React を作る (1 ファイル版)             NEW
+  020 A.2 本家 React のソースコードを読む                NEW
+  030 A.3 chibivue ↔ chibireact マッピング表             NEW
+  040 A.4 最小 RSC 実装に挑戦する                        NEW
 ```
+
+→ **53 章中 53 章 完走 (100%) ★★**
 
 ---
 
 ## レビューしてほしいポイント
 
-### A. 概念章中心の構成 (6.2/6.3/6.4)
-コード変更ゼロの章が 3 つ連続。Part 1-5 と比べて実装比重が下がる。これが「実プロダクションで意識すべき領域」を整理する Part として違和感がないか。
+### A. mini-react.ts (A.1) のスコープ
+250 行で Part 1-3 の核心を圧縮。useEffect / Suspense / Concurrent は本書本体で扱うため省略。
+「全部入りでなく、コアだけを 1 ファイル」という方針が読者にとって価値があるか。
 
-### B. 6.1 ハッシュルーターのスコープ
-パスパラメータ・History API・ネストルートは本書スコープ外と明示済。70 行で書ける範囲としての完成度は妥当か。
+### B. RSC (A.4) の本書実装の意義
+本家との差 (Flight 形式 / streaming / use client / Server Action) を本文で明示済。
+「概念を分かる最小実装」として 200 行で構築。
+本書のオリジナリティ強化として位置付け、本家コードを読む前の足場として機能するか。
 
-### C. 6.5 デバッグツールの簡素さ
-本物 React DevTools (GUI + Profiler) には遠く及ばないが、`console.log(dumpFiberTree(root))` で「fiber tree が見える」体験は提供できる。教育目的としての位置付けは妥当か。
+### C. 章末の「本書を読み終えたあなたへ」メッセージ
+A.4 章末に本書全体の振り返りと感謝を入れた。著者性を強く感じる文体になったが、本書のトーンとして許容できるか。
 
-### D. Plans からの逸脱
-原案では 6.5 が「DevTools 概観」だったが、実装ありの章にした (簡素なものを実装)。
-原案の網掛け (Web Components / SSR / RSC など) は本書スコープ外として割愛。これらは Part 7 付録または別書籍候補。
+### D. ブランチ運用
+Part 6 PR が未マージのため Part 7 を Part 6 tip から派生。Part 6 マージ後 main に rebase 想定。
+履歴整理時の対応が必要。
+
+---
+
+## 本書完走時点での累計
+
+| 指標 | 値 |
+|---|---|
+| 章数 | **53 / 53 (100%)** |
+| テスト | **246 / 246 緑** |
+| テストファイル | 34 |
+| src ファイル | 18 |
+| ラウンド数 | 16 |
+| 期間 | 2026-05-02 〜 2026-05-09 (約 1 週間) |
 
 ---
 
@@ -154,16 +168,19 @@ tests/  (32 ファイル / 229 テスト)
 
 | # | 内容 | 工数 |
 |---|---|---|
-| **a** | Part 6 ブランチを push、PR 作成 | 1 分 |
-| **b** | Part 7「付録」(4 章) | 4-8 時間 |
-| **c** | render.ts の TS narrowing 修正 | 30 分 |
-| **d** | examples/ ディレクトリで動くサンプル整備 | 1-2 時間 |
+| **a** | Part 7 ブランチを push、PR 作成 | 1 分 |
+| **b** | render.ts の TS narrowing 修正 (pre-existing) | 30 分 |
+| **c** | examples/ ディレクトリで動くサンプル整備 | 1-2 時間 |
+| **d** | License 決定 + LICENSE ファイル追加 | 30 分 |
+| **e** | Cloudflare Workers デプロイ | 1-2 時間 |
+| **f** | 本書のリリース告知 (Twitter / Zenn) | 1 時間 |
 
-**進捗**: 53 章中 **52 章 (98%) 完了**。残り 4 章。
-**個人的推奨**: a (push + PR) → b (Part 7 で完走!)
+**進捗**: **本書完走 (100%)**。残るは推敲・整備・公開準備のみ。
+**個人的推奨**: a (push + PR) → 中間レビュー → b (型エラー掃除) → e (デプロイ) → f (告知)。
 
 ---
 
 ## 削除候補
 
-このファイル自体は「自律作業ログ」なので、history が落ち着いたら削除を検討してください。
+このファイル自体は「自律作業ログ」なので、本書公開前に削除を検討してください。
+完成記念として README.md に「執筆過程の記録」として残すのも一案。
