@@ -6,4 +6,5 @@ export default {
   '30-hooks': 'Hooks の実装',
   '40-jsx': 'JSX とビルドツール',
   '50-concurrent': 'Concurrent Rendering と Suspense',
+  '60-web-essentials': 'Web Application Essentials',
 }
