@@ -1,0 +1,377 @@
+---
+title: A.4 最小 RSC 実装に挑戦する
+description: React Server Components の核心を 200 行で再現します。Server Component / Client Reference / Payload シリアライズ。本書の最終章
+---
+
+# A.4 最小 RSC 実装に挑戦する
+
+本書最後の章にして最大の挑戦です。
+
+**React Server Components (RSC)** は React 19 で正式機能となった「サーバ側で実行されるコンポーネント」の仕組み。本格的な解説書はまだ少なく、**世界的にも空白領域** です。
+
+本章では RSC の **核心だけ** を約 200 行で実装し、「server で render → 文字列で client に送る → client が復元して描画」のフローを実証します。
+
+## この章のゴール
+
+- Server Component / Client Component の区別が分かる
+- RSC payload の役割と内容を説明できる
+- `markAsClientComponent` / `registerClientComponent` の **Client Reference** 機構を理解する
+- async server component が `await` できる理由が腑に落ちる
+- 本書の総まとめとしての「全機能の集大成」を体感する
+
+> 章末に動くもの: server-side で payload 生成 → JSON 化 → client で復元 → Counter 動作。テスト 10 個追加で累計 **246/246**。**Part 7 完走** で全 53 章中 **53 章 (100%) 制覇**！
+
+前章: [A.3 chibivue ↔ chibireact マッピング表](./030-chibivue-mapping)
+
+## RSC とは何か
+
+**従来の React (CSR + SSR)**:
+
+```
+Browser → request → Server (SSR で HTML 生成) → Browser (HTML + JS bundle で hydrate)
+```
+
+JS bundle に **すべてのコンポーネント** が含まれる。`<UserCard>` が DB を読むなら、bundle に DB 接続コードが入るか、API を分けて fetch する必要がある。
+
+**RSC (React 19+)**:
+
+```
+Browser → request → Server (一部 Component を実行) → Server (Payload 生成) → Browser (Payload + 必要な JS だけ)
+```
+
+「**サーバでだけ動くコンポーネント**」を作れる。直接 DB を読める、bundle に含まれない、async な処理 (await) が許される。
+
+## Server / Client Component の違い
+
+| 観点 | Server Component | Client Component |
+|---|---|---|
+| 実行場所 | サーバのみ | ブラウザ (+ SSR で Node も) |
+| async | OK | 不可 (制限あり) |
+| useState / useEffect | **使えない** | 使える |
+| イベントハンドラ | 渡せない (関数 props 不可) | 普通に書ける |
+| DB / ファイル / 環境変数 | 直接アクセス可能 | NG (普通の React と同じ) |
+| bundle に含まれるか | **含まれない** | 含まれる |
+
+## API
+
+```ts
+// 1. server-side: element tree を payload に
+const payload = await renderToRSCPayload(element)
+
+// 2. payload を client に送る (HTTP / streaming)
+const json = JSON.stringify(payload)
+
+// 3. client-side: client component を登録
+registerClientComponent('Counter', Counter)
+
+// 4. payload を element に戻して描画
+const element = payloadToElement(JSON.parse(json))
+createRoot(container).render(element)
+```
+
+## 実装: 型と server side
+
+```ts
+export type RSCPayload =
+  | string
+  | number
+  | boolean
+  | null
+  | RSCElementPayload
+  | RSCClientReferencePayload
+  | RSCPayload[]
+
+export type RSCElementPayload = {
+  $$typeof: 'host'
+  type: string
+  props: Record<string, unknown>
+  children: RSCPayload[]
+}
+
+export type RSCClientReferencePayload = {
+  $$typeof: 'client-ref'
+  ref: string  // 登録名
+  props: Record<string, unknown>
+  children: RSCPayload[]
+}
+```
+
+server-side rendering:
+
+```ts
+export async function renderToRSCPayload(node: ChibireactNode): Promise<RSCPayload> {
+  if (node === null || node === undefined || node === false || node === true) return null
+  if (typeof node === 'string' || typeof node === 'number') return node
+  if (Array.isArray(node)) {
+    const out: RSCPayload[] = []
+    for (const c of node) {
+      const p = await renderToRSCPayload(c)
+      if (p !== null) out.push(p)
+    }
+    return out
+  }
+
+  const el = node as ChibireactElement
+
+  // Client Reference (markAsClientComponent でフラグ付け済)
+  if (typeof el.type === 'function' && (el.type as any).$$clientRef) {
+    return {
+      $$typeof: 'client-ref',
+      ref: (el.type as any).$$clientRef,
+      props: el.props,
+      children: await Promise.all(el.children.map(renderToRSCPayload)),
+    }
+  }
+
+  // Server Component (関数): 呼び出して結果を payload 化
+  if (typeof el.type === 'function') {
+    const result = await el.type({ ...el.props, children: el.children })
+    return renderToRSCPayload(result)
+  }
+
+  // Host element
+  return {
+    $$typeof: 'host',
+    type: el.type,
+    props: serializableProps(el.props),  // function props は除去
+    children: await Promise.all(el.children.map(renderToRSCPayload)),
+  }
+}
+```
+
+ポイント:
+- 関数コンポは **await できる** (async function 対応)
+- `markAsClientComponent` 済の関数は **呼ばずに参照のまま** payload に
+- 関数 props はシリアライズ不可なので **除去** (本家 React は Server Action で別解決)
+
+## 実装: client side
+
+```ts
+const clientRegistry = new Map<string, Function>()
+
+export function registerClientComponent(name: string, fn: Function): void {
+  clientRegistry.set(name, fn)
+}
+
+export function markAsClientComponent<F extends Function>(name: string, fn: F): F {
+  ;(fn as any).$$clientRef = name
+  return fn
+}
+
+export function payloadToElement(payload: RSCPayload): ChibireactNode {
+  if (payload === null) return null
+  if (typeof payload === 'string' || typeof payload === 'number') return payload
+  if (typeof payload === 'boolean') return null
+  if (Array.isArray(payload)) return payload.map(payloadToElement)
+
+  if (payload.$$typeof === 'host') {
+    return createElement(payload.type, payload.props, ...payload.children.map(payloadToElement))
+  }
+  if (payload.$$typeof === 'client-ref') {
+    const fn = clientRegistry.get(payload.ref)
+    if (!fn) throw new Error(`Client component "${payload.ref}" not registered`)
+    return createElement(fn, payload.props, ...payload.children.map(payloadToElement))
+  }
+  return null
+}
+```
+
+13 行の registry + 18 行の dispatcher。これだけで RSC のエッセンスが動きます。
+
+## テストで動作確認
+
+### Server-side: 単純な server component
+
+```ts
+const Greeting = (props: { name: string }) =>
+  createElement('span', null, `hello, ${props.name}`)
+
+const payload = await renderToRSCPayload(
+  createElement(Greeting, { name: 'world' }),
+)
+// payload === { $$typeof: 'host', type: 'span', props: {}, children: ['hello, world'] }
+```
+
+### Server-side: async server component
+
+```ts
+const fakeFetch = async (id: number) => ({ name: `User ${id}` })
+
+const UserCard = async (props: { id: number }) => {
+  const user = await fakeFetch(props.id)  // ← server component なら await できる
+  return createElement('div', null, user.name)
+}
+
+const payload = await renderToRSCPayload(
+  createElement(UserCard, { id: 42 }),
+)
+// payload.children === ['User 42']
+```
+
+### Client Reference の round-trip
+
+```ts
+// Client component (state を持つ)
+const Counter = markAsClientComponent('Counter', function Counter() {
+  const [count, setCount] = useState(0)
+  return createElement('button',
+    { onClick: () => setCount(count + 1) },
+    `${count}`,
+  )
+})
+registerClientComponent('Counter', Counter)
+
+// Server: payload 生成
+const Page = () => createElement(Counter, null)
+const payload = await renderToRSCPayload(createElement(Page, null))
+// payload === { $$typeof: 'client-ref', ref: 'Counter', props: {}, children: [] }
+
+// Network 越しでも JSON.stringify できる
+const json = JSON.stringify(payload)
+
+// Client side: payload → element → render
+const restored = payloadToElement(JSON.parse(json))
+createRoot(container).render(restored)
+
+// button.click() で state が更新される
+button.click()
+await flushMicrotasks()
+// → '1' に
+```
+
+**Server で生成された "ボタンの形" を Client で hydrate して、state も動く** — RSC のエッセンスが手の内にあります。
+
+## 本家 React 19 RSC との違い
+
+| 観点 | 本書実装 | 本家 React 19 |
+|---|---|---|
+| Payload 形式 | JSON 互換 | "Flight" バイナリ形式 |
+| Streaming | なし (一括生成) | あり (chunked transfer) |
+| `'use client'` ディレクティブ | `markAsClientComponent` で代替 | バンドラ統合で自動 |
+| `'use server'` (Server Action) | 未対応 | あり |
+| Suspense との統合 | 未対応 | streaming の境界として動く |
+| バンドラ統合 | なし (手動 register) | webpack / Next.js で自動 |
+
+本書実装は **シンプル化のため多くを犠牲** にしていますが、**核心の概念 (server で render → reference → client で復元)** は完全に同じです。
+
+## ちょっと深掘り
+
+### `'use client'` ディレクティブの実態
+
+本家 RSC では:
+
+```tsx
+'use client'  // ← この文字列が Counter.tsx の先頭にあるとバンドラが反応
+
+import { useState } from 'react'
+
+export default function Counter() {
+  const [count, setCount] = useState(0)
+  return <button onClick={() => setCount(c => c + 1)}>{count}</button>
+}
+```
+
+バンドラ (Webpack / Turbopack) が:
+1. `'use client'` を検出
+2. このファイルをクライアントバンドルに振り分け
+3. server side では **Reference (パス + named export)** を生成
+4. client side で実際の関数として解決
+
+これを本書では **`markAsClientComponent('Counter', fn)`** という明示登録で代替しています。バンドラ統合が無ければ手動で済ませる、というシンプルな設計。
+
+### Server Action とは
+
+`'use server'` の片割れ:
+
+```tsx
+'use server'
+
+export async function createPost(formData: FormData) {
+  await db.posts.insert({ title: formData.get('title') })
+}
+
+// client component から
+<form action={createPost}>
+  <input name="title" />
+  <button>Create</button>
+</form>
+```
+
+「**関数を server に予約 push**」する仕組み。client から呼ぶと裏で HTTP POST が走り、server で `createPost` が実行されます。
+
+本書では実装しませんが、形は **「関数 reference の双方向版 RSC」** とも言えます。
+
+### RSC × Suspense の組み合わせ
+
+実プロダクションでは streaming + Suspense が標準:
+
+```tsx
+<Suspense fallback={<Spinner />}>
+  <SlowAsyncComponent />  {/* server side で await が長い */}
+</Suspense>
+```
+
+server は最初に **Suspense の境界まで** 生成して送る → ブラウザは即座に Spinner を表示 → server side で await 完了 → 続きの payload が送られる → ブラウザは Spinner を本物に置換。
+
+これが React 19 + Next.js App Router の **「待たせない SSR」** の正体です。本書 Part 5.4 の Suspense と組み合わせれば近いことが作れます (本書スコープ外)。
+
+### RSC は新しいパラダイム
+
+10 年前のフロントエンド界はサーバ vs クライアントの二項対立でしたが、RSC は **「コンポネント単位で実行場所を選べる」** 第 3 の道を開きました:
+
+- ブログ記事の本文 → Server Component (動かないので)
+- いいねボタン → Client Component (state が要る)
+- 著者プロフィール → Server Component (DB から取る)
+- コメント投稿フォーム → Client Component (input handler)
+
+**1 ページの中で混在** できるのが画期的。ページ全体を CSR か SSR に振り分けていた時代の終わり。
+
+### Vue / Solid / Qwik の対応状況
+
+- **Vue (Nuxt)**: server component は実験的、Vue 公式の正式機能ではない
+- **Solid**: SolidStart で server functions が標準
+- **Qwik**: resumability で似た概念だがアプローチは別 (全てを serializable に)
+- **SvelteKit**: load 関数で似た領域をカバー
+
+「**フロントエンドフレームワークが server / client の境界を再定義** している」のがこの時代の潮流。本書 RSC 実装はその一端に触れる教材です。
+
+## 本書を読み終えたあなたへ
+
+ここまで読んでくださって、本当にありがとうございました。
+
+53 章を通じて、本書 chibireact は:
+
+- **Stack reconciler** から始め (Part 1)
+- **Fiber** で中断・再開可能に (Part 2)
+- **Hooks** で関数コンポを実用化 (Part 3)
+- **JSX** で書き心地を良くし (Part 4)
+- **Concurrent Rendering / Suspense** で並行性を獲得 (Part 5)
+- **実用パターン** を整理し (Part 6)
+- **本書の核心を 1 ファイルに圧縮 + RSC** に挑む (Part 7)
+
+という旅をしてきました。**246 個のテスト**が全て緑で動くチビ React は、あなたの手元にあります。
+
+これからは:
+- 本書のコードを **改造** して useEffect バリエーションや独自 hook を追加
+- 本家 React のソースを A.2 の地図を頼りに探検
+- 自分のプロダクトで「フレームワークの中身が見えてる」感覚で開発
+- もし気が向いたら、本書を Vue / Solid / Qwik 経験者として読み比べ
+
+「**フレームワークに使われる側から、設計判断ができる側へ**」。本書がそのきっかけになれば幸いです。
+
+## まとめ
+
+- RSC の本質は **server で render → Reference 経由で client が復元** の 2 段階
+- 本書実装は約 200 行: payload 型 / renderToRSCPayload / payloadToElement / registerClientComponent / markAsClientComponent
+- async server component / Client Reference / 関数 props 除去まで対応
+- 本家 React 19 と概念は同じ、機能差 (Streaming / Server Action / バンドラ統合) は本書スコープ外
+
+## 本書全 53 章 完走
+
+```
+Part 0: ✓ Part 1: ✓ Part 2: ✓ Part 3: ✓ Part 4: ✓ Part 5: ✓ Part 6: ✓ Part 7: ✓
+```
+
+**100%。お疲れさまでした。**
+
+→ あなたの React 開発が、本書を読む前と後で違うものになっていますように。
