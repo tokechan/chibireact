@@ -23,6 +23,19 @@ export { Suspense } from './suspense'
 export { ErrorBoundary } from './error-boundary'
 export type { ErrorBoundaryProps } from './error-boundary'
 export { createPortal, PORTAL } from './portal'
+export { useHashLocation, Link, Route, Switch } from './router'
+export { dumpFiberTree, findFiber, fiberStats } from './dev-tools'
+export {
+  renderToRSCPayload,
+  payloadToElement,
+  registerClientComponent,
+  markAsClientComponent,
+} from './rsc'
+export type {
+  RSCPayload,
+  RSCElementPayload,
+  RSCClientReferencePayload,
+} from './rsc'
 export { requestIdleWork } from './scheduler'
 export type { IdleDeadline, IdleWorkCallback } from './scheduler'
 export type { ChibireactElement, ChibireactNode } from './types'

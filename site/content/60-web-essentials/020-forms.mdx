@@ -1,0 +1,322 @@
+---
+title: フォーム — controlled vs uncontrolled
+description: 入力フォーム管理の 2 つのパターンを整理し、useReducer による複雑フォーム管理パターンを示します
+---
+
+# フォーム — controlled vs uncontrolled
+
+[ルーティング](./010-routing) で URL とコンポーネントを結びつけました。
+本章は **入力フォーム** の管理パターンを整理します。
+
+React のフォームには 2 流派があります:
+- **Controlled**: 全入力値を React state に持つ
+- **Uncontrolled**: DOM が値を持ち、必要なときだけ参照する
+
+両者の使い分けと、複雑なフォームのための **useReducer + custom hook** パターンを見ていきます。
+
+## この章のゴール
+
+- Controlled / Uncontrolled の違いと選択基準が言える
+- 単純な useState ベースのフォームが書ける
+- 複雑なフォームを useReducer で整理できる
+- バリデーション・エラー表示の典型パターンを理解する
+
+> 章末に動くもの: なし（パターン解説）。コード変更ゼロ。
+
+前章: [ルーティング — hash router の最小実装](./010-routing)
+
+## Controlled パターン
+
+state が **唯一の真実 (single source of truth)**:
+
+```tsx
+function Form() {
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={name}
+        onChange={e => setName(e.target.value)}
+      />
+      <input
+        type="email"
+        value={email}
+        onChange={e => setEmail(e.target.value)}
+      />
+      <button>Submit</button>
+    </form>
+  )
+}
+```
+
+特徴:
+- **入力中の値が常に React state に存在** → リアルタイム検証・整形が容易
+- 入力欄の表示と state が完全同期
+- React が **入力欄を 1 文字書き換えるたびに再 render**
+- 大量の入力欄 + 1 つを変えるたび全部再 render → パフォーマンス考慮が必要
+
+## Uncontrolled パターン
+
+DOM が値を持ち、submit 時にだけ取り出す:
+
+```tsx
+function Form() {
+  const nameRef = useRef<HTMLInputElement>(null)
+  const emailRef = useRef<HTMLInputElement>(null)
+
+  const handleSubmit = (e) => {
+    e.preventDefault()
+    console.log({
+      name: nameRef.current.value,
+      email: emailRef.current.value,
+    })
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input ref={nameRef} defaultValue="" />
+      <input type="email" ref={emailRef} defaultValue="" />
+      <button>Submit</button>
+    </form>
+  )
+}
+```
+
+特徴:
+- **入力中は再 render しない** → 高速
+- React は最小関与 (DOM がほぼ全権)
+- リアルタイム検証は手動 (input イベントで自分で読む)
+- ファイル入力 (`<input type="file" />`) は **常に uncontrolled**
+
+## 使い分けの目安
+
+| 状況 | 推奨 |
+|---|---|
+| 入力中に値を表示・整形・検証したい | **Controlled** |
+| 大量入力欄 (50+) でパフォーマンスが気になる | **Uncontrolled** |
+| ファイル入力 | **Uncontrolled (強制)** |
+| ライブラリ (react-hook-form) を使う | 内部は Uncontrolled |
+
+実務では **react-hook-form** や **Formik** が定番。それぞれ特徴:
+- **react-hook-form**: 内部は Uncontrolled、再 render 最小
+- **Formik**: Controlled ベース、API がシンプル
+
+## 複雑なフォームを useReducer で
+
+複数フィールド + バリデーション + エラー表示は useReducer が向きます:
+
+```tsx
+type FormState = {
+  values: { name: string; email: string; age: number }
+  errors: Partial<Record<keyof FormState['values'], string>>
+  touched: Partial<Record<keyof FormState['values'], boolean>>
+}
+
+type Action =
+  | { type: 'change'; field: keyof FormState['values']; value: string | number }
+  | { type: 'blur'; field: keyof FormState['values'] }
+  | { type: 'submit' }
+
+const reducer = (s: FormState, a: Action): FormState => {
+  switch (a.type) {
+    case 'change': {
+      const values = { ...s.values, [a.field]: a.value }
+      return { ...s, values, errors: validate(values) }
+    }
+    case 'blur':
+      return { ...s, touched: { ...s.touched, [a.field]: true } }
+    case 'submit':
+      return { ...s, touched: allTrue(s.touched) }
+  }
+}
+
+function validate(values: FormState['values']): FormState['errors'] {
+  const errors: FormState['errors'] = {}
+  if (!values.name) errors.name = 'name is required'
+  if (!/^[^@]+@[^@]+$/.test(values.email)) errors.email = 'invalid email'
+  if (values.age < 0) errors.age = 'age must be >= 0'
+  return errors
+}
+```
+
+使う側:
+
+```tsx
+function Form() {
+  const [state, dispatch] = useReducer(reducer, initialState)
+
+  return (
+    <form onSubmit={() => dispatch({ type: 'submit' })}>
+      <input
+        value={state.values.name}
+        onChange={e => dispatch({ type: 'change', field: 'name', value: e.target.value })}
+        onBlur={() => dispatch({ type: 'blur', field: 'name' })}
+      />
+      {state.touched.name && state.errors.name && (
+        <span role="alert">{state.errors.name}</span>
+      )}
+      {/* ... */}
+    </form>
+  )
+}
+```
+
+利点:
+- 状態遷移が **reducer 関数に集約** されてテスト容易
+- バリデーションが純粋関数 (`validate`) で分離
+- `touched` の管理で「入力前にエラーを見せない」UX が綺麗
+
+## バリデーションのパターン
+
+### 即時バリデーション
+
+入力中に都度検証:
+
+```tsx
+const handleChange = (e) => {
+  const value = e.target.value
+  setName(value)
+  if (value.length < 3) setError('短すぎ')
+  else setError('')
+}
+```
+
+UX: 即座に間違いに気づける。書きながら直せる。
+
+### onBlur バリデーション
+
+入力欄から離れたときだけ検証:
+
+```tsx
+<input
+  value={name}
+  onChange={e => setName(e.target.value)}
+  onBlur={() => {
+    if (name.length < 3) setError('短すぎ')
+  }}
+/>
+```
+
+UX: 書いてる途中にエラーが出ない。落ち着く。
+
+### Submit 時バリデーション
+
+提出時に全部検証:
+
+```tsx
+const handleSubmit = (e) => {
+  e.preventDefault()
+  const errors = validate(values)
+  if (Object.keys(errors).length > 0) {
+    setErrors(errors)
+    return
+  }
+  // 送信
+}
+```
+
+UX: 確実に防げるが、ユーザは長く書いた後で初めてエラーを見る。
+
+実務ではこの 3 つを組み合わせ:
+- onChange: 軽量検証 (long string, format)
+- onBlur: 中程度 (email format, range)
+- onSubmit: 重い検証 (server-side, async)
+
+## アクセシビリティ
+
+フォーム要素には **`<label>` を必ず付ける**:
+
+```tsx
+// ✗ NG
+<span>Name</span>
+<input value={name} onChange={...} />
+
+// ✓ OK (1)
+<label>
+  Name
+  <input value={name} onChange={...} />
+</label>
+
+// ✓ OK (2)
+<label htmlFor="name-input">Name</label>
+<input id="name-input" value={name} onChange={...} />
+```
+
+エラー表示は `role="alert"` で:
+
+```tsx
+{error && <span role="alert">{error}</span>}
+```
+
+スクリーンリーダーが「アラートが出た」と読み上げます。Part 6.4 でアクセシビリティを深掘り。
+
+## ちょっと深掘り
+
+### react-hook-form の発想
+
+[react-hook-form](https://react-hook-form.com/) は **Uncontrolled** ベースで「再 render 最小」を売りにしています:
+
+```tsx
+import { useForm } from 'react-hook-form'
+
+function Form() {
+  const { register, handleSubmit, formState: { errors } } = useForm()
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)}>
+      <input {...register('name', { required: true })} />
+      {errors.name && <span>required</span>}
+      <button>Submit</button>
+    </form>
+  )
+}
+```
+
+`register('name')` は内部で `ref` と `onChange` を返し、その入力欄を「観察対象」として登録。Form 全体ではなく該当欄だけを再 render。
+
+本書 chibireact では `register` を作る練習問題として書けますが、**ref props 自動配線** が必要なので未対応。
+
+### Form Actions (React 19)
+
+React 19 で `<form action={fn}>` の form action が公式機能に:
+
+```tsx
+function Form() {
+  return (
+    <form action={async (formData) => {
+      'use server'  // server action
+      await db.insert(formData)
+    }}>
+      <input name="name" />
+      <button>Submit</button>
+    </form>
+  )
+}
+```
+
+ブラウザ標準の form 送信を React がフックして、サーバー Actions と統合。
+SSR 前提なので本書 chibireact ではスコープ外ですが、新しい標準として知っておくと良い。
+
+### 制御されすぎないコントロール
+
+useState で全フィールドを管理すると、**入力中に毎キーストロークで全コンポが再 render**。
+大量フィールドフォーム (50+) では:
+- フォーム全体を `memo()` してフィールド単位に分離
+- フィールド単位で useState
+- またはライブラリに任せる (react-hook-form)
+
+「**state 管理の粒度を、再 render の粒度と合わせる**」が原則。
+
+## まとめ
+
+- Controlled: state が真実、再 render 多め、リアルタイム検証 OK
+- Uncontrolled: DOM が真実、再 render 少なめ、ファイル入力強制
+- 複雑なフォームは useReducer + 純粋関数 validate
+- バリデーション: onChange / onBlur / onSubmit を組み合わせ
+- アクセシビリティ: label 紐付けと role="alert" は必須
+
+## 次の章へ
+
+[リスト最適化 — key と virtualization](./030-list-optimization)（執筆中）で、大量リストを高速に描画する戦略を整理します。

@@ -1,0 +1,305 @@
+---
+title: ルーティング — hash router の最小実装
+description: SPA における URL とコンポーネントの対応付けを最小コードで実装します。useState + useEffect + window.hashchange だけで動く骨格
+---
+
+# ルーティング — hash router の最小実装
+
+Part 6 へようこそ。ここからは React 自体の機能ではなく、**実 Web アプリで欠かせない要素** を整理します。
+
+最初は **ルーティング**。SPA で「URL → どのコンポを描画するか」を結びつける仕組みです。
+本書 chibireact では Part 3 で作った hooks だけを使い、**70 行ほど** で動くハッシュルーターを書きます。
+
+## この章のゴール
+
+- SPA ルーティングの本質 (URL → component のマップ) を理解する
+- ハッシュルーティング (`#/foo`) と History API の違いが言える
+- `useHashLocation` / `Link` / `Route` / `Switch` を実装できる
+- 「サーバ設定不要」のメリットと「URL に # が残る」デメリットの両方を把握する
+
+> 章末に動くもの: 最小ハッシュルーター。テスト 5 個追加で累計 **222/222**。
+
+前章: [Part 5.6 Portal](../50-concurrent/060-portal)
+
+## ハッシュルーティングを採用する理由
+
+ブラウザでルーティングを実装する方法は 2 種類:
+
+| 方式 | URL 例 | サーバ設定 | Pros |
+|---|---|---|---|
+| ハッシュ | `/app/#/users` | **不要** | 静的ホスティング OK / 戻る進む自動 / 実装簡単 |
+| History API | `/app/users` | **必要** (全パスを index.html に) | URL が綺麗 / SEO 対応しやすい |
+
+本書 chibireact は **教育目的** なので、サーバ設定不要のハッシュ方式を採用します。
+プロダクションでは History API ベースのほうが一般的ですが、本質は同じ:
+- URL から「現在のパス」を取り出す
+- パス変化を購読して再 render する
+- リンククリックで URL を書き換える
+
+## API
+
+```tsx
+// 4 つの API
+const [path, navigate] = useHashLocation()
+<Link to="/users">Users</Link>
+<Route path="/users" component={UsersPage} />
+<Switch>
+  <Route path="/" component={Home} />
+  <Route path="/users" component={Users} />
+  <Route path="*" component={NotFound} />
+</Switch>
+```
+
+## 実装: `useHashLocation`
+
+ハッシュを購読する hook:
+
+```ts
+function getHashPath(): string {
+  if (typeof window === 'undefined') return '/'
+  const hash = window.location.hash
+  if (!hash || hash === '#') return '/'
+  return hash.startsWith('#') ? hash.slice(1) || '/' : hash
+}
+
+export function useHashLocation(): [string, (to: string) => void] {
+  const [path, setPath] = useState(getHashPath())
+
+  useEffect(() => {
+    const listener = () => setPath(getHashPath())
+    window.addEventListener('hashchange', listener)
+    return () => window.removeEventListener('hashchange', listener)
+  }, [])
+
+  const navigate = (to: string) => {
+    window.location.hash = to.startsWith('/') ? to : `/${to}`
+  }
+
+  return [path, navigate]
+}
+```
+
+ポイント:
+- `useState(getHashPath())` で初期パスを取得
+- `useEffect` で `hashchange` イベントを購読
+- cleanup で `removeEventListener` (Part 3.4 で習った副作用パターン)
+
+## 実装: `Link`
+
+`a` タグの薄いラッパ:
+
+```tsx
+export function Link(props: {
+  to: string
+  children?: ChibireactNode | ChibireactNode[]
+}) {
+  const handleClick = (e: MouseEvent) => {
+    if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
+    // 修飾キーなしならブラウザのデフォルト挙動 (hash 書き換え) に任せる
+  }
+  const href = `#${props.to.startsWith('/') ? props.to : `/${props.to}`}`
+  return createElement('a', { href, onClick: handleClick }, props.children)
+}
+```
+
+ポイント:
+- **`<a href="#/...">` を生成** するだけ
+- ブラウザがデフォルトで hash を書き換えるので preventDefault 不要
+- 修飾キー (Cmd / Ctrl) 押下時は通常クリック動作 (新タブ等) に任せる
+- アクセシビリティ: 普通の `<a>` なのでスクリーンリーダや右クリックメニューが正常動作
+
+## 実装: `Route` / `Switch`
+
+```tsx
+export function Route(props: {
+  path: string
+  component: () => ChibireactNode
+}) {
+  const [current] = useHashLocation()
+  if (current !== props.path) return null
+  return props.component()
+}
+
+export function Switch(props: { children?: ChibireactNode | ChibireactNode[] }) {
+  const [current] = useHashLocation()
+  const list = Array.isArray(props.children) ? props.children : [props.children]
+  for (const child of list) {
+    if (child.type === Route) {
+      const path = child.props.path
+      if (path === '*' || path === current) {
+        return child.props.component()
+      }
+    }
+  }
+  return null
+}
+```
+
+`Switch` は **最初にマッチした 1 つだけ** 描画。`'*'` は wildcard でフォールバック。
+
+## 使用例
+
+```tsx
+const Home = () => createElement('h1', null, 'Welcome')
+const Users = () => createElement('h1', null, 'Users')
+const NotFound = () => createElement('h1', null, '404')
+
+const App = () => createElement('div', null,
+  createElement('nav', null,
+    createElement(Link, { to: '/' }, 'Home'),
+    ' | ',
+    createElement(Link, { to: '/users' }, 'Users'),
+  ),
+  createElement(Switch, null,
+    createElement(Route, { path: '/', component: Home }),
+    createElement(Route, { path: '/users', component: Users }),
+    createElement(Route, { path: '*', component: NotFound }),
+  ),
+)
+```
+
+## テストで動作確認
+
+ルートの切り替え:
+
+```ts
+it('Route はパスがマッチしたときだけ描画する', async () => {
+  const Home = () => createElement('span', null, 'home')
+  const Users = () => createElement('span', null, 'users')
+
+  const App = () => createElement('div', null,
+    createElement(Route, { path: '/', component: Home }),
+    createElement(Route, { path: '/users', component: Users }),
+  )
+
+  // 初期 # → '/' → home が表示
+  // hash を '#/users' に変更 → users が表示
+})
+```
+
+Link クリックで hash 更新:
+
+```ts
+it('Link をクリックすると hash が更新され Route が切り替わる', async () => {
+  // <Link to="/about">go-about</Link> + <Route ... /> を render
+  // link.click() → hash が '#/about' に → Route が About を render
+})
+```
+
+## 制限と発展
+
+| 機能 | 本書 | 本格版 |
+|---|---|---|
+| 完全一致パス | ✓ | ✓ |
+| `'*'` ワイルドカード | ✓ | ✓ |
+| パスパラメータ (`/users/:id`) | ❌ | ✓ |
+| クエリパラメータ抽出 | ❌ | ✓ |
+| ネストルート | ❌ | ✓ |
+| History API ルーティング | ❌ | ✓ |
+| ルートガード / 認証チェック | ❌ | ✓ |
+| 遷移アニメーション | ❌ | ✓ |
+
+実プロジェクトでは [react-router](https://reactrouter.com) / [TanStack Router](https://tanstack.com/router) / [wouter](https://github.com/molefrog/wouter) が定番。本書の Link/Route の API は **wouter にインスパイア** された設計です。
+
+## ちょっと深掘り
+
+### History API ルーティングの実装
+
+ハッシュ方式とほぼ同じです:
+
+```ts
+function getPath() {
+  return window.location.pathname
+}
+
+export function useLocation() {
+  const [path, setPath] = useState(getPath())
+
+  useEffect(() => {
+    const listener = () => setPath(getPath())
+    window.addEventListener('popstate', listener)
+    return () => window.removeEventListener('popstate', listener)
+  }, [])
+
+  const navigate = (to: string) => {
+    window.history.pushState({}, '', to)
+    setPath(to)  // popstate は pushState では発火しないので明示更新
+  }
+  return [path, navigate]
+}
+```
+
+違い:
+- `hashchange` → `popstate` (戻る進むのみ発火)
+- `location.hash = ...` → `history.pushState({}, '', to)` + 手動 setState
+- `<a href="/...">` → `<a href="/..." onClick={preventDefault + navigate}>` で fallback 必須
+
+サーバが `/users` のような GET にも `index.html` を返すように設定する必要あり (NGINX try_files / Vite の historyApiFallback など)。
+
+### パスパラメータの実装
+
+```ts
+function matchPath(template: string, actual: string): Record<string, string> | null {
+  const t = template.split('/').filter(Boolean)
+  const a = actual.split('/').filter(Boolean)
+  if (t.length !== a.length) return null
+
+  const params: Record<string, string> = {}
+  for (let i = 0; i < t.length; i++) {
+    if (t[i].startsWith(':')) {
+      params[t[i].slice(1)] = a[i]
+    } else if (t[i] !== a[i]) {
+      return null
+    }
+  }
+  return params
+}
+
+// '/users/:id' と '/users/42' をマッチング → { id: '42' }
+```
+
+これを `Route` に組み込めば `<Route path="/users/:id" component={UserDetail} />` が書けるようになります。
+本書では割愛しますが 30 行程度で実装可能です。
+
+### Suspense との組み合わせ
+
+```tsx
+<Switch>
+  <Route path="/users" component={() => (
+    <Suspense fallback={<Spinner />}>
+      <UsersPage />
+    </Suspense>
+  )} />
+</Switch>
+```
+
+ルート単位で Suspense を置くと、ページ切り替え時のローディング表示が自然に書けます。
+本書 Part 5.4 の Suspense と組み合わせれば、データ取得込みのページ遷移が完成します。
+
+### 「フレームワーク」としてのルーティング
+
+Next.js / Remix のような **フルスタックフレームワーク** はルーティングを **ファイルベース** で表現します:
+
+```
+app/
+├── page.tsx          → /
+├── users/
+│   ├── page.tsx      → /users
+│   └── [id]/
+│       └── page.tsx  → /users/:id
+```
+
+ファイル構造そのものがルート定義。手動で `<Route>` を書かなくて良い反面、ビルド時にルート情報を生成する必要があります。
+本書スコープ外ですが、人気の方向性として知っておくと良いです。
+
+## まとめ
+
+- ハッシュルーティングは **window.location.hash + hashchange イベント** だけで動く
+- `useHashLocation` / `Link` / `Route` / `Switch` の 4 つで最小ルーターが完成
+- 70 行ほどのコードで実プロジェクトの 80% は賄える
+- パスパラメータ・ネスト・History API は本格ライブラリで
+
+## 次の章へ
+
+[フォーム — controlled vs uncontrolled](./020-forms)（執筆中）で、入力フォームの管理パターンを整理します。
+useReducer を使った複雑なフォームの実装も。

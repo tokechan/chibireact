@@ -1,0 +1,238 @@
+---
+title: A.2 本家 React のソースコードを読む
+description: 本書を読み終えた人が React 本家リポジトリ (約 30 万行) を効果的にナビゲートするための地図とチェックリスト
+---
+
+# A.2 本家 React のソースコードを読む
+
+本書を読み終えたあなたは、**Fiber / hooks / scheduler / Suspense / Concurrent** の概念を完全に理解しています。
+ここから自然な次のステップは **本家 React のソースを読むこと** です。
+
+この章は地図です。React リポジトリのどこに何があるか、どう読めば効率的かを案内します。
+**本書の各章 → React の対応ファイル** の対応表を用意しました。
+
+## この章のゴール
+
+- React リポジトリの構造を把握する
+- 自分の関心 (Hooks / Fiber / Suspense...) ごとにエントリポイントが分かる
+- ソースを読むコツ (検索ワード / 用語 / コメント文化) を理解する
+- 困ったら参照すべき外部リソースを知る
+
+> 章末に動くもの: なし（読み方ガイド）。
+
+前章: [A.1 30 分で React を作る (1 ファイル版)](./010-thirty-min-react)
+
+## React リポジトリの全体構造
+
+[github.com/facebook/react](https://github.com/facebook/react) のディレクトリ:
+
+```
+react/
+├── packages/
+│   ├── react/                  ← createElement, hooks API surface
+│   ├── react-dom/              ← Web ターゲットの renderer (DOM 操作)
+│   ├── react-reconciler/       ← Fiber / work loop / reconciliation の本体
+│   ├── scheduler/              ← lane / 優先度 / 中断・再開
+│   ├── react-server/           ← Server Components 関連
+│   ├── react-server-dom-webpack/  ← RSC の Webpack 統合
+│   ├── shared/                 ← 各パッケージ共通ユーティリティ
+│   ├── react-devtools/         ← DevTools 拡張
+│   └── ... (他に多数)
+├── scripts/
+└── fixtures/
+```
+
+**最も重要なのは** `react-reconciler/` と `react-dom/`。本書で言う Part 2-3 の核心がここにあります。
+
+## 本書の章 ↔ React 本家ファイル 対応表
+
+### Part 1: Minimum (Stack reconciler)
+
+| 本書 | React 本家 |
+|---|---|
+| createElement | [`packages/react/src/jsx/ReactJSXElement.js`](https://github.com/facebook/react/blob/main/packages/react/src/jsx/ReactJSXElement.js) |
+| Stack reconciler 風 render | (本家にはない、Pombo 教材を参照) |
+| useState (legacy 版) | [`packages/react-reconciler/src/ReactFiberHooks.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberHooks.js) |
+
+### Part 2: Fiber
+
+| 本書 | React 本家 |
+|---|---|
+| Fiber type | [`packages/react-reconciler/src/ReactInternalTypes.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactInternalTypes.js) (Fiber type) |
+| performUnitOfWork | [`packages/react-reconciler/src/ReactFiberWorkLoop.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js) |
+| Scheduler (RIC ラッパ) | [`packages/scheduler/src/forks/SchedulerDOM.js`](https://github.com/facebook/react/blob/main/packages/scheduler/src/forks/SchedulerDOM.js) |
+| 二重バッファ | 同 ReactFiberWorkLoop.js (`workInProgressRoot` / `currentRoot`) |
+| commit phase | [`packages/react-reconciler/src/ReactFiberCommitWork.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCommitWork.js) |
+
+### Part 3: Hooks
+
+| 本書 | React 本家 |
+|---|---|
+| すべての hook 実装 | [`packages/react-reconciler/src/ReactFiberHooks.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberHooks.js) (約 4,000 行!) |
+| useState | 同ファイルの `mountState` / `updateState` |
+| useEffect | 同ファイルの `mountEffect` / `updateEffect` |
+| useContext | 同ファイルの `readContext` |
+
+### Part 4: JSX
+
+| 本書 | React 本家 |
+|---|---|
+| JSX runtime | [`packages/react/src/jsx/ReactJSXElement.js`](https://github.com/facebook/react/blob/main/packages/react/src/jsx/ReactJSXElement.js) |
+| automatic runtime entry | [`packages/react/src/jsx/jsx-runtime.js`](https://github.com/facebook/react/blob/main/packages/react/src/jsx/) |
+| Babel plugin | [`@babel/plugin-transform-react-jsx`](https://github.com/babel/babel/tree/main/packages/babel-plugin-transform-react-jsx) (別リポジトリ) |
+
+### Part 5: Concurrent
+
+| 本書 | React 本家 |
+|---|---|
+| lane | [`packages/react-reconciler/src/ReactFiberLane.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberLane.js) |
+| Suspense | [`packages/react-reconciler/src/ReactFiberSuspenseComponent.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/) |
+| Error Boundary | ReactFiberWorkLoop.js (`throwException` / `dispatchError`) |
+| Portal | ReactFiberCommitWork.js (`commitPlacement` で portal 分岐) |
+| `use(promise)` | [`packages/react-reconciler/src/ReactFiberThenable.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/) |
+
+## 読むときの順序 (おすすめ)
+
+### レベル 1: 入り口
+
+1. [`packages/react/src/React.js`](https://github.com/facebook/react/blob/main/packages/react/src/React.js) — 公開 API の輸出
+2. [`packages/react/src/jsx/ReactJSXElement.js`](https://github.com/facebook/react/blob/main/packages/react/src/jsx/ReactJSXElement.js) — createElement の本体
+3. [`packages/react-dom/src/client/ReactDOMRoot.js`](https://github.com/facebook/react/blob/main/packages/react-dom/src/client/ReactDOMRoot.js) — createRoot の入り口
+
+これで「React の API は内部でどう繋がっているか」の **全体俯瞰** が掴めます。
+
+### レベル 2: Fiber
+
+1. [`ReactInternalTypes.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactInternalTypes.js) — Fiber 型を眺める
+2. [`ReactFiberWorkLoop.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js) — `performUnitOfWork` から始める
+3. [`ReactFiberCommitWork.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCommitWork.js) — commit phase
+
+ここまでで Part 2 の理解が **本家コードでも追えます**。
+
+### レベル 3: Hooks
+
+1. [`ReactFiberHooks.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberHooks.js) を **`mountState`** と **`updateState`** から
+2. それぞれの hook 実装 (mount / update のペア) を順に
+3. dispatcher 切り替え (`HooksDispatcherOnMount` vs `HooksDispatcherOnUpdate`) のトリック
+
+このファイル 1 つで Part 3 全体に対応します。
+
+### レベル 4: Concurrent
+
+1. [`ReactFiberLane.js`](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberLane.js) — 31 ビット lane の定数
+2. [`Scheduler.js`](https://github.com/facebook/react/blob/main/packages/scheduler/src/forks/SchedulerDOM.js) — MessageChannel ベースの優先度キュー
+3. ReactFiberWorkLoop.js の `ensureRootIsScheduled` / `markRootSuspended` — lane を読み替えてどう work をスケジュールするか
+
+## 検索のコツ
+
+VS Code / GitHub のリポジトリ検索で:
+
+| 探したいもの | 検索ワード |
+|---|---|
+| ある hook の実装 | `function mount<HookName>` (例: `function mountState`) |
+| ある fiber tag の処理 | `case <Tag>:` (例: `case FunctionComponent:`) |
+| エラーメッセージ | エラー文字列を引用符付きで |
+| 設定フラグ | `enableXxx` (例: `enableSuspenseAvoidThisFallback`) |
+
+`packages/shared/ReactFeatureFlags.js` には機能フラグが集約されており、**「この機能はまだ実験中か」** が分かります。
+
+## 読むときの心得
+
+### 1. 「全部理解しよう」と思わない
+
+React のコードは **30 年分の試行錯誤** の塊です。一度に全部理解するのは無理。
+本書を読んだあなたなら、**気になった機能 1 つだけを追う** で十分。
+
+### 2. コメントが豊富 (機能フラグ周辺は特に)
+
+```js
+// We don't fall through to the regular workInProgress component.
+// Suspense never matches.
+```
+
+英語のコメントは **設計判断の理由** を含むことが多い。翻訳しながら読むと学びが深い。
+
+### 3. テストコードを併読する
+
+`packages/react-reconciler/src/__tests__/` の各テストは **「この機能は実際にどう使うか」** の最高の例:
+
+```bash
+# 全テスト見るだけでも勉強になる
+ls packages/react-reconciler/src/__tests__/
+```
+
+### 4. dev build と prod build の差を意識
+
+```js
+if (__DEV__) {
+  // 開発ビルドだけのコード (warning, type check)
+}
+```
+
+`__DEV__` ガード内のコードは production では消されます。**「警告系は読まなくていい」** と判断するのに使えます。
+
+## 参考リソース
+
+実際に React のコードを読んでいる人の記事・動画:
+
+### 公式
+
+- [React 公式ドキュメント](https://react.dev/) — 概念と使い方
+- [React RFCs](https://github.com/reactjs/rfcs) — 機能追加の提案・議論
+
+### 個人ブログ
+
+- [overreacted.io](https://overreacted.io/) — Dan Abramov (元 React コアチーム)
+- [JSer.dev](https://jser.dev/) — 内部構造の図解 (本書の元ネタ的存在)
+- [Pomb.us "Build your own React"](https://pomb.us/build-your-own-react/) — 200 行で書く
+
+### コミュニティ
+
+- [Reactiflux](https://www.reactiflux.com/) — Discord
+- [r/reactjs](https://www.reddit.com/r/reactjs/) — Reddit
+
+## ちょっと深掘り
+
+### React 内部の用語集
+
+本家コードを読むと出てくる固有名詞:
+
+- **Reconciler**: React の差分計算エンジン (Fiber based)
+- **Renderer**: 結果を反映するターゲット (react-dom / react-native / etc.)
+- **Host**: renderer ターゲット (DOM の場合は HTMLElement)
+- **Lane**: 31 ビット優先度
+- **Effect**: commit phase で実行する副作用 (DOM 操作含む)
+- **Hook**: function component に紐付く状態 (本書 Part 3)
+- **Throw**: Promise / Error を発生させること (Suspense / ErrorBoundary)
+- **Hydration**: SSR で出力した HTML に React を「上書き」する処理
+- **Dispatcher**: hook の現在の実装 (mount/update で切り替わる)
+
+### 「読むのが辛い」と感じたら
+
+巨大コードを読むのは **必ず辛い瞬間が来ます**。そのときは:
+
+- **本書に戻る** — 概念を再確認
+- **小さい機能から** — 全体を諦め、自分が興味ある hook 1 つだけ
+- **Issue / PR を読む** — 機能追加時の議論はコードより理解しやすい
+- **JSer.dev** — 図解で全体像を掴む
+
+「本家のコードを読み切ること」が目的ではなく、**「自分のコードがなぜ動くかを深く理解する」** ことが目的。本書 + 本家の組み合わせで十分達成できます。
+
+### React Compiler (Forget) のソース
+
+[github.com/facebook/react/tree/main/compiler](https://github.com/facebook/react/tree/main/compiler) に新しい Compiler のコードがあります。
+React 本体とは別の独立パッケージで、**RxJS の Babel プラグイン** として動きます。
+
+これは React の「**未来形**」なので、本書のスコープ外ですが、興味ある方には新天地です。
+
+## まとめ
+
+- React リポジトリは **`react-reconciler` と `react-dom`** が核心
+- 本書の章 ↔ 本家ファイルの対応表で迷子にならない
+- Hooks は ReactFiberHooks.js 1 つに 4,000 行集約
+- 検索は `function mount<Name>` / `case <Tag>:` / 機能フラグ
+- 全部理解しなくていい、気になった機能 1 つで十分
+
+## 次の章へ
+
+[A.3 chibivue ↔ chibireact マッピング表](./030-chibivue-mapping) で、Vue 経験者向けに本書を chibivue のどの章と比較できるか整理します。

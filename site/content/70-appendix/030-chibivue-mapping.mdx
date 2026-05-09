@@ -1,0 +1,229 @@
+---
+title: A.3 chibivue ↔ chibireact マッピング表
+description: chibivue 経験者が本書を読むときの章対応表。Vue と React の設計思想の違いを章ごとに対比します
+---
+
+# A.3 chibivue ↔ chibireact マッピング表
+
+本書 chibireact は、ubugeeei 氏の [**chibivue**](https://book.chibivue.land/) (Vue を小さく作りながら学ぶ本) にインスパイアされ、その **React 版** を目指して書かれました。
+本章は **chibivue を既に読んだ方** が「同じ概念は本書のどこ？」を素早く引けるための索引です。
+
+両者の設計思想の **共通点と相違点** も並列で見ていきます。
+
+## この章のゴール
+
+- chibivue の各章 / Part に本書の対応箇所が即引ける
+- Vue と React の **設計判断の違い** が章単位で見える
+- 「同じ問題を別解で解いた」ペアを通じて両者の哲学が深まる
+
+> 章末に動くもの: なし（マッピングテーブル）。
+
+前章: [A.2 本家 React のソースコードを読む](./020-reading-react-source)
+
+## 全体の Part 構成比較
+
+| | chibivue | 本書 chibireact |
+|---|---|---|
+| Part 0 | Getting Started (4) | Getting Started (4) ✓ 同等 |
+| Part 1 | Minimum Example (20) | Minimum Example (13) ※ 圧縮 |
+| Part 2 | Basic Virtual DOM (4) | Reconciler / Fiber (7) ※ 大幅増 |
+| Part 3 | Basic Reactivity (6) | Hooks (9) ※ 別アプローチ |
+| Part 4 | Basic Component (5) | (Hooks に統合) |
+| Part 5 | Basic Template Compiler (16) | JSX (5) ※ 大幅圧縮 |
+| Part 6 | Web App Essentials (5) | Web Essentials (5) ✓ 似た構成 |
+| Part 7 | (なし) | Concurrent (6) ※ 本書追加 |
+| Part 8 | (なし) | 付録 (4) |
+
+合計: chibivue 60+、chibireact 53。**Vue と React の言語仕様の差** がそのまま反映。
+
+## Part 0: Getting Started
+
+| chibivue | 本書 chibireact |
+|---|---|
+| はじめに | [Part 0.1](../00-introduction/010-introduction) |
+| Vue とは | [Part 0.2 React とは何か](../00-introduction/020-what-is-react) |
+| Vue を構成する主要要素 | [Part 0.3 React を構成する要素](../00-introduction/030-react-elements) |
+| 環境構築 | [Part 0.4 環境構築](../00-introduction/040-setup) |
+
+導入は両者ほぼ同形。対象読者・進め方の方針も似通っています。
+
+## Part 1: Minimum (Stack reconciler / 仮想 DOM)
+
+chibivue は仮想 DOM 周りで 20 章、本書は 13 章。**Vue 特有の SFC やテンプレートディレクティブが本書では不要** になるためです。
+
+| chibivue | 本書 chibireact |
+|---|---|
+| createApp API | [Part 1.1 createRoot API](../10-minimum/010-create-root-api) |
+| パッケージ設計 | [Part 1.2 パッケージ設計](../10-minimum/020-package-architecture) |
+| HTML 要素のレンダリング | [Part 1.3 createElement](../10-minimum/030-create-element) |
+| ↑ の続き (再帰) | [Part 1.4 単純な再帰的レンダラー](../10-minimum/040-recursive-renderer) |
+| Props | [Part 1.5 props](../10-minimum/050-props) |
+| イベントハンドラ・属性 | [Part 1.6 イベントハンドラ](../10-minimum/060-event-handlers) |
+| (chibivue では仮想 DOM 章に統合) | [Part 1.7 children と入れ子](../10-minimum/070-children) |
+| コンポーネント指向 | [Part 1.8 関数コンポ](../10-minimum/080-function-components) |
+| 小さなリアクティビティ | [Part 1.9 useState](../10-minimum/090-use-state) ※ **アプローチが根本的に違う** |
+| 小さな仮想 DOM | [Part 1.10 setState バッチング](../10-minimum/100-batching) |
+| key 属性とパッチレンダリング | [Part 1.11 リスト描画と key](../10-minimum/110-list-and-key) |
+| (chibivue では他章に分散) | [Part 1.12 TypeScript 化](../10-minimum/120-typescript) |
+| ちょっと一息 | [Part 1.13 ちょっと一息](../10-minimum/130-pause) |
+
+### Vue と React の最大の違いはここ (1.9)
+
+**chibivue の小さなリアクティビティ**:
+- Proxy ベース、`reactive()` / `ref()` で値の変更を追跡
+- 値が変わると **「変わった部分だけ」が分かる** ので局所更新
+
+**本書の useState**:
+- 不変 state + 再 render (= 関数コンポを丸ごと再評価)
+- どこが変わったかを知るには **Fiber tree の diff** が必要
+
+両者は同じ問題 (UI の自動更新) を **真逆のアプローチ** で解決しています。
+
+## Part 2: Reconciler
+
+ここから両者は構造が大きく分岐します。
+
+### chibivue の Basic Virtual DOM (4 章)
+
+- 仮想 DOM とは何か (DOM 操作のコスト)
+- patch 関数 (diff & DOM 更新)
+- マウントとアンマウント
+- パッチの分岐
+
+### 本書の Reconciler / Fiber (7 章)
+
+| 本書 chibireact |
+|---|
+| [Part 2.1 Reconciliation の前提知識](../20-fiber/010-reconciliation-intro) |
+| [Part 2.2 Stack Reconciler の限界](../20-fiber/020-stack-reconciler-limits) |
+| [Part 2.3 Fiber Node とは何か](../20-fiber/030-fiber-node) |
+| [Part 2.4 work loop と作業の単位化](../20-fiber/040-work-loop) |
+| [Part 2.5 requestIdleCallback](../20-fiber/050-scheduler) |
+| [Part 2.6 二重バッファ](../20-fiber/060-double-buffer) |
+| [Part 2.7 Commit phase 最適化](../20-fiber/070-commit) |
+
+**chibivue は ~~一気通貫の同期 patch~~ にとどまる**(Vue 3 が同期 stack reconciler 設計のため)。
+**本書は Fiber + 中断・再開** に大幅な紙幅を割く (React 16+ の根本)。
+
+> Vue 3 にも実は **Vapor Mode** という似た概念の実装があるが、chibivue は扱わない。本書 Part 2 は Vue では存在しない章群。
+
+## Part 3 vs chibivue の Reactivity + Component
+
+| chibivue | 本書 chibireact |
+|---|---|
+| ref API | [Part 3.2 useState](../30-hooks/020-use-state-per-fiber) |
+| reactive API | (本書では未実装、useState で代用) |
+| computed / watch | [Part 3.7 useMemo / useCallback](../30-hooks/070-use-memo-callback) |
+| ライフサイクルフック | [Part 3.4 useEffect](../30-hooks/040-use-effect) / [Part 3.5 useLayoutEffect](../30-hooks/050-use-layout-effect) |
+| Provide / Inject | [Part 3.6 useContext](../30-hooks/060-use-context) |
+| (chibivue にない) | [Part 3.3 useReducer](../30-hooks/030-use-reducer) |
+| (chibivue にない) | [Part 3.8 useRef](../30-hooks/080-use-ref) |
+| (chibivue にない) | [Part 3.9 カスタムフック](../30-hooks/090-custom-hooks) |
+| Composition API setup | (関数コンポーネントが React の primary API) |
+
+両者で **「リアクティブ」** の意味が違います:
+- Vue: **データに reactive のラベル** を貼る (`reactive()`)
+- React: **再 render が常に reactive** (関数を再評価することで自動的に最新値)
+
+API 表面は似ていても、内部メカニズムは正反対。
+
+## Part 4: テンプレート (chibivue) vs JSX (本書)
+
+chibivue は **16 章** をテンプレートコンパイラに費やします。本書は JSX で **5 章**。これが Vue と React の最大の表現差。
+
+| chibivue | 本書 chibireact |
+|---|---|
+| テンプレートコンパイラを理解する | [Part 4.1 JSX とは何か](../40-jsx/010-jsx-intro) |
+| テンプレートコンパイラを実装する | [Part 4.2 classic runtime](../40-jsx/020-classic-runtime) |
+| ディレクティブ (v-bind / v-on / v-if / v-for) | (JSX には不要、JS の式で書く) |
+| SFC コンパイラ (テンプレート / script / style) | (JSX では関数コンポ 1 つだけ) |
+| Scoped CSS | (CSS-in-JS / Modules で別枠) |
+| (chibivue にない) | [Part 4.3 automatic runtime](../40-jsx/030-automatic-runtime) |
+| (chibivue にない) | [Part 4.4 JSX トランスフォーマ実装](../40-jsx/040-jsx-transformer) |
+| (chibivue にない) | [Part 4.5 JSX の TypeScript 型](../40-jsx/050-jsx-types) |
+
+JSX は **JS の式そのもの** なので独自パーサが要らず、チャプター数が劇的に減ります。逆に、テンプレートを **静的解析して最適化** する余地は Vue の方が大きい。
+
+## Part 5: Concurrent (本書独自)
+
+chibivue には対応する Part がありません。**React 18 で大きく進化した領域** で、本書のオリジナリティが出ます。
+
+- [5.1 Concurrent Rendering の前提知識](../50-concurrent/010-concurrent-intro)
+- [5.2 startTransition](../50-concurrent/020-start-transition)
+- [5.3 useDeferredValue](../50-concurrent/030-use-deferred-value)
+- [5.4 Suspense](../50-concurrent/040-suspense)
+- [5.5 Error Boundary](../50-concurrent/050-error-boundary)
+- [5.6 Portal](../50-concurrent/060-portal)
+
+> Vue 3.4+ にも `<Suspense>` 相当はありますが、Vapor Mode と並んで chibivue でも省略されています。本書 Part 5 が「Vue 経験者にとって最も新鮮」な領域。
+
+## Part 6: Web Essentials (両者で似た構成)
+
+| chibivue (Web Application Essentials, 5) | 本書 chibireact (Web Essentials, 5) |
+|---|---|
+| Vue Router | [6.1 ルーティング](../60-web-essentials/010-routing) |
+| (chibivue にない) | [6.2 フォーム](../60-web-essentials/020-forms) |
+| key と最適化 | [6.3 リスト最適化](../60-web-essentials/030-list-optimization) |
+| (chibivue にない) | [6.4 アクセシビリティ](../60-web-essentials/040-accessibility) |
+| Vapor Mode (実験的) | [6.5 デバッグツール](../60-web-essentials/050-debugging) |
+
+「Web アプリで現実に必要なもの」のリストはどちらも似ています。実装パターンの違いのみ。
+
+## 設計判断の対比
+
+両書を読み比べたときに見えてくる **設計上の対称性**:
+
+| 概念 | Vue / chibivue | React / chibireact |
+|---|---|---|
+| 状態管理 | Proxy + reactive ラベル | 不変 state + re-render |
+| 変更検知 | きめ細かい (どこが変わったか分かる) | 全体再評価 (差分計算で部分更新) |
+| テンプレート | HTML 風 + ディレクティブ | JSX (JS の式) |
+| 副作用 | ライフサイクルフック / watch | useEffect / useLayoutEffect |
+| 並行性 | (Vapor Mode で対応中) | Concurrent Rendering (lane) |
+| コンポネント定義 | SFC (template/script/style) | 関数 (JSX を return) |
+| 親 → 子 | props | props |
+| 子 → 親 | emit | コールバック props |
+| 子 → 子孫 | provide / inject | useContext |
+
+**「同じ問題を別解で解く」** のが両書を読み比べる最大の楽しみ。
+
+## ちょっと深掘り
+
+### 「両方理解する」ことの価値
+
+フロントエンドエンジニアが Vue と React の両方を学ぶと:
+- **デザインパターンの引き出し** が倍になる
+- 自分が書いてるフレームワークの「**当たり前じゃない選択**」が見える
+- ライブラリ選択時の判断軸が明確に
+- 「reactive な思考」と「再評価な思考」を意識的に使い分けられる
+
+「フレームワークに縛られない」エンジニアになる入り口として、本書 + chibivue の組み合わせは強力です。
+
+### Solid.js / Svelte / Qwik も加えると
+
+Solid.js は **Proxy ベースだが JSX を書く** という変わり種。
+Svelte は **コンパイル時に reactive コードを生成** する別解。
+Qwik は **resumability** (実行を中断・再開) という新コンセプト。
+
+各フレームワークが「同じ問題」をどう解いているかの比較は、**フロントエンドの哲学** を学ぶ最良の方法です。
+
+### chibivue 著者 ubugeeei さんへの謝辞
+
+本書 chibireact は ubugeeei 氏の chibivue にインスパイアされて書かれました。
+- 「フレームワークを小さく作りながら学ぶ」コンセプト
+- 章を細かく刻む構成
+- TDD ベースで進める方針 (本書独自要素)
+
+すべて chibivue がベースとなっています。先行者へのリスペクトとともに、両書を読み比べることをおすすめします。
+
+## まとめ
+
+- 両書の Part 構成は **概ね対応** しているが、Vue/React の差で粒度が変わる
+- Part 1.9 (リアクティビティ vs useState) が **設計思想の根本差**
+- Part 4 (テンプレート vs JSX) で **章数が大きく変わる**
+- 本書 Part 5 (Concurrent) は chibivue にない領域
+- Web Essentials は似た構成で実装が違うだけ
+
+## 次の章へ
+
+[A.4 最小 RSC 実装に挑戦する](./040-minimal-rsc) で、本書最大の挑戦 — **React Server Components** の最小実装に挑みます。

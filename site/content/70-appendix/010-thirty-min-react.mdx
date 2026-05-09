@@ -1,0 +1,387 @@
+---
+title: A.1 30 分で React を作る — 1 ファイル版
+description: 本書 Part 1-3 の核心を 1 ファイル 250 行に圧縮した教材。「Counter が動く」を最小コードで実証
+---
+
+# A.1 30 分で React を作る — 1 ファイル版
+
+付録の最初は **「本書の核心を 1 ファイルに圧縮した教材」** です。
+
+Part 1〜3 で散らばっていた `createElement` / Fiber / work loop / commit / useState を **1 つのファイル**にまとめ、全体像を一望できるようにしました。読み終わるのに **30 分** あれば足ります。
+
+## このファイルでやること
+
+- `createElement` / `createRoot` / `useState` だけを export
+- Fiber + reconciliation + commit phase + 関数コンポ + setState バッチング **すべて含む**
+- 約 250 行、テスト 7 個で動作保証
+
+含まないもの (本書本体で扱う):
+- `useEffect` / `useReducer` / `useContext` / `useMemo` / `useRef`
+- Suspense / ErrorBoundary / Portal
+- Concurrent Rendering / Scheduler
+- JSX トランスフォーマ
+
+「これだけで Counter が動く」を体感する章。
+
+> 章末に動くもの: `mini-react.ts` 単独で Counter / 複数コンポ / 条件レンダ / DOM identity 保存。テスト 7 個追加で累計 **236/236**。
+
+前章: [Part 6.5 デバッグツール](../60-web-essentials/050-debugging)
+
+## 全体像
+
+ファイルを 7 セクションに分けて構成:
+
+```
+mini-react.ts (約 250 行)
+├── 型定義          (Element / Fiber / Hook)
+├── createElement  (Part 1.3)
+├── モジュール状態   (work loop と hooks 共通)
+├── createRoot     (Part 1.1 + Part 2.7)
+├── performUnitOfWork (Part 2.4)
+├── applyProps + reconcileChildren (Part 2.6)
+├── commitRoot     (Part 2.6)
+└── useState       (Part 3.2)
+```
+
+## 全コード ([mini-react.ts](https://github.com/tokechan/chibireact/blob/main/packages/%40chibireact/core/src/mini-react.ts))
+
+長いので主要セクションを抜粋:
+
+### 型と createElement
+
+```ts
+const TEXT = '__TEXT__' as const
+
+type Hook = { state: unknown }
+type Element = {
+  type: string | Function | typeof TEXT
+  props: { children: Element[]; [key: string]: unknown }
+}
+type Fiber = {
+  type: string | Function | typeof TEXT | 'ROOT'
+  props: { children: Element[]; [key: string]: unknown }
+  parent: Fiber | null
+  child: Fiber | null
+  sibling: Fiber | null
+  alternate: Fiber | null
+  dom: Node | null
+  effectTag?: 'PLACEMENT' | 'UPDATE' | 'DELETION'
+  hooks: Hook[]
+}
+
+export function createElement(type, props, ...children): Element {
+  const flatChildren: Element[] = []
+  const push = (c) => {
+    if (c == null || c === false || c === true) return
+    if (Array.isArray(c)) { for (const i of c) push(i); return }
+    if (typeof c === 'string' || typeof c === 'number') {
+      flatChildren.push({ type: TEXT, props: { nodeValue: String(c), children: [] } })
+      return
+    }
+    flatChildren.push(c)
+  }
+  for (const c of children) push(c)
+  return { type, props: { ...(props ?? {}), children: flatChildren } }
+}
+```
+
+ポイント:
+- text は `TEXT` 型の Element に揃える (Part 2.3 の `TEXT_ELEMENT` 相当)
+- `null` / `false` / 配列をフラット化して扱える (Part 1.7 相当)
+
+### モジュール状態と createRoot
+
+```ts
+let nextUnitOfWork: Fiber | null = null
+let wipRoot: Fiber | null = null
+let currentRoot: Fiber | null = null
+let deletions: Fiber[] = []
+let wipFiber: Fiber | null = null
+let hookIndex = 0
+let scheduled = false
+
+export function createRoot(container) {
+  return {
+    render(element) {
+      wipRoot = {
+        type: 'ROOT',
+        props: { children: [element] },
+        parent: null, child: null, sibling: null,
+        alternate: currentRoot, dom: container, hooks: [],
+      }
+      deletions = []
+      nextUnitOfWork = wipRoot
+      runWorkLoop()
+    },
+  }
+}
+
+function runWorkLoop(): void {
+  while (nextUnitOfWork !== null) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+  }
+  if (wipRoot !== null) commitRoot()
+}
+```
+
+`runWorkLoop` は **同期** で全 fiber を処理 → commit。Part 2.4 の `runFiberRoot` 相当。
+RIC / 中断はこのファイルでは省略 (本書 Part 2.5 で扱う)。
+
+### performUnitOfWork
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  if (typeof fiber.type === 'function') {
+    fiber.hooks = fiber.alternate ? [...fiber.alternate.hooks] : []
+    wipFiber = fiber
+    hookIndex = 0
+    const result = fiber.type(fiber.props)
+    reconcileChildren(fiber, result ? [result] : [])
+  } else {
+    if (fiber.dom === null && fiber.type !== 'ROOT') {
+      fiber.dom = createDom(fiber)
+    }
+    reconcileChildren(fiber, fiber.props.children)
+  }
+
+  if (fiber.child !== null) return fiber.child
+  let next: Fiber | null = fiber
+  while (next !== null) {
+    if (next.sibling !== null) return next.sibling
+    next = next.parent
+  }
+  return null
+}
+```
+
+3 つの仕事:
+1. 関数コンポなら呼び出し + hooks 紐付け / そうでなければ DOM 作成
+2. children を reconcile して child / sibling 鎖を作る
+3. 次の fiber を child → sibling → uncle で決定
+
+### reconcileChildren (alternate 比較)
+
+```ts
+function reconcileChildren(wip: Fiber, children: Element[]): void {
+  let oldFiber = wip.alternate?.child ?? null
+  let prev: Fiber | null = null
+  let i = 0
+
+  while (i < children.length || oldFiber !== null) {
+    const childEl = children[i]
+    const sameType = oldFiber !== null && childEl !== undefined &&
+                     oldFiber.type === childEl.type
+
+    let newFiber: Fiber | null = null
+    if (sameType && oldFiber) {
+      newFiber = {
+        type: oldFiber.type, props: childEl.props,
+        parent: wip, child: null, sibling: null,
+        alternate: oldFiber, dom: oldFiber.dom,
+        effectTag: 'UPDATE', hooks: [],
+      }
+    } else if (childEl) {
+      newFiber = {
+        type: childEl.type, props: childEl.props,
+        parent: wip, child: null, sibling: null,
+        alternate: null, dom: null,
+        effectTag: 'PLACEMENT', hooks: [],
+      }
+    }
+    if (oldFiber && !sameType) {
+      oldFiber.effectTag = 'DELETION'
+      deletions.push(oldFiber)
+    }
+
+    if (i === 0) wip.child = newFiber
+    else if (prev) prev.sibling = newFiber
+    prev = newFiber
+    if (oldFiber) oldFiber = oldFiber.sibling
+    i++
+  }
+}
+```
+
+Part 2.6 の二重バッファ。`alternate.child` と新 children を並走比較し、effectTag を割り当てる。
+
+### commit phase
+
+```ts
+function commitRoot(): void {
+  for (const d of deletions) commitWork(d)
+  if (wipRoot && wipRoot.child) commitWork(wipRoot.child)
+  currentRoot = wipRoot
+  wipRoot = null
+  deletions = []
+}
+
+function commitWork(fiber: Fiber | null): void {
+  if (fiber === null) return
+  let parentFiber: Fiber | null = fiber.parent
+  while (parentFiber !== null && parentFiber.dom === null) {
+    parentFiber = parentFiber.parent
+  }
+  const parentDom = parentFiber?.dom ?? null
+
+  if (fiber.effectTag === 'PLACEMENT' && fiber.dom !== null && parentDom !== null) {
+    parentDom.appendChild(fiber.dom)
+  } else if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
+    applyProps(fiber.dom, fiber.alternate?.props ?? {}, fiber.props)
+  } else if (fiber.effectTag === 'DELETION') {
+    if (fiber.dom !== null && parentDom !== null && fiber.dom.parentNode === parentDom) {
+      parentDom.removeChild(fiber.dom)
+    }
+    return
+  }
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
+}
+```
+
+PLACEMENT / UPDATE / DELETION の 3 効果を適用する小さな再帰。
+
+### useState (per-fiber)
+
+```ts
+export function useState<T>(initial: T): [T, (v: T | ((p: T) => T)) => void] {
+  if (wipFiber === null) throw new Error('useState outside render')
+  const fiber = wipFiber
+  const idx = hookIndex++
+
+  if (fiber.hooks[idx] === undefined) fiber.hooks[idx] = { state: initial }
+  const hook = fiber.hooks[idx] as Hook & { state: T }
+
+  const setState = (action) => {
+    const next = typeof action === 'function' ? (action as Function)(hook.state) : action
+    if (Object.is(hook.state, next)) return
+    hook.state = next
+    schedule()
+  }
+
+  return [hook.state, setState]
+}
+
+function schedule(): void {
+  if (scheduled) return
+  scheduled = true
+  queueMicrotask(() => {
+    scheduled = false
+    if (currentRoot === null) return
+    wipRoot = {
+      type: currentRoot.type,
+      props: currentRoot.props,
+      parent: null, child: null, sibling: null,
+      alternate: currentRoot, dom: currentRoot.dom, hooks: [],
+    }
+    deletions = []
+    nextUnitOfWork = wipRoot
+    runWorkLoop()
+  })
+}
+```
+
+Part 3.2 の per-fiber hooks がそのまま。setState で `queueMicrotask` バッチング → 同 tick の複数 setState を 1 回の commit に。
+
+## テストで動作確認
+
+これだけで Counter が動きます:
+
+```ts
+import { createElement, createRoot, useState } from './mini-react'
+
+const Counter = () => {
+  const [count, setCount] = useState(0)
+  return createElement('button',
+    { onClick: () => setCount(count + 1) },
+    `${count}`,
+  )
+}
+
+createRoot(container).render(createElement(Counter, null))
+
+// button.click() → microtask → DOM が '1' に更新
+// DOM identity (button === button2) も保たれる
+```
+
+7 テスト pass:
+- 単純な要素描画
+- 入れ子と複数子
+- 関数コンポーネント
+- **Counter で setState が動く** (本書のクライマックス再現)
+- 複数 Counter が独立 (per-fiber hooks)
+- 条件付きレンダリングで子追加削除
+- 再 render で DOM identity 保存
+
+## 本書本体との対応
+
+| mini-react.ts のセクション | 本書本体での章 |
+|---|---|
+| `createElement` | Part 1.3 |
+| 型と Fiber 構造 | Part 2.3 |
+| `runWorkLoop` / `performUnitOfWork` | Part 2.4 (RIC は省略) |
+| `applyProps` / DOM 作成 | Part 1.5 / 1.6 / Part 2.7 (prop diff) |
+| `reconcileChildren` (alternate 比較) | Part 2.6 |
+| `commitRoot` / `commitWork` | Part 2.6 |
+| `useState` (per-fiber) | Part 3.2 |
+| `schedule` (queueMicrotask) | Part 1.10 |
+
+各セクションのコメントに「Part X.Y 相当」を書いてあるので、本書のどこに戻れば詳しいかが分かります。
+
+## ちょっと深掘り
+
+### なぜ「1 ファイル版」を作るのか
+
+本書 30+ 章を読み終えた後でも、**全体像の俯瞰** は意外と難しい。
+1 ファイルで読み返せると:
+- どの機能がどこにあるか即座に分かる
+- 変更したいときの影響範囲がすぐ見える
+- 自分のプロジェクトに「最小 React」として組み込める
+
+教育目的だけでなく、**アイデア検証用の React-like ライブラリ** としても使えます。
+
+### 本物の React のサイズ感
+
+参考までに本物 React の規模:
+- React core: 約 6,000 行
+- React DOM: 約 30,000 行 (合成イベント・SSR・DevTools 等込み)
+- Scheduler: 約 1,500 行
+
+`mini-react.ts` の **約 250 行** は本物の **0.5%** 程度。それでも Counter / DOM diff / hooks の本質は揃っています。
+
+「数十万行のうち 99% は最適化・互換性・エッジケース」と捉えると、フレームワークのスケール感が掴めます。
+
+### Pombo "Build your own React" との比較
+
+Rodrigo Pombo の有名な記事 [Build your own React](https://pomb.us/build-your-own-react/) は約 200 行で同様のものを実現します。本書 mini-react との違い:
+
+| 観点 | Pombo | 本書 mini-react |
+|---|---|---|
+| RIC | 使う | 省略 (sync) |
+| 二重バッファ | あり | あり |
+| useState | あり | あり |
+| 教育の進め方 | 段階的に追加 | 圧縮版 (詳細は本書本体) |
+| TypeScript | なし | 完全 |
+
+Pombo は「これ 1 本で React が分かる」教材、本書 mini-react は「Part 1-3 の振り返り教材」。位置付けが違います。
+
+### 自分で改造する練習
+
+本ファイルから始めて自分なりに拡張するアイデア:
+
+1. **useEffect** を足す: hook の kind を増やし、commit 後に effect を走らせる (Part 3.4 が参考)
+2. **JSX サポート**: `tsconfig.json` で `"jsx": "react"`, `"jsxFactory": "createElement"` を設定 (Part 4.4)
+3. **ErrorBoundary**: try/catch を performUnitOfWork に足す (Part 5.5)
+4. **DevTools フック**: `globalThis.__MINI_REACT_HOOK__` で fiber tree を公開 (Part 6.5)
+
+少しずつ機能を足していくと、本書本体の各 Part がなぜ存在するかが体感で分かります。
+
+## まとめ
+
+- 250 行で **Counter が動く React** が書ける
+- 各セクションは本書 Part 1-3 のどこかに対応
+- 全体像の俯瞰・改造のベースに使える
+- 本物の React の 0.5% でも本質は同じ
+
+## 次の章へ
+
+[A.2 本家 React のソースコードを読む](./020-reading-react-source) で、本書を読み終えた人が **本家 React のコード** を効果的に読むための地図を提供します。
