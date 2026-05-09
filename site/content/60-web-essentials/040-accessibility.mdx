@@ -1,0 +1,306 @@
+---
+title: アクセシビリティ — ARIA / focus 管理
+description: スクリーンリーダー対応とキーボード操作。React アプリで欠かせない a11y の典型パターンと実装テクニック
+---
+
+# アクセシビリティ — ARIA / focus 管理
+
+[リスト最適化](./030-list-optimization) でパフォーマンスを扱いました。
+本章は **アクセシビリティ (a11y)** の典型パターンを整理します。
+
+「画面が見える人」だけでなく、**スクリーンリーダーや音声読み上げを使う人** にも使えるアプリを作るのが a11y。
+React 自体には a11y 機能はありませんが、JSX で書ける ARIA 属性 + hooks による focus 管理で実現できます。
+
+## この章のゴール
+
+- ARIA 属性の基本 (`role` / `aria-label` / `aria-live`) が言える
+- セマンティック HTML を使うべき場面と ARIA で補強すべき場面が分かる
+- focus 管理の典型パターン (Modal / Tab Trap / Skip link) を実装できる
+- React 特有の落とし穴 (`useEffect` での focus 移動など) を理解する
+
+> 章末に動くもの: なし（パターン解説）。コード変更ゼロ。
+
+前章: [リスト最適化 — key と virtualization](./030-list-optimization)
+
+## まずはセマンティック HTML
+
+ARIA 属性を足す前に、**正しい HTML タグを使う** のが第一原則:
+
+```tsx
+// ❌ NG: div で button を作る
+<div onClick={handleClick}>クリック</div>
+
+// ✓ OK: 普通の button タグを使う
+<button onClick={handleClick}>クリック</button>
+```
+
+`<button>` は無料で:
+- キーボードの Enter / Space で発火
+- スクリーンリーダーが「ボタン」と認識
+- フォーカス可能 (Tab で到達できる)
+- disabled 状態を表現できる
+
+これら全部を `<div>` で再現するには **大量の ARIA + onKeyDown** が要る。**面倒の塊**。
+
+セマンティック HTML を使うべきタグ:
+- `<button>`, `<a>`, `<input>`, `<select>`, `<textarea>`
+- `<nav>`, `<main>`, `<header>`, `<footer>`, `<aside>`, `<section>`, `<article>`
+- `<h1>`-`<h6>` (順序を守る)
+- `<ul>`, `<ol>`, `<li>` (リストには使う)
+- `<table>`, `<thead>`, `<tbody>`, `<th>`, `<td>` (表データには使う)
+
+## ARIA 属性が必要なケース
+
+セマンティック HTML だけで足りないとき:
+
+### `aria-label`: 視覚的ラベルが無いとき
+
+アイコンだけのボタンは何のボタンか伝わりません:
+
+```tsx
+// ❌ アイコンだけ → スクリーンリーダーは何も読めない
+<button onClick={handleClose}>×</button>
+
+// ✓ aria-label で意味を伝える
+<button aria-label="閉じる" onClick={handleClose}>×</button>
+```
+
+### `aria-describedby`: 補足情報
+
+```tsx
+<input
+  type="email"
+  aria-describedby="email-help"
+/>
+<span id="email-help">会社のアドレスを入力してください</span>
+```
+
+スクリーンリーダーが入力欄にフォーカスしたとき、補足を読み上げます。
+
+### `role`: タグの本来の役割を上書き
+
+```tsx
+<div role="alert">エラーが発生しました</div>
+```
+
+`<div>` をスクリーンリーダーに「アラート」として認識させる。
+ただし **`<div>` で済ませず、適切なタグがあるならそれを使う** のが先。
+
+### `aria-live`: 動的に変わる領域
+
+```tsx
+<div aria-live="polite">
+  {searchResults.length} 件見つかりました
+</div>
+```
+
+`polite`: 読み上げ中の文章を中断しない (推奨)
+`assertive`: 即座に割り込む (緊急時のみ)
+
+検索結果カウントやチャット通知などに。
+
+### `aria-current`: 「今ここ」を示す
+
+```tsx
+<a href="#/" aria-current={path === '/' ? 'page' : undefined}>Home</a>
+```
+
+ナビゲーション内で **現在のページを** スクリーンリーダーに伝える。
+
+## focus 管理の典型パターン
+
+### パターン 1: Modal の focus trap
+
+Modal を開いたら、Tab キーで Modal 内だけを巡回したい:
+
+```tsx
+function Modal({ isOpen, onClose, children }) {
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!isOpen) return
+    const previousFocus = document.activeElement as HTMLElement
+
+    // Modal 内の最初の focusable 要素にフォーカス
+    const focusable = ref.current?.querySelectorAll(
+      'button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )
+    ;(focusable?.[0] as HTMLElement)?.focus()
+
+    return () => {
+      previousFocus?.focus()  // 閉じるとき元の位置に戻す
+    }
+  }, [isOpen])
+
+  if (!isOpen) return null
+  return createPortal(
+    <div ref={ref} role="dialog" aria-modal="true">
+      {children}
+      <button onClick={onClose}>閉じる</button>
+    </div>,
+    document.body,
+  )
+}
+```
+
+ポイント:
+- `role="dialog"` + `aria-modal="true"` で Modal と認識
+- 開く時に **Modal 内の最初の要素にフォーカス**
+- 閉じる時に **元の要素にフォーカスを戻す** (cleanup で)
+- 完全な focus trap には Tab キー監視が要る (本書スコープ外)
+
+### パターン 2: Skip link
+
+長いナビゲーションを飛ばすリンク:
+
+```tsx
+<a href="#main" className="skip-link">本文へスキップ</a>
+{/* ... 大量のナビ ... */}
+<main id="main">
+  {/* 本文 */}
+</main>
+```
+
+CSS で見えなくしておき、Tab で focus が当たったときだけ表示:
+
+```css
+.skip-link {
+  position: absolute;
+  left: -9999px;
+}
+.skip-link:focus {
+  left: 0;
+  top: 0;
+}
+```
+
+スクリーンリーダー / キーボードユーザにとって地味に効く。
+
+### パターン 3: ルート切り替え時のフォーカス移動
+
+SPA でページを切り替えても、フォーカスは前のページの位置に残ります:
+
+```tsx
+function App() {
+  const [path] = useHashLocation()
+  const mainRef = useRef<HTMLElement>(null)
+
+  useEffect(() => {
+    mainRef.current?.focus()
+  }, [path])
+
+  return (
+    <main ref={mainRef} tabIndex={-1}>
+      <Switch>...</Switch>
+    </main>
+  )
+}
+```
+
+ページ遷移後 `<main>` にフォーカスを移動。スクリーンリーダーが「新しいページのコンテンツ」と認識。
+`tabIndex={-1}` は「プログラム的に focus は当てられるが Tab で到達はしない」設定。
+
+## React 特有の落とし穴
+
+### `autoFocus` は予期せぬ動作を起こす
+
+```tsx
+<input autoFocus />
+```
+
+これは **HTML 属性** で、React の意図と一致しないことがあります。多くのケースで `useEffect` + `ref.current.focus()` の方が予測しやすい。
+
+### Server-side render での focus
+
+SSR では DOM が無いので focus 制御は client hydration 後に。`useEffect` で十分。
+
+### `useEffect` vs `useLayoutEffect`
+
+focus 移動は **`useLayoutEffect`** の方がフリッカー無し:
+
+```tsx
+useLayoutEffect(() => {
+  ref.current?.focus()
+}, [])
+```
+
+`useEffect` だと一瞬古い focus 状態が見える可能性あり。本書 chibireact ではどちらも sync なので差は無いが、本家 React では useLayoutEffect 推奨。
+
+## ツール
+
+- **eslint-plugin-jsx-a11y**: 静的チェックで多くの問題を検出
+- **axe DevTools**: ブラウザ拡張で実機検証
+- **NVDA / VoiceOver**: 実際のスクリーンリーダーで試す
+- **Lighthouse**: Chrome の標準監査ツール
+
+最低限 `eslint-plugin-jsx-a11y` だけは入れる。設定で大量の警告が出るので、徐々に直すのが現実的。
+
+## ちょっと深掘り
+
+### prefers-reduced-motion
+
+「アニメーションを少なくしたい」設定の人へ配慮:
+
+```tsx
+useEffect(() => {
+  const prefersReduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  if (!prefersReduce) {
+    // アニメーション有効
+  }
+}, [])
+```
+
+CSS なら:
+
+```css
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none; transition: none; }
+}
+```
+
+健康障害を持つユーザに優しい配慮。
+
+### 色覚多様性
+
+色だけで状態を伝えると、色覚に違いがある人に伝わらない:
+
+```tsx
+// ❌ 色だけ
+<span style={{ color: error ? 'red' : 'green' }}>{message}</span>
+
+// ✓ 色 + アイコン or テキスト
+<span className={error ? 'error' : 'ok'}>
+  {error ? '⚠ エラー: ' : '✓ '}
+  {message}
+</span>
+```
+
+色は補強要素であり、唯一の情報伝達手段にしない。
+
+### コントラスト
+
+文字色と背景のコントラスト比は **4.5:1 以上** (WCAG AA)。
+テストツール: Chrome DevTools の Contrast 機能、または [WebAIM Contrast Checker](https://webaim.org/resources/contrastchecker/)。
+
+### React の合成イベントと a11y
+
+本書 chibireact は実 DOM のイベントしか使いませんが、本家 React の合成イベントは **`onChange` が `input` イベント** にマップされるなど a11y に影響します:
+
+```tsx
+<input onChange={...} />  // input イベント (毎キーストローク発火)
+<input onInput={...} />   // 同上
+```
+
+通常 React の `onChange` で十分。スクリーンリーダーやブラウザの自動入力との相性も良い。
+
+## まとめ
+
+- セマンティック HTML が a11y の出発点 (button, nav, main, h1-h6...)
+- ARIA は補強用 (aria-label / role / aria-live / aria-current)
+- focus 管理は Modal / Skip link / ルート切替時の 3 パターン
+- React 特有の落とし穴: autoFocus / SSR / useEffect vs useLayoutEffect
+- ツール: eslint-plugin-jsx-a11y は最低限導入
+
+## 次の章へ
+
+[デバッグツール — fiber tree の可視化](./050-debugging)（執筆中）で、自前で fiber を覗くデバッグヘルパを作ります。Part 6 完走です。
